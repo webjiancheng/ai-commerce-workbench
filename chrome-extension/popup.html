@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>商品采集</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="hero">
+        <p class="eyebrow">Product Capture</p>
+        <h1>商品采集</h1>
+        <p class="sub">采集商品图片、标题、价格、SKU 和详情，提交到本地 Temu AI 上架工作台。</p>
+      </section>
+
+      <section class="actions">
+        <button id="collect" class="primary">采集</button>
+        <button id="sync" class="secondary">提交本地</button>
+        <button id="shot" class="secondary" type="button">截图</button>
+        <button id="toggleCorrect" class="ghost" type="button">手动纠错</button>
+      </section>
+
+      <section class="filters">
+        <label class="field">
+          <span>本地工作台地址</span>
+          <input id="serverUrl" type="url" placeholder="http://127.0.0.1:8000" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>采集人</span>
+          <input id="collector" type="text" placeholder="例如：team-a" autocomplete="off">
+        </label>
+      </section>
+
+      <section class="stats">
+        <article><span>平台</span><strong id="platform">-</strong></article>
+        <article><span>价格</span><strong id="price">-</strong></article>
+        <article><span>主图</span><strong id="mainCount">0</strong></article>
+        <article><span>SKU</span><strong id="skuCount">0</strong></article>
+        <article><span>详情</span><strong id="detailCount">0</strong></article>
+      </section>
+
+      <section id="correctPanel" class="correct is-hidden" aria-label="手动纠错">
+        <div id="assignBar" class="assign">
+          <span class="assignLabel">归类到</span>
+          <button id="assignMode" type="button" class="pill">归类模式：关</button>
+          <button type="button" class="pill" data-assign="main">主图</button>
+          <button type="button" class="pill" data-assign="sku">SKU</button>
+          <button type="button" class="pill" data-assign="detail">详情</button>
+          <button type="button" class="pill" data-assign="size">尺寸</button>
+        </div>
+
+        <section class="group" data-group="main">
+          <header class="groupHead">
+            <div class="groupTitle">主图</div>
+            <div class="groupMeta"><span class="count" data-count="main">0</span></div>
+            <label class="check"><input type="checkbox" data-invert="main"><span>全选/反选</span></label>
+            <button class="ghost small" type="button" data-download-selected="main">下载选中</button>
+          </header>
+          <div class="grid" data-grid="main"></div>
+        </section>
+
+        <section class="group" data-group="sku">
+          <header class="groupHead">
+            <div class="groupTitle">SKU</div>
+            <div class="groupMeta"><span class="count" data-count="sku">0</span></div>
+            <label class="check"><input type="checkbox" data-invert="sku"><span>全选/反选</span></label>
+            <button class="ghost small" type="button" data-download-selected="sku">下载选中</button>
+          </header>
+          <div class="grid" data-grid="sku"></div>
+        </section>
+
+        <section class="group" data-group="detail">
+          <header class="groupHead">
+            <div class="groupTitle">详情</div>
+            <div class="groupMeta"><span class="count" data-count="detail">0</span></div>
+            <label class="check"><input type="checkbox" data-invert="detail"><span>全选/反选</span></label>
+            <button class="ghost small" type="button" data-download-selected="detail">下载选中</button>
+          </header>
+          <div class="grid" data-grid="detail"></div>
+        </section>
+
+        <section class="group" data-group="size">
+          <header class="groupHead">
+            <div class="groupTitle">尺寸</div>
+            <div class="groupMeta"><span class="count" data-count="size">0</span></div>
+            <label class="check"><input type="checkbox" data-invert="size"><span>全选/反选</span></label>
+            <button class="ghost small" type="button" data-download-selected="size">下载选中</button>
+          </header>
+          <div class="grid" data-grid="size"></div>
+        </section>
+
+        <section class="group" data-group="video">
+          <header class="groupHead">
+            <div class="groupTitle">视频</div>
+            <div class="groupMeta"><span class="count" data-count="video">0</span></div>
+          </header>
+          <div class="grid" data-grid="video"></div>
+        </section>
+
+        <section class="group" data-group="all">
+          <header class="groupHead">
+            <div class="groupTitle">全部图片</div>
+            <div class="groupMeta"><span class="count" data-count="all">0</span></div>
+          </header>
+          <div class="grid" data-grid="all"></div>
+        </section>
+      </section>
+
+      <textarea id="summary" readonly></textarea>
+      <div class="statusbar">
+        <span id="status">待采集</span>
+        <span id="titleWarning" class="warn"></span>
+        <span id="message">打开商品页后点击采集。</span>
+      </div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

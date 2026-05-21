@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: ai-caiji-api
+Version: 0.1.0
+Summary: Phase 0 FastAPI skeleton for AI listing workbench
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: sqlalchemy<3.0,>=2.0
+Requires-Dist: psycopg[binary]<4.0,>=3.2
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
+Requires-Dist: pydantic-settings<3.0,>=2.4
+Requires-Dist: python-slugify<9.0,>=8.0
+Requires-Dist: pillow<11.0,>=10.4
+Requires-Dist: openpyxl<4.0,>=3.1
+Requires-Dist: cryptography<44.0,>=42.0
+Requires-Dist: openai<2.0,>=1.0

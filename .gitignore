@@ -1,0 +1,15 @@
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+
+node_modules/
+.next/
+out/
+
+storage/temp/*
+!storage/temp/.gitkeep
+storage/exports/*
+!storage/exports/.gitkeep

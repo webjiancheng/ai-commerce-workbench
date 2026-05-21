@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-caiji-api"
+version = "0.1.0"
+description = "Phase 0 FastAPI skeleton for AI listing workbench"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "sqlalchemy>=2.0,<3.0",
+  "psycopg[binary]>=3.2,<4.0",
+  "uvicorn[standard]>=0.30,<1.0",
+  "pydantic-settings>=2.4,<3.0",
+  "python-slugify>=8.0,<9.0",
+  "pillow>=10.4,<11.0",
+  "openpyxl>=3.1,<4.0",
+  "cryptography>=42.0,<44.0",
+  "openai>=1.0,<2.0"
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
