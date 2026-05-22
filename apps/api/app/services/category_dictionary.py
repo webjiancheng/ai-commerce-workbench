@@ -32,6 +32,22 @@ def _leaf_from_path(path: str) -> str:
     return parts[-1] if parts else path
 
 
+def _unique_category_paths() -> list[str]:
+    dictionary = load_temu_category_dictionary()
+    seen: set[str] = set()
+    paths: list[str] = []
+    for candidates in dictionary.values():
+        if not isinstance(candidates, list):
+            continue
+        for path in candidates:
+            path_text = str(path or "").strip()
+            if not path_text or path_text in seen:
+                continue
+            seen.add(path_text)
+            paths.append(path_text)
+    return sorted(paths, key=lambda item: (len(item), item))
+
+
 @lru_cache(maxsize=1)
 def load_temu_category_dictionary() -> dict[str, list[str]]:
     repo_root = Path(__file__).resolve().parents[4]
@@ -159,3 +175,33 @@ def recall_category_candidates_multi(
 
     ranked = sorted(merged.values(), key=lambda item: (item.score, len(item.path)), reverse=True)
     return ranked[:limit]
+
+
+def search_category_paths(*, query: str = "", limit: int = 200) -> list[str]:
+    all_paths = _unique_category_paths()
+    q = (query or "").strip()
+    if not q:
+        return all_paths[:limit]
+
+    q_lc = q.lower()
+    query_tokens = _tokenize(q)
+    ranked: list[tuple[float, str]] = []
+    for path in all_paths:
+        path_lc = path.lower()
+        leaf_lc = _leaf_from_path(path).lower()
+        score = 0.0
+        if q_lc in leaf_lc:
+            score += 3.0
+        if q_lc in path_lc:
+            score += 2.0
+        for token in query_tokens:
+            if token in leaf_lc:
+                score += 1.4
+            elif token in path_lc:
+                score += 0.8
+        if score <= 0:
+            continue
+        ranked.append((score, path))
+
+    ranked.sort(key=lambda item: (item[0], -len(item[1])), reverse=True)
+    return [path for _, path in ranked[:limit]]

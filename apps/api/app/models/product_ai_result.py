@@ -26,10 +26,7 @@ class ProductAIResult(Base):
     prompt_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     product_info: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     category_match: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    product_dna: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    title_cn: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     title_en: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    product_description: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     title_package: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     image_prompt_package: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 

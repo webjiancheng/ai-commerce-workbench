@@ -6,10 +6,12 @@ import {
   AiPurpose,
   AiProviderCapability,
   LocalAiProvider,
+  LocalAiRoute,
   deleteLocalAiProvider,
   ensureDefaultAiRoutes,
   loadLocalAiProviders,
   loadLocalAiRoutes,
+  saveLocalAiRoutes,
   setLocalAiRoute,
   upsertLocalAiProvider,
 } from "@/lib/local-settings";
@@ -19,21 +21,92 @@ function newId(): string {
   return `p_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
 }
 
-const PURPOSE_LABEL: Record<AiPurpose, string> = {
-  title: "标题生成",
-  image_generate: "通用生图",
-  image_4grid: "4宫格生图",
+type PurposeDefinition = {
+  key: AiPurpose;
+  label: string;
+  capability: AiProviderCapability;
+  group: string;
+  description: string;
+  required?: boolean;
+  builtIn?: boolean;
 };
 
-const PURPOSE_GROUPS: Array<{ title: string; purposes: AiPurpose[] }> = [
-  { title: "文案能力", purposes: ["title"] },
-  { title: "图片能力", purposes: ["image_generate", "image_4grid"] },
+const BUILT_IN_PURPOSES: PurposeDefinition[] = [
+  {
+    key: "title",
+    label: "标题生成",
+    capability: "text",
+    group: "核心文本链路",
+    description: "前端本地文本运行时的首选路由，至少配一个。",
+    required: true,
+    builtIn: true,
+  },
+  {
+    key: "product_info",
+    label: "商品理解 / 截图理解",
+    capability: "text",
+    group: "核心文本链路",
+    description: "对应 product_info_from_screenshot 这类理解步骤。",
+    builtIn: true,
+  },
+  {
+    key: "title_package_lite",
+    label: "轻量标题包",
+    capability: "text",
+    group: "核心文本链路",
+    description: "模式 2 使用的轻量标题链路，只生成标题和类目检索字段。",
+    builtIn: true,
+  },
+  {
+    key: "title_package",
+    label: "标题包生成",
+    capability: "text",
+    group: "核心文本链路",
+    description: "适合把标题、卖点、翻译统一交给一个文本模型。",
+    builtIn: true,
+  },
+  {
+    key: "image_prompt_package",
+    label: "AI 图片提示词包",
+    capability: "text",
+    group: "提示词与解析",
+    description: "你提到的“生成 AI 提示词”就是这一类，用文本模型产出生图 prompt。",
+    builtIn: true,
+  },
+  {
+    key: "dimension_extract",
+    label: "尺寸识别 / 尺寸图解析",
+    capability: "text",
+    group: "提示词与解析",
+    description: "用于尺寸图识别、尺寸字段抽取或补全。",
+    builtIn: true,
+  },
+  {
+    key: "image_generate",
+    label: "通用生图",
+    capability: "image",
+    group: "图片执行",
+    description: "主图、预览图、普通单图生成。",
+    required: true,
+    builtIn: true,
+  },
+  {
+    key: "image_4grid",
+    label: "4 宫格生图",
+    capability: "image",
+    group: "图片执行",
+    description: "四宫格母图或轮播图专用生图模型。",
+    required: true,
+    builtIn: true,
+  },
 ];
 
+const BUILT_IN_PURPOSE_MAP = new Map(BUILT_IN_PURPOSES.map((item) => [item.key, item]));
+
 const RECOMMENDED_COMBOS = [
-  "稳妥方案：标题走 DeepSeek / Qwen，生图走 OpenAI。",
-  "质量优先：标题和生图都走 OpenAI，配置最省事。",
-  "统一网关方案：如果你有聚合网关，就把标题模型和生图模型统一挂到一个出口。",
+  "稳妥方案：标题与提示词走 DeepSeek / Qwen，生图走 OpenAI 或你自己的图片网关。",
+  "质量优先：商品理解、标题包、图片提示词都走同一套高质量文本模型，生图单独走图片模型。",
+  "统一网关方案：如果你有聚合网关，把文本链路和图片链路统一挂到一个出口，再按用途细分模型名。",
 ];
 
 type TestResult = { ok: boolean; detail?: string; models?: string[] };
@@ -77,6 +150,25 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
   },
 ];
 
+function dedupeStrings(items: string[]): string[] {
+  return Array.from(new Set(items.map((item) => item.trim()).filter(Boolean)));
+}
+
+function getPurposeMeta(route: LocalAiRoute): PurposeDefinition {
+  const builtIn = BUILT_IN_PURPOSE_MAP.get(route.purpose);
+  if (builtIn) return builtIn;
+  const label = typeof route.params?.label === "string" && route.params.label.trim() ? route.params.label.trim() : route.purpose;
+  const capability = route.params?.capability === "image" ? "image" : "text";
+  return {
+    key: route.purpose,
+    label,
+    capability,
+    group: "扩展用途",
+    description: "自定义扩展用途。当前主要用于预留未来链路或临时实验。",
+    builtIn: false,
+  };
+}
+
 export default function AiSettingsWizardPage() {
   const [providers, setProviders] = useState<LocalAiProvider[]>([]);
   const [routes, setRoutes] = useState(() => loadLocalAiRoutes());
@@ -86,6 +178,11 @@ export default function AiSettingsWizardPage() {
 
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [testing, setTesting] = useState(false);
+  const [modelFilter, setModelFilter] = useState("");
+  const [showAllTestModels, setShowAllTestModels] = useState(false);
+  const [customPurposeKey, setCustomPurposeKey] = useState("");
+  const [customPurposeLabel, setCustomPurposeLabel] = useState("");
+  const [customPurposeCapability, setCustomPurposeCapability] = useState<AiProviderCapability>("text");
   const selectedKeyPreset =
     (selected
       ? PROVIDER_PRESETS.find(
@@ -102,6 +199,34 @@ export default function AiSettingsWizardPage() {
     if (!selectedId && items[0]?.id) setSelectedId(items[0].id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const customRoutes = useMemo(
+    () => routes.filter((route) => !BUILT_IN_PURPOSE_MAP.has(route.purpose)),
+    [routes],
+  );
+
+  const purposeGroups = useMemo(() => {
+    const definitions = [...BUILT_IN_PURPOSES, ...customRoutes.map(getPurposeMeta)];
+    const groups = new Map<string, PurposeDefinition[]>();
+    for (const definition of definitions) {
+      const items = groups.get(definition.group) || [];
+      items.push(definition);
+      groups.set(definition.group, items);
+    }
+    return Array.from(groups.entries()).map(([title, purposes]) => ({ title, purposes }));
+  }, [customRoutes]);
+
+  const filteredTestModels = useMemo(() => {
+    const models = dedupeStrings(testResult?.models || []);
+    if (!modelFilter.trim()) return models;
+    const keyword = modelFilter.trim().toLowerCase();
+    return models.filter((model) => model.toLowerCase().includes(keyword));
+  }, [modelFilter, testResult?.models]);
+
+  const visibleTestModels = useMemo(() => {
+    if (showAllTestModels || modelFilter.trim()) return filteredTestModels;
+    return filteredTestModels.slice(0, 36);
+  }, [filteredTestModels, modelFilter, showAllTestModels]);
 
   function refresh(): void {
     const items = loadLocalAiProviders();
@@ -126,6 +251,8 @@ export default function AiSettingsWizardPage() {
     refresh();
     setSelectedId(id);
     setTestResult(null);
+    setModelFilter("");
+    setShowAllTestModels(false);
   }
 
   function addFromPreset(preset: ProviderPreset): void {
@@ -146,11 +273,15 @@ export default function AiSettingsWizardPage() {
     refresh();
     setSelectedId(id);
     setTestResult(null);
+    setModelFilter("");
+    setShowAllTestModels(false);
   }
 
   async function testConnection(p: LocalAiProvider): Promise<void> {
     setTestResult(null);
     setTesting(true);
+    setModelFilter("");
+    setShowAllTestModels(false);
     try {
       const res = await fetch(`${apiBaseUrl}/api/ai/test-openai-compatible`, {
         method: "POST",
@@ -169,14 +300,16 @@ export default function AiSettingsWizardPage() {
         setTestResult({ ok: false, detail: json?.detail || `HTTP ${res.status}` });
         return;
       }
+      const discoveredModels = dedupeStrings(Array.isArray(json.models) ? json.models : []);
       upsertLocalAiProvider({
         ...p,
+        models: dedupeStrings([...(p.models || []), ...discoveredModels]),
         testStatus: "success",
         testedAt: new Date().toISOString(),
         testDetail: "",
       });
       refresh();
-      setTestResult({ ok: true, models: Array.isArray(json.models) ? json.models : [] });
+      setTestResult({ ok: true, models: discoveredModels });
     } catch (err) {
       upsertLocalAiProvider({
         ...p,
@@ -206,6 +339,32 @@ export default function AiSettingsWizardPage() {
     setTestResult(null);
   }
 
+  function addCustomPurpose(): void {
+    const purpose = customPurposeKey.trim();
+    const label = customPurposeLabel.trim();
+    if (!purpose) return;
+    if (routes.some((route) => route.purpose === purpose) || BUILT_IN_PURPOSE_MAP.has(purpose)) {
+      window.alert(`用途标识已存在：${purpose}`);
+      return;
+    }
+    setLocalAiRoute({
+      purpose,
+      providerId: "",
+      model: "",
+      params: { label: label || purpose, capability: customPurposeCapability, built_in: false },
+    });
+    refresh();
+    setCustomPurposeKey("");
+    setCustomPurposeLabel("");
+    setCustomPurposeCapability("text");
+  }
+
+  function removeCustomPurpose(purpose: AiPurpose): void {
+    const next = loadLocalAiRoutes().filter((route) => route.purpose !== purpose);
+    saveLocalAiRoutes(next);
+    refresh();
+  }
+
   return (
     <div className="min-h-screen px-4 py-6 md:px-6">
       <section className="mx-auto max-w-6xl space-y-6">
@@ -215,12 +374,12 @@ export default function AiSettingsWizardPage() {
               <div className="text-sm text-slate-500">运营可读 · 三步搞定</div>
               <h1 className="mt-1 text-3xl font-semibold">AI 配置向导</h1>
               <div className="mt-2 text-sm text-slate-600">
-                先添加接口（可多个），再把“标题生成 / 通用生图 / 4宫格生图”分配给对应模型。
+                先添加接口（可多个），再把不同用途分配给对应模型。文本链路和图片链路建议分开配置，排错更清楚。
               </div>
             </div>
             <Link
               href="/settings/ai/guide"
-              className="h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center"
+              className="inline-flex h-10 items-center rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
             >
               查看详细教程
             </Link>
@@ -265,6 +424,8 @@ export default function AiSettingsWizardPage() {
                   onClick={() => {
                     setSelectedId(p.id);
                     setTestResult(null);
+                    setModelFilter("");
+                    setShowAllTestModels(false);
                   }}
                   className={[
                     "w-full rounded-[18px] border px-4 py-3 text-left",
@@ -326,7 +487,7 @@ export default function AiSettingsWizardPage() {
                     placeholder="sk-..."
                   />
                   <div className="grid gap-2 pt-1 md:grid-cols-[1fr_auto]">
-                    <div className="h-9 w-full rounded-[12px] border border-slate-200 bg-slate-50 px-3 text-xs text-slate-600 inline-flex items-center">
+                    <div className="inline-flex h-9 w-full items-center rounded-[12px] border border-slate-200 bg-slate-50 px-3 text-xs text-slate-600">
                       {selectedKeyPreset
                         ? `已识别平台：${selectedKeyPreset.name.split("（")[0]}`
                         : "未识别平台：请确认名称或 Base URL"}
@@ -336,12 +497,12 @@ export default function AiSettingsWizardPage() {
                         href={selectedKeyPreset.keyUrl}
                         target="_blank"
                         rel="noreferrer"
-                        className="h-9 rounded-[12px] border border-slate-200 bg-white px-3 text-xs text-slate-700 hover:bg-slate-50 inline-flex items-center"
+                        className="inline-flex h-9 items-center rounded-[12px] border border-slate-200 bg-white px-3 text-xs text-slate-700 hover:bg-slate-50"
                       >
                         打开 {selectedKeyPreset.name.split("（")[0]} 官方 Key 页面
                       </a>
                     ) : (
-                      <span className="h-9 rounded-[12px] border border-slate-200 bg-white px-3 text-xs text-slate-400 inline-flex items-center">
+                      <span className="inline-flex h-9 items-center rounded-[12px] border border-slate-200 bg-white px-3 text-xs text-slate-400">
                         暂无匹配 Key 链接
                       </span>
                     )}
@@ -440,14 +601,27 @@ export default function AiSettingsWizardPage() {
 
                 {testResult?.ok && testResult.models?.length ? (
                   <div className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-semibold text-slate-700">可用模型（截取前 12 个）</div>
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      {testResult.models.slice(0, 12).map((m) => (
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-700">可用模型（支持搜索，不再只截前 12 个）</div>
+                        <div className="mt-1 text-[11px] text-slate-500">
+                          共发现 {filteredTestModels.length} 个模型。点模型标签可加入“常用模型”。
+                        </div>
+                      </div>
+                      <input
+                        value={modelFilter}
+                        onChange={(e) => setModelFilter(e.target.value)}
+                        className="h-9 w-full rounded-[12px] border border-slate-200 bg-white px-3 text-xs outline-none focus:border-slate-400 md:w-64"
+                        placeholder="搜索模型，例如 image / gpt / omni"
+                      />
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {visibleTestModels.map((m) => (
                         <button
                           key={m}
                           type="button"
                           onClick={() => {
-                            const next = Array.from(new Set([m, ...selected.models]));
+                            const next = dedupeStrings([m, ...selected.models]);
                             updateSelected({ models: next });
                           }}
                           className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
@@ -457,7 +631,18 @@ export default function AiSettingsWizardPage() {
                         </button>
                       ))}
                     </div>
-                    <div className="mt-2 text-[11px] text-slate-500">点模型标签可加入“常用模型”。</div>
+                    {!filteredTestModels.length ? (
+                      <div className="mt-3 text-[11px] text-slate-500">没有匹配结果。你也可以直接在上方“常用模型”里手填模型名。</div>
+                    ) : null}
+                    {!showAllTestModels && !modelFilter.trim() && filteredTestModels.length > visibleTestModels.length ? (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllTestModels(true)}
+                        className="mt-3 h-9 rounded-full border border-slate-200 bg-white px-3 text-xs text-slate-700 hover:bg-slate-50"
+                      >
+                        展开剩余 {filteredTestModels.length - visibleTestModels.length} 个模型
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -483,66 +668,109 @@ export default function AiSettingsWizardPage() {
             </div>
           </div>
 
-          <div className="text-sm font-semibold text-slate-900">3）用途分配（按现有流程保留必要项）</div>
+          <div className="mt-6 text-sm font-semibold text-slate-900">3）用途分配（按现有流程展开，并允许继续扩展）</div>
           <div className="mt-2 text-sm text-slate-600">
-            这里只保留当前系统真正会走到的用途：标题生成、通用生图、4宫格生图。没接入流程的用途先不展示，避免误配。
+            不再只保留 3 个用途。当前把已有流程里常见的文本理解、标题包、图片提示词、尺寸识别、导出校验、生图用途都展开；后面新增链路时，也可以先加“扩展用途”占位。
           </div>
 
           <div className="mt-4 grid gap-4 md:grid-cols-2">
-            {PURPOSE_GROUPS.map((group) => (
+            {purposeGroups.map((group) => (
               <div key={group.title} className="rounded-[20px] border border-slate-200 bg-slate-50 p-4">
                 <div className="text-xs font-semibold text-slate-700">{group.title}</div>
-                <div className="mt-3 space-y-3">
-                  {group.purposes.map((purpose) => {
-                    const current = routes.find((r) => r.purpose === purpose) || null;
-                    const requiredCapability: AiProviderCapability = group.title === "图片能力" ? "image" : "text";
+                <div className="mt-3 space-y-4">
+                  {group.purposes.map((purposeDef) => {
+                    const current = routes.find((r) => r.purpose === purposeDef.key) || null;
                     const selectableProviders = providers.filter(
-                      (p) => p.capabilities.includes(requiredCapability) && p.testStatus === "success",
+                      (p) => p.capabilities.includes(purposeDef.capability) && p.testStatus === "success",
                     );
                     const selectedProvider = current ? providers.find((p) => p.id === current.providerId) : null;
-                    const modelOptions = selectedProvider?.models || [];
+                    const modelOptions = dedupeStrings([
+                      ...(selectedProvider?.models || []),
+                      ...(Array.isArray(testResult?.models) && selectedProvider?.id === selected?.id ? testResult.models : []),
+                    ]);
 
                     return (
-                      <div key={purpose} className="grid gap-2 md:grid-cols-[140px_1fr_1fr] items-center">
-                        <div className="text-sm text-slate-700">{PURPOSE_LABEL[purpose]}</div>
-                        <select
-                          value={current?.providerId || ""}
-                          onChange={(e) => {
-                            const providerId = e.target.value;
-                            const provider = providers.find((p) => p.id === providerId);
-                            const model = provider?.models?.[0] || "";
-                            if (!providerId) return;
-                            setLocalAiRoute({ purpose, providerId, model });
-                            refresh();
-                          }}
-                          className="h-10 w-full rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                        >
-                          <option value="">选择接口</option>
-                          {selectableProviders.map((p) => (
-                            <option key={p.id} value={p.id}>
-                              {p.name}
-                            </option>
-                          ))}
-                        </select>
+                      <div key={purposeDef.key} className="rounded-[16px] border border-slate-200 bg-white p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-medium text-slate-900">{purposeDef.label}</div>
+                            <div className="mt-1 text-[11px] leading-5 text-slate-500">{purposeDef.description}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {purposeDef.required ? (
+                              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-700">
+                                必配
+                              </span>
+                            ) : null}
+                            {!purposeDef.builtIn ? (
+                              <button
+                                type="button"
+                                onClick={() => removeCustomPurpose(purposeDef.key)}
+                                className="rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] text-slate-600 hover:bg-slate-50"
+                              >
+                                删除扩展项
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="mt-3 grid gap-2 md:grid-cols-[1fr_1fr]">
+                          <select
+                            value={current?.providerId || ""}
+                            onChange={(e) => {
+                              const providerId = e.target.value;
+                              const provider = providers.find((p) => p.id === providerId);
+                              const model = provider?.models?.[0] || current?.model || "";
+                              setLocalAiRoute({
+                                purpose: purposeDef.key,
+                                providerId,
+                                model,
+                                params: {
+                                  ...(current?.params || {}),
+                                  label: purposeDef.label,
+                                  capability: purposeDef.capability,
+                                  built_in: Boolean(purposeDef.builtIn),
+                                },
+                              });
+                              refresh();
+                            }}
+                            className="h-10 w-full rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+                          >
+                            <option value="">选择接口</option>
+                            {selectableProviders.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            value={current?.model || ""}
+                            onChange={(e) => {
+                              setLocalAiRoute({
+                                purpose: purposeDef.key,
+                                providerId: current?.providerId || "",
+                                model: e.target.value,
+                                params: {
+                                  ...(current?.params || {}),
+                                  label: purposeDef.label,
+                                  capability: purposeDef.capability,
+                                  built_in: Boolean(purposeDef.builtIn),
+                                },
+                              });
+                              refresh();
+                            }}
+                            list={`models-${purposeDef.key}`}
+                            className="h-10 w-full rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+                            placeholder="模型名（可手填）"
+                          />
+                          <datalist id={`models-${purposeDef.key}`}>
+                            {modelOptions.map((m) => (
+                              <option key={m} value={m} />
+                            ))}
+                          </datalist>
+                        </div>
                         {current?.providerId && selectedProvider?.testStatus !== "success" ? (
-                          <div className="md:col-start-2 text-xs text-rose-600">该接口未测试成功，不能用于此用途，请先修复并测试通过。</div>
+                          <div className="mt-2 text-xs text-rose-600">该接口未测试成功，不能用于此用途，请先修复并测试通过。</div>
                         ) : null}
-                        <input
-                          value={current?.model || ""}
-                          onChange={(e) => {
-                            if (!current?.providerId) return;
-                            setLocalAiRoute({ ...current, model: e.target.value });
-                            refresh();
-                          }}
-                          list={`models-${purpose}`}
-                          className="h-10 w-full rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                          placeholder="模型名（可手填）"
-                        />
-                        <datalist id={`models-${purpose}`}>
-                          {modelOptions.map((m) => (
-                            <option key={m} value={m} />
-                          ))}
-                        </datalist>
                       </div>
                     );
                   })}
@@ -551,8 +779,44 @@ export default function AiSettingsWizardPage() {
             ))}
           </div>
 
+          <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 p-4">
+            <div className="text-xs font-semibold text-slate-700">新增扩展用途</div>
+            <div className="mt-2 text-[11px] leading-5 text-slate-500">
+              适合后续还没正式接入 UI 的链路先占位，例如新的提示词步骤、修图、OCR、审核等。标识建议用英文 snake_case。
+            </div>
+            <div className="mt-3 grid gap-2 md:grid-cols-[1fr_1fr_120px_auto]">
+              <input
+                value={customPurposeKey}
+                onChange={(e) => setCustomPurposeKey(e.target.value)}
+                className="h-10 rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+                placeholder="purpose key，例如 image_edit"
+              />
+              <input
+                value={customPurposeLabel}
+                onChange={(e) => setCustomPurposeLabel(e.target.value)}
+                className="h-10 rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+                placeholder="显示名称，例如 修图"
+              />
+              <select
+                value={customPurposeCapability}
+                onChange={(e) => setCustomPurposeCapability(e.target.value === "image" ? "image" : "text")}
+                className="h-10 rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+              >
+                <option value="text">文本</option>
+                <option value="image">图片</option>
+              </select>
+              <button
+                type="button"
+                onClick={addCustomPurpose}
+                className="h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
+              >
+                添加扩展用途
+              </button>
+            </div>
+          </div>
+
           <div className="mt-4 text-[11px] text-slate-500">
-            提示：接口类型先统一按“OpenAI 兼容”落地（豆包/DeepSeek/自建网关一般都能兼容）。后续如果要做“供应商专用配置”，再在这里扩展类型即可。
+            提示：接口类型先统一按“OpenAI 兼容”落地。后续如果要做供应商专用配置或不同用途的独立参数，再在这里继续扩展即可。
           </div>
 
           <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 p-4">

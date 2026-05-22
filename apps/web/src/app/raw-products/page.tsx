@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { HoverZoomImage } from "@/components/hover-zoom-image";
 import { apiBaseUrl } from "@/lib/api";
-import { resolveLocalTextRuntime } from "@/lib/local-settings";
+import { AiPurpose, resolveLocalTextRuntime } from "@/lib/local-settings";
 
 type RawProductListItem = {
   id: number;
@@ -79,6 +79,12 @@ function resolveThumbnail(item: RawProductListItem): string | null {
 function normalizeInput(value: string): string | null {
   const next = value.trim();
   return next.length ? next : null;
+}
+
+function getCreateTaskPurposes(mode: GenerationMode): AiPurpose[] {
+  if (mode === "no_ai") return ["title"];
+  if (mode === "title_only") return ["title_package_lite", "title"];
+  return ["image_prompt_package", "title_package", "product_info", "title"];
 }
 
 export default function RawProductsPage() {
@@ -250,7 +256,7 @@ export default function RawProductsPage() {
     setNotice(null);
     setError(null);
     try {
-      const localTextRuntime = resolveLocalTextRuntime();
+      const localTextRuntime = resolveLocalTextRuntime(getCreateTaskPurposes(generationMode));
       const aiHeaders: Record<string, string> = {};
       if (localTextRuntime?.apiKey) aiHeaders["X-AI-API-Key"] = localTextRuntime.apiKey;
       if (localTextRuntime?.baseUrl) aiHeaders["X-AI-Base-URL"] = localTextRuntime.baseUrl;

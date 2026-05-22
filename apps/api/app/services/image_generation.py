@@ -501,23 +501,17 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
 
     category_path = None
     product_info = None
-    product_dna = None
     title_cn = None
     title_package = None
     title_en_package = None
-    description = None
     selling_points: list[str] = []
 
     if isinstance(ai, ProductAIResult):
         category_out = (ai.category_match or {}).get("output") if isinstance(ai.category_match, dict) else {}
         category_path = task.selected_category_id or (category_out or {}).get("best_path") or (category_out or {}).get("selected_category")
         product_info = ((ai.product_info or {}).get("output") or None)
-        product_dna = ((ai.product_dna or {}).get("output") or None)
         title_package = ((ai.title_package or {}).get("output") or None)
-        title_cn = (
-            (title_package.get("title_cn") if isinstance(title_package, dict) else None)
-            or ((ai.title_cn or {}).get("output") or {}).get("title")
-        )
+        title_cn = title_package.get("title_cn") if isinstance(title_package, dict) else None
         if isinstance(title_package, dict) and title_package.get("title_en"):
             title_en_package = {
                 "title_en": title_package.get("title_en"),
@@ -526,7 +520,6 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
             }
         else:
             title_en_package = ((ai.title_en or {}).get("output") or None)
-        description = ((ai.product_description or {}).get("output") or {}).get("description")
         if isinstance(title_package, dict):
             raw_points = title_package.get("selling_points") or title_package.get("highlights") or []
             if isinstance(raw_points, list):
@@ -539,19 +532,17 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
         "selected_category_path": category_path or "",
         "category_path": category_path or "",
         "product_info": product_info or {},
-        "product_dna": product_dna or {},
         "title_package": title_package or {},
         "title_en_with_cn_translation": title_en_package or {},
         "selling_points": selling_points,
-        "material": (product_dna or {}).get("attributes", {}).get("material") if isinstance(product_dna, dict) else "",
-        "target_user": (product_dna or {}).get("attributes", {}).get("target_user") if isinstance(product_dna, dict) else "",
+        "material": "",
+        "target_user": "",
         "scenes": (
             (product_info or {}).get("product_core", {}).get("scene_keywords", [])
             if isinstance(product_info, dict)
             else []
         ),
         "reference_image_notes": raw.screenshot_url if raw else "",
-        "product_description": description or "",
         "slot": slot or "",
         "slot_purpose": SLOT_PURPOSE.get(slot or "", ""),
     }

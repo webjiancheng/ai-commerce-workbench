@@ -25,10 +25,8 @@ class ProductAiSummary(BaseModel):
     category_top3: list[CategoryTop3Item] = Field(default_factory=list)
     category_candidates: list[dict[str, Any]] = Field(default_factory=list)
     product_info: dict | None = None
-    product_dna: dict | None = None
     title_cn: str | None = None
     title_en: str | None = None
-    product_description: str | None = None
     title_package: dict | None = None
     image_prompt_package: dict | None = None
 

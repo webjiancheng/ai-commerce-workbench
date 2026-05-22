@@ -152,14 +152,7 @@ def build_ai_summary(ai_row: ProductAIResult | None) -> ProductAiSummary | None:
 
     product_info_out = (ai_row.product_info or {}).get("output") if isinstance(ai_row.product_info, dict) else None
     category_out = (ai_row.category_match or {}).get("output") if isinstance(ai_row.category_match, dict) else None
-    dna_out = (ai_row.product_dna or {}).get("output") if isinstance(ai_row.product_dna, dict) else None
-    title_cn_out = (ai_row.title_cn or {}).get("output") if isinstance(ai_row.title_cn, dict) else None
     title_en_out = (ai_row.title_en or {}).get("output") if isinstance(ai_row.title_en, dict) else None
-    desc_out = (
-        (ai_row.product_description or {}).get("output")
-        if isinstance(ai_row.product_description, dict)
-        else None
-    )
     title_package_out = (ai_row.title_package or {}).get("output") if isinstance(ai_row.title_package, dict) else None
     image_prompt_package_out = (
         (ai_row.image_prompt_package or {}).get("output")
@@ -191,14 +184,7 @@ def build_ai_summary(ai_row: ProductAIResult | None) -> ProductAiSummary | None:
         category_top3=top3_items,
         category_candidates=(category_out.get("candidates") or []) if isinstance(category_out, dict) else [],
         product_info=product_info_out if isinstance(product_info_out, dict) else None,
-        product_dna=dna_out if isinstance(dna_out, dict) else None,
-        title_cn=(
-            title_package_out.get("title_cn")
-            if isinstance(title_package_out, dict)
-            else title_cn_out.get("title")
-            if isinstance(title_cn_out, dict)
-            else None
-        ),
+        title_cn=title_package_out.get("title_cn") if isinstance(title_package_out, dict) else None,
         title_en=(
             title_package_out.get("title_en")
             if isinstance(title_package_out, dict) and title_package_out.get("title_en") is not None
@@ -208,7 +194,6 @@ def build_ai_summary(ai_row: ProductAIResult | None) -> ProductAiSummary | None:
             if isinstance(title_en_out, dict)
             else None
         ),
-        product_description=desc_out.get("description") if isinstance(desc_out, dict) else None,
         title_package=title_package_out if isinstance(title_package_out, dict) else None,
         image_prompt_package=image_prompt_package_out if isinstance(image_prompt_package_out, dict) else None,
     )
@@ -228,10 +213,7 @@ def update_product_task(session: Session, task: ProductTask, payload: ProductTas
 _PROMPT_LABELS: dict[str, str] = {
     "product_info": "商品理解",
     "category_match": "类目处理",
-    "product_dna": "商品 DNA",
-    "title_cn": "中文标题",
     "title_en": "英文标题",
-    "product_description": "商品描述",
     "title_package": "标题包",
     "image_prompt_package": "图片提示词包",
 }
@@ -308,10 +290,12 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
     ]
     prompt_type_map: dict[str, str] = {
         "product_info": "product_info_from_screenshot",
+        "category_match": "category_match",
         "title_package": "title_package",
         "image_prompt_package": "image_prompt_package",
     }
     prompt_snapshot = ai_row.prompt_snapshot if isinstance(ai_row.prompt_snapshot, dict) else {}
+    runtime_meta = prompt_snapshot.get("_runtime") if isinstance(prompt_snapshot.get("_runtime"), dict) else {}
 
     for field_name, label in _PROMPT_LABELS.items():
         payload = getattr(ai_row, field_name, None)
@@ -323,8 +307,12 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
         prompt = payload.get("prompt")
         input_obj = payload.get("input")
         duration_ms = payload.get("duration_ms")
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        cost = payload.get("cost") if isinstance(payload.get("cost"), dict) else {}
+        provider_meta = payload.get("provider") if isinstance(payload.get("provider"), dict) else {}
         prompt_type = prompt_type_map.get(field_name)
         prompt_meta = prompt_snapshot.get(prompt_type) if prompt_type and isinstance(prompt_snapshot.get(prompt_type), dict) else {}
+        resolved_prompt_type = str(prompt_meta.get("prompt_type") or prompt_type or "")
         status = "failed" if error else "success"
         if error:
             message = str(error)
@@ -335,12 +323,9 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
             message = f"生成标题包：{output.get('title_cn') or '-'} / {output.get('title_en') or '-'}"
         elif field_name == "image_prompt_package" and isinstance(output, dict):
             message = "已生成四宫格、轮播图和尺寸图提示词包。"
-        elif field_name in {"title_cn", "title_en"} and isinstance(output, dict):
+        elif field_name == "title_en" and isinstance(output, dict):
             title_value = output.get("title") or output.get("title_en") or "-"
             message = f"生成标题：{title_value}"
-        elif field_name == "product_description" and isinstance(output, dict):
-            bullets = len(output.get("bullet_points") or [])
-            message = f"生成商品描述，包含 {bullets} 条卖点。"
         else:
             message = f"{label} 已返回结果。"
         events.append(
@@ -355,7 +340,11 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
                     "model": model,
                     "duration_ms": duration_ms,
                     "has_prompt": bool(prompt),
-                    "prompt_type": prompt_type,
+                    "prompt_type": resolved_prompt_type,
+                    "runtime": runtime_meta,
+                    "provider": provider_meta,
+                    "usage": usage,
+                    "cost": cost,
                     "prompt_template": {
                         "template_id": prompt_meta.get("template_id"),
                         "scope": prompt_meta.get("scope"),

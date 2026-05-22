@@ -2,7 +2,7 @@
 
 import { apiBaseUrl } from "@/lib/api";
 import { HoverZoomImage } from "@/components/hover-zoom-image";
-import { resolveLocalTextRuntime } from "@/lib/local-settings";
+import { AiPurpose, resolveLocalTextRuntime } from "@/lib/local-settings";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
@@ -61,10 +61,8 @@ type ProductTaskDetail = ProductTaskListItem & {
     category_top3: { path: string; confidence: number | null }[];
     category_candidates: { path: string; score?: number | null; matched_terms?: string[] }[];
     product_info: Record<string, unknown> | null;
-    product_dna: Record<string, unknown> | null;
     title_cn: string | null;
     title_en: string | null;
-    product_description: string | null;
     title_package: Record<string, unknown> | null;
     image_prompt_package: Record<string, unknown> | null;
   } | null;
@@ -113,6 +111,7 @@ type RawProductDetail = {
   url: string;
   title: string;
   price: string | null;
+  category_path: string | null;
   platform_sku: string | null;
   source_id: string | null;
   screenshot_url: string | null;
@@ -124,14 +123,34 @@ type RawProductDetail = {
   created_at: string;
 };
 
-function buildAiRequestHeaders(includeJsonContentType = false): Record<string, string> {
-  const runtime = resolveLocalTextRuntime();
+function buildAiRequestHeaders(
+  includeJsonContentType = false,
+  preferredPurposes?: AiPurpose[],
+): Record<string, string> {
+  const runtime = resolveLocalTextRuntime(preferredPurposes);
   const headers: Record<string, string> = includeJsonContentType ? { "content-type": "application/json" } : {};
   if (!runtime) return headers;
   if (runtime.apiKey) headers["X-AI-API-Key"] = runtime.apiKey;
   if (runtime.baseUrl) headers["X-AI-Base-URL"] = runtime.baseUrl;
   if (runtime.model) headers["X-AI-Model"] = runtime.model;
   return headers;
+}
+
+function mapPromptTypesToPurposes(promptTypes?: string[]): AiPurpose[] {
+  if (!promptTypes?.length) {
+    return ["image_prompt_package", "title_package", "product_info", "title"];
+  }
+
+  const mapped = new Set<AiPurpose>();
+  for (const type of promptTypes) {
+    if (type === "product_info_from_screenshot") mapped.add("product_info");
+    else if (type === "title_package_lite") mapped.add("title_package_lite");
+    else if (type === "title_package") mapped.add("title_package");
+    else if (type === "dimension_extract_from_image") mapped.add("dimension_extract");
+    else if (type.startsWith("image_prompt_") || type === "image_prompt_package") mapped.add("image_prompt_package");
+    else mapped.add("title");
+  }
+  return Array.from(mapped);
 }
 
 type ProductAsset = {
@@ -158,6 +177,7 @@ type RowMeta = {
   raw: RawProductDetail | null;
   assets: AssetsBySlotResponse;
   detail: ProductTaskDetail | null;
+  exportDraft: ExportFieldDraft | null;
 };
 
 type ExportFieldDraft = {
@@ -188,9 +208,20 @@ type WorkbenchDetailResponse = {
   export_draft: ExportFieldDraft | null;
 };
 
+type CategorySearchItem = {
+  path: string;
+  leaf: string;
+};
+
+type CategorySearchResponse = {
+  items: CategorySearchItem[];
+  total: number;
+  query: string;
+};
+
 type ViewMode = "cards" | "table";
 type DrawerSize = "50" | "70" | "100";
-type DrawerTab = "images" | "info" | "defaults" | "raw";
+type DrawerTab = "trace" | "images" | "info" | "defaults" | "raw";
 
 type PromptEditorConfig = {
   fieldLabel: string;
@@ -241,6 +272,7 @@ function statusText(status: string): string {
     warning: "警告",
     low_confidence: "置信度低",
     ready: "已就绪",
+    skipped: "已跳过",
   };
   return map[status] || status;
 }
@@ -257,6 +289,18 @@ function formatJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function formatInteger(value: unknown): string {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return Math.round(num).toLocaleString("zh-CN");
+}
+
+function formatMoney(value: unknown, currency = "USD"): string {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return `${currency} ${num.toFixed(num >= 0.1 ? 4 : 6)}`;
 }
 
 async function copyTraceEvent(event: ProductTaskTimelineEvent): Promise<void> {
@@ -327,7 +371,7 @@ export default function ProductTasksPage() {
   const [status, setStatus] = useState<TaskMainStatus | "">("");
   const [categoryStatus, setCategoryStatus] = useState<CategoryStatus | "">("");
   const [exportStatus, setExportStatus] = useState<ExportStatus | "">("");
-  const [exceptionOnly, setExceptionOnly] = useState<boolean>(pathname === "/logs" || searchParams.get("exception") === "1");
+  const [exceptionOnly, setExceptionOnly] = useState<boolean>(searchParams.get("exception") === "1");
   const [lowConfidenceOnly, setLowConfidenceOnly] = useState<boolean>(searchParams.get("low_confidence") === "1");
 
   const [loading, setLoading] = useState(false);
@@ -346,6 +390,7 @@ export default function ProductTasksPage() {
   const [rowLoading, setRowLoading] = useState<Record<number, string>>({});
   const [quickTitleDrafts, setQuickTitleDrafts] = useState<Record<number, string>>({});
   const [quickCategoryDrafts, setQuickCategoryDrafts] = useState<Record<number, string>>({});
+  const [categoryOptions, setCategoryOptions] = useState<CategorySearchItem[]>([]);
   const [bulkTitleMode, setBulkTitleMode] = useState<"current" | "raw" | "ai">("ai");
   const [bulkTitlePrefix, setBulkTitlePrefix] = useState("");
   const [bulkTitleSuffix, setBulkTitleSuffix] = useState("");
@@ -353,7 +398,7 @@ export default function ProductTasksPage() {
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerSize, setDrawerSize] = useState<DrawerSize>("70");
-  const [drawerTab, setDrawerTab] = useState<DrawerTab>("images");
+  const [drawerTab, setDrawerTab] = useState<DrawerTab>(pathname === "/logs" ? "trace" : "images");
   const [activeTaskId, setActiveTaskId] = useState<number | null>(null);
   const [taskDetail, setTaskDetail] = useState<ProductTaskDetail | null>(null);
   const [rawDetail, setRawDetail] = useState<RawProductDetail | null>(null);
@@ -368,17 +413,33 @@ export default function ProductTasksPage() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    async function loadCategoryOptions(): Promise<void> {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/categories/search?limit=5000`, { cache: "no-store" });
+        if (!response.ok) return;
+        const result = (await response.json()) as CategorySearchResponse;
+        if (!cancelled) {
+          setCategoryOptions(result.items || []);
+        }
+      } catch {
+        // ignore category preload failure
+      }
+    }
+    void loadCategoryOptions();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     window.localStorage.setItem(DRAWER_SIZE_KEY, drawerSize);
   }, [drawerSize]);
 
   useEffect(() => {
     const nextView: ViewMode = pathname === "/logs" || searchParams.get("view") === "logs" ? "cards" : "table";
     setViewMode(nextView);
-    if (pathname === "/logs" || searchParams.get("view") === "logs") {
-      if (searchParams.get("exception") === null && searchParams.get("low_confidence") === null) {
-        setExceptionOnly(true);
-      }
-    }
+    setDrawerTab(pathname === "/logs" ? "trace" : "images");
   }, [pathname, searchParams]);
 
   const queryString = useMemo(() => {
@@ -415,21 +476,21 @@ export default function ProductTasksPage() {
     }
   }
 
+  async function loadTaskTimeline(taskId: number): Promise<ProductTaskTimelineResponse> {
+    const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/timeline`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return (await response.json()) as ProductTaskTimelineResponse;
+  }
+
   async function loadTimelines(items: ProductTaskListItem[]): Promise<void> {
     if (!items.length) {
       setTimelineMap({});
       return;
     }
     try {
-      const results = await Promise.all(
-        items.map(async (item) => {
-          const response = await fetch(`${apiBaseUrl}/api/product-tasks/${item.id}/timeline`, {
-            cache: "no-store",
-          });
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          return (await response.json()) as ProductTaskTimelineResponse;
-        }),
-      );
+      const results = await Promise.all(items.map((item) => loadTaskTimeline(item.id)));
       setTimelineMap(
         results.reduce<Record<number, ProductTaskTimelineResponse>>((acc, timeline) => {
           acc[timeline.task_id] = timeline;
@@ -445,6 +506,33 @@ export default function ProductTasksPage() {
     void loadList();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryString]);
+
+  useEffect(() => {
+    const hasRunningTask = data.items.some(
+      (item) =>
+        item.main_status === "ai_running" ||
+        item.main_status === "image_running" ||
+        item.category_status === "running" ||
+        item.title_status === "running" ||
+        item.image_prompt_status === "running" ||
+        item.image_status === "running",
+    );
+    if (!hasRunningTask) return;
+
+    const timer = window.setInterval(() => {
+      void loadList();
+      if (drawerOpen && activeTaskId) {
+        void loadWorkbenchDetail(activeTaskId).catch(() => {
+          // ignore polling errors
+        });
+      }
+    }, 5000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.items, drawerOpen, activeTaskId]);
 
   const currentPage = Math.floor(data.offset / data.limit) + 1;
   const totalPages = Math.max(1, Math.ceil((data.total || 0) / data.limit));
@@ -474,18 +562,23 @@ export default function ProductTasksPage() {
   }
 
   async function loadWorkbenchDetail(taskId: number): Promise<void> {
-    const detailRes = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/workbench-detail`, {
-      cache: "no-store",
-    });
+    const [detailRes, timeline] = await Promise.all([
+      fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/workbench-detail`, {
+        cache: "no-store",
+      }),
+      loadTaskTimeline(taskId),
+    ]);
     if (!detailRes.ok) throw new Error(`加载详情失败: HTTP ${detailRes.status}`);
     const detail = (await detailRes.json()) as WorkbenchDetailResponse;
     setTaskDetail(detail.task);
     setRawDetail(detail.raw);
+    setTimelineMap((prev) => ({ ...prev, [taskId]: timeline }));
   }
 
   async function openDrawer(taskId: number): Promise<void> {
     setDrawerOpen(true);
     setActiveTaskId(taskId);
+    setDrawerTab(pathname === "/logs" ? "trace" : "images");
     setDrawerLoading(true);
     setDrawerError(null);
     setTaskDetail(null);
@@ -509,18 +602,24 @@ export default function ProductTasksPage() {
     const pairs = await Promise.all(
       items.map(async (item) => {
         try {
-          const [rawRes, assetsRes, detailRes] = await Promise.all([
-            fetch(`${apiBaseUrl}/api/raw-products/${item.raw_product_id}`, { cache: "no-store" }),
-            fetch(`${apiBaseUrl}/api/product-tasks/${item.id}/assets`, { cache: "no-store" }),
-            fetch(`${apiBaseUrl}/api/product-tasks/${item.id}`, { cache: "no-store" }),
-          ]);
-
-          const raw = rawRes.ok ? ((await rawRes.json()) as RawProductDetail) : null;
-          const assets = assetsRes.ok ? (((await assetsRes.json()) as AssetsBySlotResponse) || {}) : {};
-          const detail = detailRes.ok ? ((await detailRes.json()) as ProductTaskDetail) : null;
-          return [item.id, { raw, assets, detail }] as const;
+          const response = await fetch(`${apiBaseUrl}/api/product-tasks/${item.id}/workbench-detail`, {
+            cache: "no-store",
+          });
+          if (!response.ok) {
+            return [item.id, { raw: null, assets: {}, detail: null, exportDraft: null }] as const;
+          }
+          const payload = (await response.json()) as WorkbenchDetailResponse;
+          return [
+            item.id,
+            {
+              raw: payload.raw,
+              assets: payload.assets || {},
+              detail: payload.task,
+              exportDraft: payload.export_draft || null,
+            },
+          ] as const;
         } catch {
-          return [item.id, { raw: null, assets: {}, detail: null }] as const;
+          return [item.id, { raw: null, assets: {}, detail: null, exportDraft: null }] as const;
         }
       }),
     );
@@ -532,7 +631,8 @@ export default function ProductTasksPage() {
       for (const item of items) {
         const meta = nextMeta[item.id];
         if (!next[item.id]) {
-          next[item.id] = meta?.detail?.title || item.title || "";
+          next[item.id] =
+            String(meta?.exportDraft?.fields_json?.product_title_en || meta?.detail?.ai?.title_en || "").trim();
         }
       }
       return next;
@@ -593,7 +693,7 @@ export default function ProductTasksPage() {
   async function generateFourGrid(taskId: number): Promise<void> {
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-images`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: buildAiRequestHeaders(true, ["image_prompt_package", "dimension_extract", "title_package"]),
       body: JSON.stringify({
         job_type: "carousel_4grid",
         slots: ["carousel_1", "carousel_2", "carousel_3", "carousel_4"],
@@ -606,7 +706,7 @@ export default function ProductTasksPage() {
   async function runAi(taskId: number): Promise<void> {
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/run-ai`, {
       method: "POST",
-      headers: buildAiRequestHeaders(true),
+      headers: buildAiRequestHeaders(true, ["image_prompt_package", "title_package", "product_info", "title"]),
       body: JSON.stringify({}),
     });
     const result = (await response.json()) as { detail?: string };
@@ -616,7 +716,7 @@ export default function ProductTasksPage() {
   async function generateTitles(taskId: number): Promise<void> {
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-titles`, {
       method: "POST",
-      headers: buildAiRequestHeaders(),
+      headers: buildAiRequestHeaders(false, ["title_package", "title"]),
     });
     const result = (await response.json()) as { detail?: string };
     if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
@@ -625,14 +725,14 @@ export default function ProductTasksPage() {
   async function saveQuickTitle(taskId: number): Promise<void> {
     const manualValue = (quickTitleDrafts[taskId] || "").trim();
     if (!manualValue) {
-      setNotice("标题不能为空");
+      setNotice("英文标题不能为空");
       return;
     }
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/field-choice`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        field_key: "task_title",
+        field_key: "product_title_en",
         selected_source: "manual",
         manual_value: manualValue,
       }),
@@ -672,15 +772,15 @@ export default function ProductTasksPage() {
           bulkTitleMode === "raw"
             ? meta?.raw?.title || listItem?.title || ""
             : bulkTitleMode === "ai"
-              ? meta?.detail?.ai?.title_cn || meta?.detail?.title || listItem?.title || ""
-              : quickTitleDrafts[taskId] || meta?.detail?.title || listItem?.title || "";
+              ? meta?.detail?.ai?.title_en || ""
+              : quickTitleDrafts[taskId] || String(meta?.exportDraft?.fields_json?.product_title_en || "").trim();
         const nextTitle = `${bulkTitlePrefix}${baseTitle}${bulkTitleSuffix}`.trim();
         if (!nextTitle) continue;
         await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/field-choice`, {
           method: "PATCH",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            field_key: "task_title",
+            field_key: "product_title_en",
             selected_source: "manual",
             manual_value: nextTitle,
           }),
@@ -689,7 +789,7 @@ export default function ProductTasksPage() {
           if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
         });
       }
-      setNotice(`已批量更新 ${selectedIds.length} 个商品标题。`);
+      setNotice(`已批量更新 ${selectedIds.length} 个商品英文标题。`);
       await loadList();
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量改标题失败");
@@ -1237,6 +1337,7 @@ export default function ProductTasksPage() {
               onToggleSelectAll={toggleSelectAll}
               quickTitleDrafts={quickTitleDrafts}
               quickCategoryDrafts={quickCategoryDrafts}
+              categoryOptions={categoryOptions}
               rowLoading={rowLoading}
               onQuickTitleChange={(taskId, value) =>
                 setQuickTitleDrafts((prev) => ({ ...prev, [taskId]: value }))
@@ -1247,6 +1348,7 @@ export default function ProductTasksPage() {
               onPickCandidate={(taskId, path) =>
                 setQuickCategoryDrafts((prev) => ({ ...prev, [taskId]: path }))
               }
+              onRunAi={(taskId) => void runRowAction(taskId, "run-ai", () => runAi(taskId))}
               onGenerateTitles={(taskId) => void runRowAction(taskId, "gen-title", () => generateTitles(taskId))}
               onSaveTitle={(taskId) => void runRowAction(taskId, "save-title", () => saveQuickTitle(taskId))}
               onSaveCategory={(taskId) => void runRowAction(taskId, "save-category", () => saveQuickCategory(taskId))}
@@ -1351,12 +1453,17 @@ export default function ProductTasksPage() {
               <div className="border-b border-slate-200 px-5 py-3">
                 <div className="flex flex-wrap gap-2">
                   {(
-                    [
-                      { key: "images", label: "图片处理" },
-                      { key: "info", label: "商品信息" },
-                      { key: "defaults", label: "上架默认值" },
-                      { key: "raw", label: "原始采集" },
-                    ] as const
+                    isLogsRoute
+                      ? ([
+                          { key: "trace", label: "流程排查" },
+                          { key: "info", label: "商品信息" },
+                        ] as const)
+                      : ([
+                          { key: "images", label: "图片处理" },
+                          { key: "info", label: "商品信息" },
+                          { key: "defaults", label: "上架默认值" },
+                          { key: "raw", label: "原始采集" },
+                        ] as const)
                   ).map((tab) => (
                     <button
                       key={tab.key}
@@ -1391,6 +1498,7 @@ export default function ProductTasksPage() {
                     raw={rawDetail}
                     timeline={activeTaskId ? timelineMap[activeTaskId] || null : null}
                     onRefresh={activeTaskId ? () => loadWorkbenchDetail(activeTaskId) : undefined}
+                    isLogsRoute={isLogsRoute}
                   />
                 )}
               </div>
@@ -1506,7 +1614,7 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-images`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: buildAiRequestHeaders(true, ["image_prompt_package", "dimension_extract", "title_package"]),
         body: JSON.stringify({ job_type: "carousel_4grid" }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -1524,7 +1632,7 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-image`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: buildAiRequestHeaders(true, slot === "size_chart" ? ["dimension_extract", "image_prompt_package"] : ["image_prompt_package", "title_package"]),
         body: JSON.stringify({ slot }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -1744,6 +1852,35 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
               </div>
             </button>
           ))}
+        </div>
+      </Section>
+
+      <Section title="原始采集图片总览">
+        <div className="grid gap-4 xl:grid-cols-2">
+          <ImageGallerySection
+            title="主图 / 轮播图"
+            description="完整回显采集到的主图和轮播图，未生成 AI 图时这里就是后续选图基础。"
+            images={[...(raw?.main_image ? [raw.main_image] : []), ...(raw?.carousel_images || [])]}
+            onPreview={(src, index) =>
+              setLightbox({
+                src,
+                alt: `raw-carousel-${index + 1}`,
+                caption: `原始主图/轮播图 · 第 ${index + 1} 张`,
+              })
+            }
+          />
+          <ImageGallerySection
+            title="详情图 / SKU 图"
+            description="把详情图、SKU 图全部展开，方便在抽屉里直接核对和换图。"
+            images={[...(raw?.detail_images || []), ...(raw?.sku_images || [])]}
+            onPreview={(src, index) =>
+              setLightbox({
+                src,
+                alt: `raw-detail-${index + 1}`,
+                caption: `原始详情/SKU 图 · 第 ${index + 1} 张`,
+              })
+            }
+          />
         </div>
       </Section>
 
@@ -2663,10 +2800,12 @@ function WorkbenchTable({
   onToggleSelectAll,
   quickTitleDrafts,
   quickCategoryDrafts,
+  categoryOptions,
   rowLoading,
   onQuickTitleChange,
   onQuickCategoryChange,
   onPickCandidate,
+  onRunAi,
   onGenerateTitles,
   onSaveTitle,
   onSaveCategory,
@@ -2683,10 +2822,12 @@ function WorkbenchTable({
   onToggleSelectAll: () => void;
   quickTitleDrafts: Record<number, string>;
   quickCategoryDrafts: Record<number, string>;
+  categoryOptions: CategorySearchItem[];
   rowLoading: Record<number, string>;
   onQuickTitleChange: (taskId: number, value: string) => void;
   onQuickCategoryChange: (taskId: number, value: string) => void;
   onPickCandidate: (taskId: number, path: string) => void;
+  onRunAi: (taskId: number) => void;
   onGenerateTitles: (taskId: number) => void;
   onSaveTitle: (taskId: number) => void;
   onSaveCategory: (taskId: number) => void;
@@ -2696,8 +2837,9 @@ function WorkbenchTable({
   onOpenPromptEditor: (fieldLabel: string, promptTypes: string[]) => void;
 }) {
   return (
-    <div className="overflow-x-auto rounded-[24px] border border-slate-200 bg-white">
-      <table className="min-w-full border-collapse text-left text-sm">
+    <>
+      <div className="overflow-x-auto rounded-[24px] border border-slate-200 bg-white">
+        <table className="min-w-full border-collapse text-left text-sm">
         <thead className="bg-slate-100 text-slate-600">
           <tr>
             <th className="px-4 py-3 font-medium">
@@ -2706,7 +2848,7 @@ function WorkbenchTable({
             <th className="px-4 py-3 font-medium">商品缩略图</th>
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
-                label="标题处理"
+                label="英文标题"
                 onEditPrompt={() => onOpenPromptEditor("标题处理", ["product_info_from_screenshot", "title_package"])}
               />
             </th>
@@ -2795,9 +2937,11 @@ function WorkbenchTable({
                     ? "失败"
                     : "警告"
                 : null;
-              const aiTitleText = detail?.ai?.title_cn ? detail.ai.title_cn : item.main_status === "ai_running" ? "AI 处理中" : "待生成";
+              const originalEnTitleText = String(meta?.raw?.title || item.title || "").trim() || "暂无原始标题";
+              const aiTitleCnText = detail?.ai?.title_cn || (item.main_status === "ai_running" ? "AI 处理中" : "待生成");
+              const aiTitleEnText = detail?.ai?.title_en ? detail.ai.title_en : item.main_status === "ai_running" ? "AI 处理中" : "待生成";
               const aiCategoryText = detail?.ai?.category_best_path || item.selected_category_id || "";
-              const quickTitle = quickTitleDrafts[item.id] ?? detail?.title ?? item.title;
+              const quickTitle = quickTitleDrafts[item.id] ?? String(meta?.exportDraft?.fields_json?.product_title_en || detail?.ai?.title_en || "").trim();
               const quickCategory = quickCategoryDrafts[item.id] ?? detail?.selected_category_id ?? detail?.ai?.category_best_path ?? "";
 
               return (
@@ -2819,27 +2963,37 @@ function WorkbenchTable({
                   <td className="px-4 py-3">
                     <div className="w-[280px] space-y-2">
                       <div className="rounded-[12px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                        <div className="text-[11px] text-slate-500">原始标题</div>
-                        <HoverTitleText value={meta?.raw?.title || item.title} />
+                        <div className="text-[11px] text-slate-500">原英文标题（采集）</div>
+                        <HoverTitleText value={originalEnTitleText} />
+                        <div className="mt-2 text-[11px] text-slate-500">AI 中文标题</div>
+                        <HoverTitleText value={aiTitleCnText} />
                       </div>
                       <div className="rounded-[12px] border border-sky-200 bg-sky-50 p-3 text-xs text-slate-600">
-                        <div className="text-[11px] text-slate-500">AI 标题</div>
-                        <div className="mt-1 line-clamp-2 text-slate-800">{aiTitleText || "-"}</div>
+                        <div className="text-[11px] text-slate-500">AI 英文标题</div>
+                        <div className="mt-1 line-clamp-3 text-slate-800">{aiTitleEnText || "-"}</div>
                       </div>
                       <input
                         value={quickTitle}
                         onChange={(event) => onQuickTitleChange(item.id, event.target.value)}
                         className="h-10 w-full rounded-[12px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                        placeholder="最终导出标题"
+                        placeholder="可修改的英文上架标题"
                       />
                       <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => onRunAi(item.id)}
+                          disabled={rowAction !== ""}
+                          className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                        >
+                          {rowAction === "run-ai" ? "AI生成中..." : "重新 AI生成"}
+                        </button>
                         <button
                           type="button"
                           onClick={() => onGenerateTitles(item.id)}
                           disabled={rowAction !== ""}
                           className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
                         >
-                          {rowAction === "gen-title" ? "生成中..." : "生成标题"}
+                          {rowAction === "gen-title" ? "生成中..." : "重生英文标题"}
                         </button>
                         <button
                           type="button"
@@ -2847,7 +3001,7 @@ function WorkbenchTable({
                           disabled={rowAction !== ""}
                           className="rounded-full border border-slate-900 bg-slate-900 px-3 py-1 text-xs text-white hover:bg-slate-800"
                         >
-                          {rowAction === "save-title" ? "保存中..." : "保存标题"}
+                          {rowAction === "save-title" ? "保存中..." : "保存英文标题"}
                         </button>
                       </div>
                     </div>
@@ -2860,6 +3014,7 @@ function WorkbenchTable({
                       <input
                         value={quickCategory}
                         onChange={(event) => onQuickCategoryChange(item.id, event.target.value)}
+                        list="category-options"
                         className="h-10 w-full rounded-[12px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
                         placeholder="最终导出类目"
                       />
@@ -2971,7 +3126,7 @@ function WorkbenchTable({
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    <TableCarouselFieldCell assets={meta?.assets} />
+                    <TableCarouselFieldCell assets={meta?.assets} raw={meta?.raw || null} />
                   </td>
                   <td className="px-4 py-3">
                     <div className="space-y-2">
@@ -3048,6 +3203,14 @@ function WorkbenchTable({
                       </button>
                       <button
                         type="button"
+                        onClick={() => onRunAi(item.id)}
+                        disabled={rowAction !== ""}
+                        className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+                      >
+                        {rowAction === "run-ai" ? "AI生成中..." : "重新AI生成"}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => onGenerateFourGrid(item.id)}
                         disabled={rowAction !== ""}
                         className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
@@ -3062,6 +3225,11 @@ function WorkbenchTable({
                       >
                         删除
                       </button>
+                      {rowAction ? (
+                        <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-700">
+                          处理中：{rowAction}
+                        </span>
+                      ) : null}
                     </div>
                   </td>
                 </tr>
@@ -3069,8 +3237,16 @@ function WorkbenchTable({
             })
           )}
         </tbody>
-      </table>
-    </div>
+        </table>
+      </div>
+      <datalist id="category-options">
+        {categoryOptions.map((option) => (
+          <option key={option.path} value={option.path}>
+            {option.leaf}
+          </option>
+        ))}
+      </datalist>
+    </>
   );
 }
 
@@ -3101,7 +3277,13 @@ function TableFourGridCell({
   );
 }
 
-function TableCarouselFieldCell({ assets }: { assets: AssetsBySlotResponse | undefined }) {
+function TableCarouselFieldCell({
+  assets,
+  raw,
+}: {
+  assets: AssetsBySlotResponse | undefined;
+  raw: RawProductDetail | null;
+}) {
   const carouselSlots = [
     "carousel_1",
     "carousel_2",
@@ -3115,6 +3297,11 @@ function TableCarouselFieldCell({ assets }: { assets: AssetsBySlotResponse | und
   const exportAssets = carouselSlots
     .map((slot) => ({ slot, asset: selectedSlotAsset(assets, slot) }))
     .filter((item) => item.asset?.public_url);
+  const rawFallbackImages = [
+    ...(raw?.main_image ? [raw.main_image] : []),
+    ...(raw?.carousel_images || []),
+    ...(raw?.detail_images || []),
+  ];
 
   return (
     <div className="w-[180px] space-y-2">
@@ -3122,11 +3309,23 @@ function TableCarouselFieldCell({ assets }: { assets: AssetsBySlotResponse | und
         {carouselSlots.map((slot, index) => (
           <div key={slot} className="space-y-1">
             <div className="text-center text-[10px] text-slate-400">{index + 1}</div>
-            <TableMiniImage asset={selectedSlotAsset(assets, slot)} fallback={String(index + 1)} />
+            {selectedSlotAsset(assets, slot)?.public_url ? (
+              <TableMiniImage asset={selectedSlotAsset(assets, slot)} fallback={String(index + 1)} />
+            ) : rawFallbackImages[index] ? (
+              <HoverZoomImage
+                src={rawFallbackImages[index]}
+                alt={`raw-carousel-${index + 1}`}
+                thumbClassName="h-12 w-12 rounded-lg border border-slate-200 bg-white p-1 object-contain"
+              />
+            ) : (
+              <TableMiniImage asset={null} fallback={String(index + 1)} />
+            )}
           </div>
         ))}
       </div>
-      <div className="text-[11px] text-slate-500">当前导出 {exportAssets.length} 张，顺序按 1-8 轮播位。</div>
+      <div className="text-[11px] text-slate-500">
+        当前导出 {exportAssets.length} 张；无 AI 图时回显采集到的主图/轮播图。
+      </div>
     </div>
   );
 }
@@ -3173,12 +3372,14 @@ function DrawerTabContent({
   raw,
   timeline,
   onRefresh,
+  isLogsRoute,
 }: {
   tab: DrawerTab;
   task: ProductTaskDetail | null;
   raw: RawProductDetail | null;
   timeline: ProductTaskTimelineResponse | null;
   onRefresh?: (() => Promise<void>) | undefined;
+  isLogsRoute: boolean;
 }) {
   if (!task) {
     return (
@@ -3189,7 +3390,15 @@ function DrawerTabContent({
   }
 
   if (tab === "info") {
-    return <InfoTab task={task} raw={raw} timeline={timeline} onRefresh={onRefresh} />;
+    return <InfoTab task={task} raw={raw} timeline={timeline} onRefresh={onRefresh} isLogsRoute={isLogsRoute} />;
+  }
+
+  if (tab === "trace") {
+    return <TraceTab task={task} raw={raw} timeline={timeline} />;
+  }
+
+  if (isLogsRoute) {
+    return <InfoTab task={task} raw={raw} timeline={timeline} onRefresh={onRefresh} isLogsRoute={isLogsRoute} />;
   }
 
   if (tab === "images") {
@@ -3284,26 +3493,853 @@ function HoverTitleText({ value }: { value: string }) {
   );
 }
 
+function TraceTab({
+  task,
+  raw,
+  timeline,
+}: {
+  task: ProductTaskDetail;
+  raw: RawProductDetail | null;
+  timeline: ProductTaskTimelineResponse | null;
+}) {
+  const allEvents = timeline?.events || [];
+  const aiEvents = allEvents.filter((event) => String(event.stage).startsWith("ai."));
+  const backendEvents = allEvents.filter((event) => !String(event.stage).startsWith("ai."));
+  const categoryEvent = aiEvents.find((event) => event.stage === "ai.category_match") || null;
+  const categoryOutput = ((categoryEvent?.meta?.output as Record<string, unknown> | undefined) || {});
+  const categoryInput = ((categoryEvent?.meta?.input as Record<string, unknown> | undefined) || {});
+  const categoryQueries = (((categoryInput.queries as Record<string, unknown> | undefined)?.queries as unknown[]) || [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const categoryQuerySources = (((categoryInput.queries as Record<string, unknown> | undefined)?.query_sources as unknown[]) || [])
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+  const categoryCandidates = ((categoryOutput.candidates as unknown[]) || [])
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+  const categoryKeywords = ((categoryOutput.category_search_keywords as unknown[]) || [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const categoryPathKeywords = ((categoryOutput.suggested_category_path_keywords as unknown[]) || [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const categorySearchQuery = String(categoryOutput.suggested_category_search_query || "").trim();
+  const runtimeFromEvents =
+    ((aiEvents.find((event) => event.meta?.runtime)?.meta?.runtime as Record<string, unknown> | undefined) || {});
+  const timelineEventsForDisplay = (() => {
+    if (task.generation_mode !== "title_only") return allEvents;
+    return allEvents.filter((event) => {
+      const stage = String(event.stage || "");
+      return (
+        stage === "task.created" ||
+        stage === "ai.title_package" ||
+        stage === "ai.category_match" ||
+        stage === "task.current_state" ||
+        stage === "exception" ||
+        stage.startsWith("image.") ||
+        stage.startsWith("export.")
+      );
+    });
+  })();
+  const expectedAiStages = (() => {
+    if (task.generation_mode === "title_only") return ["ai.title_package", "ai.category_match"];
+    if (task.generation_mode === "title_and_image_prompts" || task.generation_mode === "full_later") {
+      return ["ai.product_info", "ai.category_match", "ai.title_package", "ai.image_prompt_package"];
+    }
+    return ["ai.category_match"];
+  })();
+  const flowPlan = (() => {
+    if (task.generation_mode === "title_only") {
+      return [
+        { label: "标题生成", value: "title_package_lite -> 一次轻量 AI 调用，返回标题 + 类目检索字段" },
+        { label: "类目处理", value: "category_match -> 基于 AI 检索词和原始字段做代码字典召回，默认采用第 1 候选" },
+      ];
+    }
+    if (task.generation_mode === "title_and_image_prompts" || task.generation_mode === "full_later") {
+      return [
+        { label: "商品理解", value: "product_info_from_screenshot -> product_info" },
+        { label: "标题生成", value: "title_package -> 基于商品理解做标题包、合规判断和类目检索关键词" },
+        { label: "类目处理", value: "category_match -> 结合标题包和商品理解结果做代码字典检索" },
+        { label: "图片提示词", value: "image_prompt_package -> 四宫格 / 主图 / 尺寸图提示词包" },
+      ];
+    }
+    return [{ label: "当前模式", value: "no_ai，不触发 AI，只保留原始采集和人工处理。" }];
+  })();
+  const totalPromptTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.prompt_tokens || 0), 0);
+  const totalCompletionTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.completion_tokens || 0), 0);
+  const totalTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.total_tokens || 0), 0);
+  const totalEstimatedCost = aiEvents.reduce((sum, event) => {
+    const cost = Number((event.meta?.cost as Record<string, unknown> | undefined)?.estimated_cost);
+    return sum + (Number.isFinite(cost) ? cost : 0);
+  }, 0);
+  const costCurrency = String(
+    ((aiEvents.find((event) => (event.meta?.cost as Record<string, unknown> | undefined)?.currency)?.meta?.cost as Record<string, unknown> | undefined)?.currency ||
+      (runtimeFromEvents.pricing as Record<string, unknown> | undefined)?.currency ||
+      "USD"),
+  );
+  const aiStepRows = aiEvents.map((event) => {
+    const runtime = (event.meta?.runtime as Record<string, unknown> | undefined) || {};
+    const promptTemplate = (event.meta?.prompt_template as Record<string, unknown> | undefined) || {};
+    const usage = (event.meta?.usage as Record<string, unknown> | undefined) || {};
+    const cost = (event.meta?.cost as Record<string, unknown> | undefined) || {};
+    const provider = (event.meta?.provider as Record<string, unknown> | undefined) || {};
+    return {
+      step: event.title,
+      stage: event.stage,
+      status: event.status,
+      promptType: String(event.meta?.prompt_type || "-"),
+      provider: String(provider.provider_display_name || runtime.provider_display_name || provider.provider_name || runtime.provider_name || "-"),
+      providerSource: String(provider.provider_source || runtime.provider_source || "-"),
+      model: String(event.meta?.model || runtime.model || "-"),
+      templateId: String(promptTemplate.template_id || "-"),
+      templateVersion: String(promptTemplate.version || "-"),
+      scope: String(promptTemplate.scope || "-"),
+      durationMs: String(event.meta?.duration_ms || 0),
+      promptTokens: Number(usage.prompt_tokens || 0),
+      completionTokens: Number(usage.completion_tokens || 0),
+      totalTokens: Number(usage.total_tokens || 0),
+      estimatedCost: Number(cost.estimated_cost),
+      currency: String(cost.currency || costCurrency),
+    };
+  });
+  const processChecks = [
+    {
+      key: "task_created",
+      label: "任务创建",
+      hint: "是否已经从 raw_product 生成 product_task。",
+      done: allEvents.some((event) => event.stage === "task.created"),
+      status: "success",
+    },
+    {
+      key: "product_info",
+      label: "商品理解",
+      hint: task.generation_mode === "title_only" ? "当前模式应跳过该步骤，不应调用商品理解 AI。" : "是否跑过商品理解 / 截图理解。",
+      done: aiEvents.some((event) => event.stage === "ai.product_info" && event.status === "success"),
+      status:
+        task.generation_mode === "title_only"
+          ? "skipped"
+          : task.main_status === "failed" && task.title_status === "failed"
+            ? "failed"
+            : task.main_status === "ai_running"
+              ? "running"
+              : "pending",
+    },
+    {
+      key: "category_match",
+      label: "类目处理",
+      hint: task.generation_mode === "title_only" ? "应由代码字典直接产出候选类目，不依赖商品理解 AI。" : "是否产出类目候选或人工采用类目。",
+      done: aiEvents.some((event) => event.stage === "ai.category_match" && event.status === "success") || Boolean(task.selected_category_id),
+      status: task.category_status,
+    },
+    {
+      key: "title_package",
+      label: "标题包",
+      hint: task.generation_mode === "title_only" ? "应只调用一次标题 AI，直接返回中英标题。" : "是否生成标题包并回写任务标题。",
+      done: aiEvents.some((event) => event.stage === "ai.title_package" && event.status === "success") || Boolean(task.ai?.title_package),
+      status: task.title_status,
+    },
+    {
+      key: "image_prompt_package",
+      label: "图片提示词",
+      hint:
+        task.generation_mode === "title_only"
+          ? "当前模式应跳过该步骤。"
+          : "是否生成 image prompt package。",
+      done: aiEvents.some((event) => event.stage === "ai.image_prompt_package" && event.status === "success") || Boolean(task.ai?.image_prompt_package),
+      status: task.generation_mode === "title_only" ? "skipped" : task.image_prompt_status,
+    },
+    {
+      key: "image_jobs",
+      label: "图片任务",
+      hint: "是否创建过 image_generation_jobs。",
+      done: backendEvents.some((event) => String(event.stage).startsWith("image.")),
+      status: task.image_status,
+    },
+    {
+      key: "export_draft",
+      label: "导出草稿",
+      hint: "是否生成过 export_field_drafts。",
+      done: backendEvents.some((event) => String(event.stage).startsWith("export.")),
+      status: task.export_status,
+    },
+  ];
+  const defaultChainChecks = (() => {
+    if (task.generation_mode === "title_only") {
+      return [
+        processChecks[0],
+        {
+          key: "material_sync",
+          label: "素材回显",
+          hint: "原始主图、轮播图、SKU 图等素材应同步到上架台，供后续按需生成图片。",
+          done: Boolean(raw) || Boolean(task.screenshot_url) || Boolean(task.source_url),
+          status: "success",
+        },
+        processChecks[3],
+        processChecks[2],
+        {
+          key: "manual_review",
+          label: "人工待确认",
+          hint: "默认第 1 候选类目和 AI 标题都需要人工确认后再继续图片或导出动作。",
+          done: task.main_status === "review_ready" || task.main_status === "export_ready" || task.main_status === "exported",
+          status: task.main_status === "failed" ? "failed" : task.main_status === "ai_running" ? "running" : "pending",
+        },
+      ];
+    }
+    return processChecks.slice(0, 5);
+  })();
+  const followupChecks = [
+    {
+      key: "image_jobs_followup",
+      label: "图片任务",
+      hint: "主图、SKU 图、四宫格、轮播图都属于创建任务后的主动触发动作。",
+      done: backendEvents.some((event) => String(event.stage).startsWith("image.")),
+      status: task.image_status,
+    },
+    {
+      key: "export_draft_followup",
+      label: "导出草稿",
+      hint: "导出草稿不属于创建任务默认链路，通常在预览、导出或应用规则时生成。",
+      done: backendEvents.some((event) => String(event.stage).startsWith("export.")),
+      status: task.export_status,
+    },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <Section title="排查总览">
+        <div className="grid gap-4 xl:grid-cols-4">
+          <CompareCard
+            title="任务定位"
+            tone="final"
+            items={[
+              { label: "任务 ID", value: String(task.id) },
+              { label: "原始采集 ID", value: String(task.raw_product_id) },
+              { label: "生成模式", value: task.generation_mode },
+              { label: "当前步骤", value: timeline?.summary.current_step || statusText(task.main_status) },
+            ]}
+          />
+          <CompareCard
+            title="当前状态"
+            tone="ai"
+            items={[
+              { label: "主状态", value: statusText(task.main_status) },
+              { label: "类目状态", value: statusText(task.category_status) },
+              { label: "标题状态", value: statusText(task.title_status) },
+              { label: "图片提示词", value: statusText(task.image_prompt_status) },
+            ]}
+          />
+          <CompareCard
+            title="流程结果"
+            tone="final"
+            items={[
+              { label: "图片状态", value: statusText(task.image_status) },
+              { label: "导出状态", value: statusText(task.export_status) },
+              { label: "选中类目", value: task.selected_category_id || task.ai?.category_best_path || "-" },
+              { label: "当前标题", value: task.title || "-" },
+            ]}
+          />
+          <CompareCard
+            title="异常与时间"
+            tone="raw"
+            items={[
+              { label: "异常等级", value: task.exception_level || "-" },
+              { label: "异常状态", value: task.exception_status || "-" },
+              { label: "最后报错", value: task.last_error_message || "-" },
+              { label: "创建时间", value: formatDateTime(task.created_at) },
+            ]}
+          />
+        </div>
+      </Section>
+
+      <Section title="模式说明">
+        <div className="grid gap-4 xl:grid-cols-3">
+          <CompareCard
+            title="默认链路"
+            tone="final"
+            items={
+              task.generation_mode === "title_only"
+                ? [
+                    { label: "模式定义", value: "1 次轻量标题 AI + 代码类目召回 + 原始素材回显" },
+                    { label: "默认 AI 次数", value: "1 次" },
+                    { label: "默认图片生成", value: "0 次" },
+                    { label: "默认结果", value: "标题、类目检索字段、默认第 1 候选类目" },
+                  ]
+                : flowPlan
+            }
+          />
+          <CompareCard
+            title="字段来源"
+            tone="raw"
+            items={[
+              { label: "轮播图 / SKU 图", value: "原始回显" },
+              { label: "标题", value: task.generation_mode === "no_ai" ? "原始回显" : "AI 生成" },
+              { label: "类目检索词", value: task.generation_mode === "no_ai" ? "-" : "AI 生成" },
+              { label: "默认候选类目", value: task.generation_mode === "no_ai" ? "人工搜索" : "代码召回" },
+            ]}
+          />
+          <CompareCard
+            title="后续动作"
+            tone="ai"
+            items={[
+              { label: "主图 / SKU 图", value: "用户主动生成" },
+              { label: "四宫格 / 轮播图", value: "用户主动生成" },
+              { label: "导出草稿", value: "预览或导出时触发" },
+              { label: "导出执行", value: "人工确认后触发" },
+            ]}
+          />
+        </div>
+      </Section>
+
+      <Section title="类目处理">
+        <div className="grid gap-4 xl:grid-cols-3">
+          <CompareCard
+            title="类目定位"
+            tone="final"
+            items={[
+              { label: "原始类目", value: raw?.category_path || "-" },
+              { label: "默认第 1 候选", value: String(categoryOutput.selected_category || categoryOutput.best_path || task.selected_category_id || "-") },
+              { label: "候选数量", value: String(categoryCandidates.length || 0) },
+              { label: "人工选中类目", value: task.selected_category_id || "-" },
+            ]}
+          />
+          <CompareCard
+            title="AI 检索字段"
+            tone="ai"
+            items={[
+              { label: "搜索短语", value: categorySearchQuery || "-" },
+              { label: "检索关键词", value: categoryKeywords.length ? categoryKeywords.join(" / ") : "-" },
+              { label: "路径关键词", value: categoryPathKeywords.length ? categoryPathKeywords.join(" / ") : "-" },
+              { label: "类目置信度", value: categoryOutput.confidence != null ? String(categoryOutput.confidence) : "-" },
+            ]}
+          />
+          <CompareCard
+            title="代码召回"
+            tone="raw"
+            items={[
+              { label: "实际 query", value: categoryQueries.length ? categoryQueries.join(" / ") : "-" },
+              { label: "低置信度", value: task.category_status === "low_confidence" ? "是" : "否" },
+              { label: "状态", value: statusText(task.category_status) },
+              { label: "说明", value: categoryCandidates.length ? "AI 只提供检索字段，最终候选由代码字典召回。" : "暂无类目召回结果" },
+            ]}
+          />
+        </div>
+
+        {categoryQuerySources.length ? (
+          <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
+            <div className="text-sm font-medium text-slate-900">Query 来源</div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {categoryQuerySources.map((item, index) => (
+                <span key={`${String(item.source || "na")}-${String(item.field || "na")}-${index}`} className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-700">
+                  {String(item.source || "-")} / {String(item.field || "-")}: {String(item.value || "-")}
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-slate-200">
+          <table className="min-w-full divide-y divide-slate-200 bg-white text-sm">
+            <thead className="bg-slate-50 text-left text-xs text-slate-500">
+              <tr>
+                <th className="px-4 py-3 font-medium">排名</th>
+                <th className="px-4 py-3 font-medium">类目路径</th>
+                <th className="px-4 py-3 font-medium">分数</th>
+                <th className="px-4 py-3 font-medium">命中词</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200">
+              {categoryCandidates.length ? (
+                categoryCandidates.slice(0, 8).map((item, index) => (
+                  <tr key={`${String(item.path || "na")}-${index}`}>
+                    <td className="px-4 py-3 text-xs text-slate-700">{index + 1}</td>
+                    <td className="px-4 py-3">
+                      <div className="text-slate-900">{String(item.path || "-")}</div>
+                      {index === 0 ? (
+                        <div className="mt-1 text-xs text-emerald-700">默认第 1 候选</div>
+                      ) : null}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-slate-700">{String(item.score ?? "-")}</td>
+                    <td className="px-4 py-3 text-xs text-slate-700">
+                      {Array.isArray(item.matched_terms) && item.matched_terms.length
+                        ? item.matched_terms.map((term) => String(term || "").trim()).filter(Boolean).join(" / ")
+                        : "-"}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={4} className="px-4 py-6 text-center text-sm text-slate-500">
+                    暂无类目候选记录
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      <Section title="AI 配置与步骤调用">
+        <div className="grid gap-4 xl:grid-cols-3">
+          <CompareCard
+            title="本次 AI 运行配置"
+            tone="ai"
+            items={[
+              { label: "配置来源", value: String(runtimeFromEvents.provider_source || "-") },
+              { label: "Provider", value: String(runtimeFromEvents.provider_display_name || runtimeFromEvents.provider_name || "-") },
+              { label: "默认模型", value: String(runtimeFromEvents.model || "-") },
+              { label: "输入 / 输出", value: totalTokens ? `${formatInteger(totalPromptTokens)} / ${formatInteger(totalCompletionTokens)}` : "-" },
+              { label: "总 Tokens", value: totalTokens ? formatInteger(totalTokens) : "-" },
+              { label: "解析时间", value: runtimeFromEvents.resolved_at ? formatDateTime(String(runtimeFromEvents.resolved_at)) : "-" },
+            ]}
+          />
+          <CompareCard
+            title="文本链路说明"
+            tone="final"
+            items={flowPlan}
+          />
+          <CompareCard
+            title="当前排查重点"
+            tone="raw"
+            items={[
+              { label: "AI / 代码步骤", value: `${aiEvents.length} / ${expectedAiStages.length}` },
+              { label: "后端动作数", value: String(backendEvents.length) },
+              { label: "预估费用", value: totalEstimatedCost ? formatMoney(totalEstimatedCost, costCurrency) : "-" },
+              { label: "最后报错", value: task.last_error_message || "-" },
+            ]}
+          />
+        </div>
+
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-slate-200">
+          <table className="min-w-full divide-y divide-slate-200 bg-white text-sm">
+            <thead className="bg-slate-50 text-left text-xs text-slate-500">
+              <tr>
+                <th className="px-4 py-3 font-medium">步骤</th>
+                <th className="px-4 py-3 font-medium">prompt_type</th>
+                <th className="px-4 py-3 font-medium">provider</th>
+                <th className="px-4 py-3 font-medium">model</th>
+                <th className="px-4 py-3 font-medium">模板</th>
+                <th className="px-4 py-3 font-medium">状态</th>
+                <th className="px-4 py-3 font-medium">耗时</th>
+                <th className="px-4 py-3 font-medium">Tokens</th>
+                <th className="px-4 py-3 font-medium">预估费用</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200">
+              {aiStepRows.length ? (
+                aiStepRows.map((row) => (
+                  <tr key={`${row.stage}-${row.promptType}-${row.model}`}>
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-slate-900">{row.step}</div>
+                      <div className="mt-1 text-xs text-slate-500">{row.stage}</div>
+                    </td>
+                    <td className="px-4 py-3 font-mono text-xs text-slate-700">{row.promptType}</td>
+                    <td className="px-4 py-3">
+                      <div className="text-slate-800">{row.provider}</div>
+                      <div className="mt-1 text-xs text-slate-500">source: {row.providerSource}</div>
+                    </td>
+                    <td className="px-4 py-3 font-mono text-xs text-slate-700">{row.model}</td>
+                    <td className="px-4 py-3 text-xs text-slate-700">
+                      <div>#{row.templateId}</div>
+                      <div className="mt-1 text-slate-500">{row.templateVersion} / {row.scope}</div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={["rounded-full border px-2 py-1 text-xs", statusBadgeColor(row.status)].join(" ")}>
+                        {statusText(row.status)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-xs text-slate-700">{row.durationMs} ms</td>
+                    <td className="px-4 py-3 text-xs text-slate-700">
+                      {row.totalTokens ? (
+                        <div>
+                          <div>总计 {formatInteger(row.totalTokens)}</div>
+                          <div className="mt-1 text-slate-500">
+                            in {formatInteger(row.promptTokens)} / out {formatInteger(row.completionTokens)}
+                          </div>
+                        </div>
+                      ) : (
+                        "-"
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-slate-700">
+                      {Number.isFinite(row.estimatedCost) ? formatMoney(row.estimatedCost, row.currency) : "-"}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={9} className="px-4 py-6 text-center text-sm text-slate-500">
+                    暂无 AI 步骤记录
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      <Section title="默认链路检查">
+        <div className="grid gap-3 xl:grid-cols-2">
+          {defaultChainChecks.map((item) => {
+            const tone = item.done
+              ? "border-emerald-200 bg-emerald-50"
+              : item.status === "failed"
+                ? "border-rose-200 bg-rose-50"
+                : item.status === "running"
+                  ? "border-amber-200 bg-amber-50"
+                  : "border-slate-200 bg-slate-50";
+            return (
+              <div key={item.key} className={["rounded-[16px] border p-4", tone].join(" ")}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-medium text-slate-900">{item.label}</div>
+                  <span className={["rounded-full border px-2 py-0.5 text-[11px]", item.done ? "border-emerald-200 bg-white text-emerald-700" : statusBadgeColor(String(item.status))].join(" ")}>
+                    {String(item.status) === "skipped" ? "按模式跳过" : item.done ? "已发生" : `未完成 / ${statusText(String(item.status))}`}
+                  </span>
+                </div>
+                <div className="mt-2 text-xs leading-5 text-slate-600">{item.hint}</div>
+              </div>
+            );
+          })}
+        </div>
+      </Section>
+
+      <Section title="后续主动触发">
+        <div className="grid gap-3 xl:grid-cols-2">
+          {followupChecks.map((item) => {
+            const tone = item.done
+              ? "border-emerald-200 bg-emerald-50"
+              : item.status === "failed"
+                ? "border-rose-200 bg-rose-50"
+                : item.status === "running"
+                  ? "border-amber-200 bg-amber-50"
+                  : "border-slate-200 bg-slate-50";
+            return (
+              <div key={item.key} className={["rounded-[16px] border p-4", tone].join(" ")}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-medium text-slate-900">{item.label}</div>
+                  <span className={["rounded-full border px-2 py-0.5 text-[11px]", item.done ? "border-emerald-200 bg-white text-emerald-700" : statusBadgeColor(String(item.status))].join(" ")}>
+                    {item.done ? "已发生" : `未触发 / ${statusText(String(item.status))}`}
+                  </span>
+                </div>
+                <div className="mt-2 text-xs leading-5 text-slate-600">{item.hint}</div>
+              </div>
+            );
+          })}
+        </div>
+      </Section>
+
+      <Section title="原始输入摘要">
+        <div className="grid gap-4 xl:grid-cols-2">
+          <CompareCard
+            title="原始采集"
+            tone="raw"
+            items={[
+              { label: "原标题", value: raw?.title || task.title || "-" },
+              { label: "平台", value: raw?.platform || task.product_platform || "-" },
+              { label: "来源链接", value: raw?.url || task.source_url || "-" },
+              { label: "平台 SKU", value: raw?.platform_sku || task.platform_sku || "-" },
+            ]}
+          />
+          <CompareCard
+            title="素材证据"
+            tone="ai"
+            items={[
+              { label: "截图", value: raw?.screenshot_url || task.screenshot_url || "-" },
+              { label: "主图张数", value: String((raw?.carousel_images?.length || 0) + (raw?.main_image ? 1 : 0)) },
+              { label: "详情图张数", value: String(raw?.detail_images?.length || 0) },
+              { label: "尺寸图张数", value: String(raw?.size_chart_images?.length || 0) },
+            ]}
+          />
+        </div>
+      </Section>
+
+      <Section title={task.generation_mode === "title_only" ? "关键时间线" : "全量时间线"}>
+        {timelineEventsForDisplay.length ? (
+          <div className="space-y-3">
+            {timelineEventsForDisplay.map((event, index) => (
+              <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] text-slate-500">
+                        #{index + 1}
+                      </span>
+                      <span className="text-sm font-medium text-slate-900">{event.title}</span>
+                      <span className={["rounded-full border px-2 py-0.5 text-[11px]", statusBadgeColor(event.status)].join(" ")}>
+                        {statusText(event.status)}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {formatDateTime(event.ts)} · {event.stage} · {event.source}
+                    </div>
+                    <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-700">{event.message}</div>
+                    {String(event.stage).startsWith("ai.") ? (
+                      <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-600">
+                        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                          prompt_type: {String(event.meta?.prompt_type || "-")}
+                        </span>
+                        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                          model: {String(event.meta?.model || "-")}
+                        </span>
+                        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                          tokens: {Number((event.meta?.usage as Record<string, unknown> | undefined)?.total_tokens || 0) ? formatInteger(Number((event.meta?.usage as Record<string, unknown> | undefined)?.total_tokens || 0)) : "-"}
+                        </span>
+                      </div>
+                    ) : null}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void copyTraceEvent(event)}
+                    className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                  >
+                    复制事件
+                  </button>
+                </div>
+                {Object.keys((event.meta as Record<string, unknown>) || {}).length ? (
+                  <details className="mt-3 rounded-[14px] border border-slate-200 bg-white">
+                    <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                      查看事件元数据
+                    </summary>
+                    <pre className="overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                      {formatJson(event.meta)}
+                    </pre>
+                  </details>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-sm text-slate-600">暂无时间线事件</div>
+        )}
+      </Section>
+
+      <Section title="AI 调用明细">
+        {aiEvents.length ? (
+          <div className="space-y-4">
+            {aiEvents.map((event, index) => {
+              const runtime = (event.meta?.runtime as Record<string, unknown> | undefined) || {};
+              const promptTemplate = (event.meta?.prompt_template as Record<string, unknown> | undefined) || {};
+              const usage = (event.meta?.usage as Record<string, unknown> | undefined) || {};
+              const cost = (event.meta?.cost as Record<string, unknown> | undefined) || {};
+              const provider = (event.meta?.provider as Record<string, unknown> | undefined) || {};
+              return (
+                <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[16px] border border-sky-200 bg-sky-50/40 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="text-sm font-medium text-slate-900">{event.title}</div>
+                        <span className={["rounded-full border px-2 py-0.5 text-[11px]", statusBadgeColor(event.status)].join(" ")}>
+                          {statusText(event.status)}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        {formatDateTime(event.ts)} · {event.stage}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void copyTraceEvent(event)}
+                      className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                    >
+                      复制本步骤
+                    </button>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-600">
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      prompt_type: {String(event.meta?.prompt_type || "-")}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      model: {String(event.meta?.model || runtime.model || "-")}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      provider: {String(provider.provider_display_name || runtime.provider_display_name || provider.provider_name || runtime.provider_name || "-")}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      耗时: {String(event.meta?.duration_ms || 0)}ms
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      tokens: {usage.total_tokens ? formatInteger(usage.total_tokens) : "-"}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      费用: {cost.estimated_cost != null ? formatMoney(cost.estimated_cost, String(cost.currency || costCurrency)) : "-"}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                      模板: #{String(promptTemplate.template_id || "-")} / {String(promptTemplate.version || "-")}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 grid gap-3 xl:grid-cols-4">
+                    <CompareCard
+                      title="本步模型"
+                      tone="ai"
+                      items={[
+                        { label: "步骤", value: event.stage },
+                        { label: "prompt_type", value: String(event.meta?.prompt_type || "-") },
+                        { label: "模型", value: String(event.meta?.model || runtime.model || "-") },
+                        { label: "Provider", value: String(provider.provider_display_name || runtime.provider_display_name || provider.provider_name || runtime.provider_name || "-") },
+                      ]}
+                    />
+                    <CompareCard
+                      title="Token 用量"
+                      tone="raw"
+                      items={[
+                        { label: "输入", value: usage.prompt_tokens ? formatInteger(usage.prompt_tokens) : "-" },
+                        { label: "输出", value: usage.completion_tokens ? formatInteger(usage.completion_tokens) : "-" },
+                        { label: "总计", value: usage.total_tokens ? formatInteger(usage.total_tokens) : "-" },
+                        { label: "费用", value: cost.estimated_cost != null ? formatMoney(cost.estimated_cost, String(cost.currency || costCurrency)) : "-" },
+                      ]}
+                    />
+                    <CompareCard
+                      title="模板信息"
+                      tone="final"
+                      items={[
+                        { label: "模板 ID", value: String(promptTemplate.template_id || "-") },
+                        { label: "版本", value: String(promptTemplate.version || "-") },
+                        { label: "作用域", value: String(promptTemplate.scope || "-") },
+                        { label: "耗时", value: `${String(event.meta?.duration_ms || 0)}ms` },
+                      ]}
+                    />
+                    <CompareCard
+                      title="执行判断"
+                      tone="ai"
+                      items={[
+                        { label: "状态", value: statusText(event.status) },
+                        { label: "模式应执行", value: expectedAiStages.includes(event.stage) ? "是" : "否" },
+                        { label: "时间", value: formatDateTime(event.ts) },
+                        { label: "错误", value: event.meta?.error ? String(event.meta.error) : "-" },
+                      ]}
+                    />
+                  </div>
+
+                  {event.meta?.error ? (
+                    <div className="mt-3 rounded-[12px] border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                      {String(event.meta.error)}
+                    </div>
+                  ) : null}
+
+                  <div className="mt-3 space-y-3">
+                    <details className="rounded-[14px] border border-slate-200 bg-white">
+                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                        查看 AI 输入
+                      </summary>
+                      <pre className="overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                        {formatJson(event.meta?.input)}
+                      </pre>
+                    </details>
+                    <details className="rounded-[14px] border border-slate-200 bg-white">
+                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                        查看实际提示词
+                      </summary>
+                      <pre className="overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                        {typeof event.meta?.prompt === "string" && event.meta.prompt ? event.meta.prompt : "-"}
+                      </pre>
+                    </details>
+                    <details className="rounded-[14px] border border-slate-200 bg-white">
+                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                        查看 AI 输出
+                      </summary>
+                      <pre className="overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                        {formatJson(event.meta?.output)}
+                      </pre>
+                    </details>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="text-sm text-slate-600">暂无 AI 调用记录</div>
+        )}
+      </Section>
+
+      <Section title="后端动作明细">
+        {backendEvents.length ? (
+          <div className="space-y-4">
+            {backendEvents.map((event, index) => (
+              <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[16px] border border-slate-200 bg-white p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-medium text-slate-900">{event.title}</div>
+                      <span className={["rounded-full border px-2 py-0.5 text-[11px]", statusBadgeColor(event.status)].join(" ")}>
+                        {statusText(event.status)}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {formatDateTime(event.ts)} · {event.stage} · {event.source}
+                    </div>
+                    <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-700">{event.message}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void copyTraceEvent(event)}
+                    className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                  >
+                    复制本步骤
+                  </button>
+                </div>
+                {Object.keys((event.meta as Record<string, unknown>) || {}).length ? (
+                  <details className="mt-3 rounded-[14px] border border-slate-200 bg-slate-50">
+                    <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                      查看后端动作元数据
+                    </summary>
+                    <pre className="overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                      {formatJson(event.meta)}
+                    </pre>
+                  </details>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-sm text-slate-600">暂无后端动作记录</div>
+        )}
+      </Section>
+    </div>
+  );
+}
+
 function InfoTab({
   task,
   raw,
   timeline,
   onRefresh,
+  isLogsRoute,
 }: {
   task: ProductTaskDetail;
   raw: RawProductDetail | null;
   timeline: ProductTaskTimelineResponse | null;
   onRefresh?: (() => Promise<void>) | undefined;
+  isLogsRoute: boolean;
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [manualTitle, setManualTitle] = useState(task.title || "");
+  const [manualTitle, setManualTitle] = useState(task.ai?.title_en || "");
   const [manualCategory, setManualCategory] = useState(task.selected_category_id || task.ai?.category_best_path || "");
+  const [categoryOptions, setCategoryOptions] = useState<CategorySearchItem[]>([]);
 
   useEffect(() => {
-    setManualTitle(task.title || "");
+    setManualTitle(task.ai?.title_en || "");
     setManualCategory(task.selected_category_id || task.ai?.category_best_path || "");
-  }, [task.id, task.title, task.selected_category_id, task.ai?.category_best_path]);
+  }, [task.id, task.title, task.selected_category_id, task.ai?.category_best_path, task.ai?.title_en]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadCategoryOptions(): Promise<void> {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/categories/search?limit=5000`, { cache: "no-store" });
+        if (!response.ok) return;
+        const result = (await response.json()) as CategorySearchResponse;
+        if (!cancelled) {
+          setCategoryOptions(result.items || []);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    void loadCategoryOptions();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function refreshAfterMutation(): Promise<void> {
     if (onRefresh) {
@@ -3407,7 +4443,7 @@ function InfoTab({
             title="原始采集"
             tone="raw"
             items={[
-              { label: "标题", value: raw?.title || task.title || "-" },
+              { label: "中文标题", value: raw?.title || task.title || "-" },
               { label: "平台", value: raw?.platform || task.product_platform || "-" },
               { label: "SKU", value: raw?.platform_sku || raw?.source_id || task.platform_sku || "-" },
               { label: "价格", value: raw?.price || "-" },
@@ -3435,7 +4471,12 @@ function InfoTab({
             title="当前采用"
             tone="final"
             items={[
-              { label: "任务标题", value: task.title || "-" },
+              { label: "中文标题", value: raw?.title || task.title || "-" },
+              {
+                label: "英文标题",
+                value:
+                  String((task.ai?.title_package as Record<string, unknown> | null)?.title_en || task.ai?.title_en || "-"),
+              },
               { label: "采用类目", value: task.selected_category_id || task.ai?.category_best_path || "-" },
               { label: "主状态", value: statusText(task.main_status) },
               { label: "导出状态", value: statusText(task.export_status) },
@@ -3509,9 +4550,17 @@ function InfoTab({
           <input
             value={manualCategory}
             onChange={(event) => setManualCategory(event.target.value)}
+            list="drawer-category-options"
             className="mt-2 h-11 w-full rounded-[14px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
             placeholder="输入完整类目路径"
           />
+          <datalist id="drawer-category-options">
+            {categoryOptions.map((option) => (
+              <option key={option.path} value={option.path}>
+                {option.leaf}
+              </option>
+            ))}
+          </datalist>
           <div className="mt-3">
             <button
               type="button"
@@ -3528,44 +4577,47 @@ function InfoTab({
       <Section title="标题采用">
         <div className="grid gap-4 xl:grid-cols-2">
           <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
-            <div className="text-xs text-slate-500">当前标题</div>
-            <div className="mt-1 text-sm text-slate-900">{task.title || "-"}</div>
+            <div className="text-xs text-slate-500">原英文标题（采集）</div>
+            <div className="mt-1 text-sm text-slate-900">{raw?.title || task.title || "-"}</div>
+            <div className="mt-3 text-xs text-slate-500">AI 中文标题（只读）</div>
+            <div className="mt-1 text-sm text-slate-900">{task.ai?.title_cn || "-"}</div>
             <div className="mt-4 flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => void applyFieldChoice("task_title", "raw")}
+                onClick={() => void regenerateTitles()}
                 disabled={loading}
                 className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
               >
-                用原始标题
-              </button>
-              <button
-                type="button"
-                onClick={() => void applyFieldChoice("task_title", "ai")}
-                disabled={loading || !task.ai?.title_cn}
-                className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-              >
-                用 AI 标题
+                重生英文标题
               </button>
             </div>
           </div>
 
           <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
-            <div className="text-xs text-slate-500">手动标题</div>
+            <div className="text-xs text-slate-500">AI 英文标题（可修改）</div>
+            <div className="mt-1 text-sm text-slate-900">{task.ai?.title_en || "-"}</div>
             <input
               value={manualTitle}
               onChange={(event) => setManualTitle(event.target.value)}
               className="mt-2 h-11 w-full rounded-[14px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
-              placeholder="输入最终采用标题"
+              placeholder={task.ai?.title_en || "输入最终英文标题"}
             />
-            <div className="mt-3">
+            <div className="mt-3 flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => void applyFieldChoice("task_title", "manual", manualTitle)}
+                onClick={() => void applyFieldChoice("product_title_en", "ai")}
+                disabled={loading || !task.ai?.title_en}
+                className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                采用 AI 英文标题
+              </button>
+              <button
+                type="button"
+                onClick={() => void applyFieldChoice("product_title_en", "manual", manualTitle)}
                 disabled={loading || !manualTitle.trim()}
                 className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
               >
-                保存手动标题
+                保存英文标题
               </button>
             </div>
           </div>
@@ -3609,10 +4661,6 @@ function InfoTab({
               <div className="mt-1">{task.ai.title_en || "-"}</div>
             </div>
             <div>
-              <div className="text-xs text-slate-500">商品描述</div>
-              <div className="mt-1 whitespace-pre-wrap">{task.ai.product_description || "-"}</div>
-            </div>
-            <div>
               <div className="text-xs text-slate-500">标题包</div>
               <pre className="mt-1 overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
                 {task.ai.title_package ? JSON.stringify(task.ai.title_package, null, 2) : "-"}
@@ -3630,18 +4678,13 @@ function InfoTab({
                 {task.ai.product_info ? JSON.stringify(task.ai.product_info, null, 2) : "-"}
               </pre>
             </div>
-            <div>
-              <div className="text-xs text-slate-500">Product DNA</div>
-              <pre className="mt-1 overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
-                {task.ai.product_dna ? JSON.stringify(task.ai.product_dna, null, 2) : "-"}
-              </pre>
-            </div>
           </div>
         ) : (
           <div className="text-sm text-slate-600">暂无 AI 结果</div>
         )}
       </Section>
 
+      {isLogsRoute ? (
       <Section title="AI 调用日志 / 排查">
         {timeline?.events?.filter((event) => String(event.stage).startsWith("ai.")).length ? (
           <div className="space-y-4">
@@ -3707,6 +4750,7 @@ function InfoTab({
           <div className="text-sm text-slate-600">暂无 AI 调用日志</div>
         )}
       </Section>
+      ) : null}
     </div>
   );
 }
@@ -4265,7 +5309,7 @@ function PromptEditorModal({
       for (const taskId of config.taskIds) {
         await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/run-ai`, {
           method: "POST",
-          headers: buildAiRequestHeaders(true),
+          headers: buildAiRequestHeaders(true, mapPromptTypesToPurposes([selectedType])),
           body: JSON.stringify({ prompt_types: [selectedType] }),
         }).then(async (res) => {
           if (!res.ok) throw new Error(`HTTP ${res.status}`);

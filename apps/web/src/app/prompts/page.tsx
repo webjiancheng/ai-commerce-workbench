@@ -28,22 +28,19 @@ type PromptTemplateListResponse = {
 type RenderResponse = { rendered_text: string };
 
 const PROMPT_TYPE_LABELS: Record<string, string> = {
-  category_match: "类目匹配",
-  product_dna: "商品特征提炼",
-  title_cn: "中文标题生成",
+  product_info_from_screenshot: "产品截图信息提取",
+  title_package_lite: "轻量标题包",
+  title_package: "标题包",
   title_en: "英文标题生成",
-  product_description: "商品描述生成",
+  image_prompt_package: "图片提示词包",
   image_prompt_main: "主图提示词",
   image_prompt_carousel_1: "轮播图1提示词",
   image_prompt_carousel_2: "轮播图2提示词",
   image_prompt_carousel_3: "轮播图3提示词",
   image_prompt_carousel_4: "轮播图4提示词",
-  image_prompt_preview_1: "预览图1提示词",
-  image_prompt_preview_2: "预览图2提示词",
-  image_prompt_preview_3: "预览图3提示词",
   image_prompt_carousel_4grid: "四宫格提示词",
+  image_prompt_dimension: "尺寸图提示词",
   dimension_extract_from_image: "尺寸图识别提示词",
-  export_validation: "导出校验提示词",
 };
 
 const SCOPE_LABELS: Record<string, string> = {
@@ -68,20 +65,10 @@ function groupKey(item: Pick<PromptTemplate, "prompt_type" | "scope" | "category
 
 function defaultTemplateTextByType(promptType: string): string {
   const preset: Record<string, string> = {
-    category_match:
-      "你是跨境电商类目匹配助手。只能从候选类目中选 1 个最匹配路径，输出 JSON：best_path、confidence、top3、reason。禁止输出候选外类目。",
-    product_dna:
-      "你是商品信息提炼助手。根据标题、属性、SKU 文本提炼商品本体、关键词、材质、场景，输出 JSON，禁止编造不存在的信息。",
-    title_cn:
-      "你是中文标题生成助手。生成 1 条准确、可上架的中文标题，突出商品本体与关键属性，避免夸张词和促销词，只输出 JSON。",
     title_en:
       "You are an English listing title assistant. Generate one accurate marketplace-ready English title, concise and factual, JSON only.",
-    product_description:
-      "你是商品描述生成助手。输出 description 和 bullet_points，先写商品本体再写用途和特点，只用已知信息，JSON 输出。",
     image_prompt_main:
       "生成电商主图提示词：同一商品本体、居中清晰、背景干净、无文字无水印无 Logo，不改变材质颜色结构。",
-    export_validation:
-      "你是导出字段校验助手。检查字段是否缺失、冲突、格式错误，输出 JSON：errors、warnings、score、suggestions。",
   };
   return `${preset[promptType] || "请根据该类型写出可直接执行的提示词模板，输出要求明确、字段清晰。"}\n`;
 }

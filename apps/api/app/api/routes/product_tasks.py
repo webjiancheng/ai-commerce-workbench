@@ -19,6 +19,7 @@ from app.schemas.raw_product import RawProductDetail
 from pydantic import BaseModel, Field
 
 from app.services.ai_pipeline import run_ai_pipeline_for_task
+from app.services.category_dictionary import search_category_paths
 from app.services.export_fields import get_export_field_draft, patch_export_fields_manual
 from app.services.openai_client import is_openai_configured, runtime_override
 from app.services.product_tasks import (
@@ -74,6 +75,17 @@ class FieldChoiceRequest(BaseModel):
     field_key: str = Field(min_length=1)
     selected_source: str = Field(min_length=1, description="raw | ai | manual")
     manual_value: str | None = None
+
+
+class CategorySearchItem(BaseModel):
+    path: str
+    leaf: str
+
+
+class CategorySearchResponse(BaseModel):
+    items: list[CategorySearchItem]
+    total: int
+    query: str
 
 
 @router.post(
@@ -400,6 +412,25 @@ def generate_titles_endpoint(
 
     background.add_task(_job, task_id, override)
     return {"ok": True, "task_id": task_id, "queued": True, "prompt_types": ["title_package"]}
+
+
+@router.get("/api/categories/search", response_model=CategorySearchResponse)
+def search_categories_endpoint(
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=200, ge=1, le=5000),
+) -> CategorySearchResponse:
+    paths = search_category_paths(query=q, limit=limit)
+    return CategorySearchResponse(
+        items=[
+            CategorySearchItem(
+                path=path,
+                leaf=path.split(">")[-1].strip() if ">" in path else path,
+            )
+            for path in paths
+        ],
+        total=len(paths),
+        query=q,
+    )
 
 
 @router.post("/api/product-tasks/{task_id}/select-category", response_model=ProductTaskDetail)

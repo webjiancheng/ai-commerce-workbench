@@ -15,10 +15,7 @@ export type LocalAiProvider = {
   updatedAt: string;
 };
 
-export type AiPurpose =
-  | "title"
-  | "image_generate"
-  | "image_4grid";
+export type AiPurpose = string;
 
 export type LocalAiRoute = {
   purpose: AiPurpose;
@@ -29,7 +26,14 @@ export type LocalAiRoute = {
 
 const KEY_PROVIDERS = "ai-caiji.settings.ai.providers.v1";
 const KEY_ROUTES = "ai-caiji.settings.ai.routes.v1";
-const ACTIVE_PURPOSES: AiPurpose[] = ["title", "image_generate", "image_4grid"];
+const PREFERRED_TEXT_PURPOSES: AiPurpose[] = [
+  "title",
+  "title_package_lite",
+  "title_package",
+  "product_info",
+  "image_prompt_package",
+  "dimension_extract",
+];
 
 function safeJsonParse<T>(text: string | null): T | null {
   if (!text) return null;
@@ -71,7 +75,6 @@ export function upsertLocalAiProvider(input: Omit<LocalAiProvider, "createdAt" |
 export function deleteLocalAiProvider(id: string): void {
   const providers = loadLocalAiProviders().filter((p) => p.id !== id);
   saveLocalAiProviders(providers);
-  // also drop routes pointing to it
   const routes = loadLocalAiRoutes().filter((r) => r.providerId !== id);
   saveLocalAiRoutes(routes);
 }
@@ -82,7 +85,9 @@ export function loadLocalAiRoutes(): LocalAiRoute[] {
   return raw.filter((x): x is LocalAiRoute => {
     if (!x || typeof x !== "object") return false;
     const purpose = (x as { purpose?: unknown }).purpose;
-    return typeof purpose === "string" && ACTIVE_PURPOSES.includes(purpose as AiPurpose);
+    const providerId = (x as { providerId?: unknown }).providerId;
+    const model = (x as { model?: unknown }).model;
+    return typeof purpose === "string" && typeof providerId === "string" && typeof model === "string";
   }) as LocalAiRoute[];
 }
 
@@ -98,13 +103,15 @@ export function setLocalAiRoute(route: LocalAiRoute): void {
 
 export function ensureDefaultAiRoutes(): void {
   const routes = loadLocalAiRoutes();
-  const cleaned = routes.filter((route) => ACTIVE_PURPOSES.includes(route.purpose));
+  const cleaned = routes.filter(
+    (route) =>
+      typeof route.purpose === "string" &&
+      typeof route.providerId === "string" &&
+      typeof route.model === "string",
+  );
   if (cleaned.length !== routes.length) {
     saveLocalAiRoutes(cleaned);
-    return;
   }
-  if (routes.length) return;
-  saveLocalAiRoutes([]);
 }
 
 export type LocalTextRuntime = {
@@ -113,12 +120,11 @@ export type LocalTextRuntime = {
   model: string;
 };
 
-export function resolveLocalTextRuntime(): LocalTextRuntime | null {
+export function resolveLocalTextRuntime(preferredPurposes: AiPurpose[] = PREFERRED_TEXT_PURPOSES): LocalTextRuntime | null {
   const providers = loadLocalAiProviders();
   const routes = loadLocalAiRoutes();
-  const textPurposes: AiPurpose[] = ["title"];
 
-  for (const purpose of textPurposes) {
+  for (const purpose of preferredPurposes) {
     const route = routes.find((r) => r.purpose === purpose);
     if (!route?.providerId) continue;
     const provider = providers.find((p) => p.id === route.providerId);

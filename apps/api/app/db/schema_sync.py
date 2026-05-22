@@ -9,6 +9,11 @@ def _add_column(engine: Engine, *, table: str, column_sql: str) -> None:
         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_sql}"))
 
 
+def _drop_column(engine: Engine, *, table: str, column: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {table} DROP COLUMN IF EXISTS {column}"))
+
+
 def _create_index(engine: Engine, *, index_name: str, index_sql: str) -> None:
     with engine.begin() as conn:
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {index_sql}"))
@@ -97,6 +102,9 @@ def ensure_product_ai_results_schema(engine: Engine) -> None:
         _add_column(engine, table="product_ai_results", column_sql="title_package JSONB NOT NULL DEFAULT '{}'::jsonb")
     if "image_prompt_package" not in existing_columns:
         _add_column(engine, table="product_ai_results", column_sql="image_prompt_package JSONB NOT NULL DEFAULT '{}'::jsonb")
+    for obsolete_column in ("product_dna", "title_cn", "product_description"):
+        if obsolete_column in existing_columns:
+            _drop_column(engine, table="product_ai_results", column=obsolete_column)
 
 
 def ensure_provider_configs_schema(engine: Engine) -> None:

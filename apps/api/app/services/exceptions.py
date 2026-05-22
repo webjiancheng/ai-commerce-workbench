@@ -35,13 +35,6 @@ def recalculate_exceptions(session: Session, *, task: ProductTask) -> ProductTas
         level = _max_level(level, "failed")
         status = "failed"
 
-    # ProductDNA missing
-    if ai is None or not ((ai.product_dna or {}).get("output") if isinstance(ai, ProductAIResult) else None):
-        # Only blocking when task already in AI ready or later
-        if task.main_status not in (TaskMainStatus.draft.value, TaskMainStatus.collected.value, TaskMainStatus.normalized.value):
-            reasons.append({"code": "product_dna_missing", "level": "blocking"})
-            level = _max_level(level, "blocking")
-
     # image generation failures
     failed_image_jobs = session.scalar(
         select(func.count()).select_from(ImageGenerationJob).where(
@@ -113,4 +106,3 @@ def _max_level(current: str | None, incoming: str) -> str:
     if current is None:
         return incoming
     return incoming if order.get(incoming, 0) > order.get(current, 0) else current
-

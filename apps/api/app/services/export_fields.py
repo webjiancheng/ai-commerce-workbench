@@ -157,24 +157,17 @@ def get_export_field_candidates(session: Session, *, task: ProductTask) -> dict[
     ai_category = None
     ai_title_cn = None
     ai_title_en = None
-    ai_description = None
     if isinstance(ai, ProductAIResult):
         category_out = (ai.category_match or {}).get("output") if isinstance(ai.category_match, dict) else None
         title_pkg_out = (ai.title_package or {}).get("output") if isinstance(ai.title_package, dict) else None
-        title_cn_out = (ai.title_cn or {}).get("output") if isinstance(ai.title_cn, dict) else None
         title_en_out = (ai.title_en or {}).get("output") if isinstance(ai.title_en, dict) else None
-        desc_out = (ai.product_description or {}).get("output") if isinstance(ai.product_description, dict) else None
         if isinstance(category_out, dict):
             ai_category = category_out.get("best_path") or category_out.get("selected_category")
         if isinstance(title_pkg_out, dict):
             ai_title_cn = title_pkg_out.get("title_cn") or ai_title_cn
             ai_title_en = title_pkg_out.get("title_en") or ai_title_en
-        if isinstance(title_cn_out, dict):
-            ai_title_cn = ai_title_cn or title_cn_out.get("title")
         if isinstance(title_en_out, dict):
             ai_title_en = ai_title_en or title_en_out.get("title") or title_en_out.get("title_en")
-        if isinstance(desc_out, dict):
-            ai_description = desc_out.get("description")
 
     current_fields = dict((draft.fields_json or {}) if draft is not None else {})
     manual_fields = dict((draft.fields_json or {}) if draft is not None else {})
@@ -215,7 +208,7 @@ def get_export_field_candidates(session: Session, *, task: ProductTask) -> dict[
         },
         "product_description": {
             "raw": raw.attributes_text if raw else None,
-            "ai": ai_description,
+            "ai": None,
             "current": current_fields.get("product_description"),
             "manual": manual_fields.get("product_description")
             if str((field_sources.get("product_description") or {}).get("source") or "") == "manual_override"
@@ -328,11 +321,8 @@ def _build_base_fields(session: Session, *, task: ProductTask) -> tuple[dict[str
             cat_path = cat_path or category_out.get("selected_category")
         title_cn = (title_pkg_out or {}).get("title_cn") if isinstance(title_pkg_out, dict) else None
         title_en = (title_pkg_out or {}).get("title_en") if isinstance(title_pkg_out, dict) else None
-        if title_cn is None and isinstance(ai.title_cn, dict):
-            title_cn = (((ai.title_cn or {}).get("output") or {}).get("title"))
         if title_en is None and isinstance(ai.title_en, dict):
             title_en = (((ai.title_en or {}).get("output") or {}).get("title"))
-        desc = (((ai.product_description or {}).get("output") or {}).get("description")) if isinstance(ai.product_description, dict) else None
 
         effective_category_path = task.selected_category_id or cat_path or (raw.category_path if raw else None)
         ai_fields = {
@@ -340,7 +330,6 @@ def _build_base_fields(session: Session, *, task: ProductTask) -> tuple[dict[str
             "selected_category_id": task.selected_category_id or cat_path,
             "product_title_cn": title_cn,
             "product_title_en": title_en,
-            "product_description": desc,
         }
         for k, v in ai_fields.items():
             if v is not None:
@@ -360,13 +349,6 @@ def _build_context(session: Session, *, task: ProductTask, base_fields: dict[str
     category_path = base_fields.get("category_path") or base_fields.get("selected_category_id") or ""
     title = str(base_fields.get("product_title_cn") or base_fields.get("raw_title") or "")
     description = str(base_fields.get("product_description") or "")
-    dna_keywords: list[str] = []
-    if isinstance(ai, ProductAIResult):
-        dna = (ai.product_dna or {}).get("output") if isinstance(ai.product_dna, dict) else None
-        if isinstance(dna, dict):
-            kws = dna.get("keywords")
-            if isinstance(kws, list):
-                dna_keywords = [str(x) for x in kws if x is not None]
 
     return {
         "task_id": task.id,
@@ -376,7 +358,7 @@ def _build_context(session: Session, *, task: ProductTask, base_fields: dict[str
         "description": description,
         "raw": raw,
         "ai": ai,
-        "dna_keywords": dna_keywords,
+        "dna_keywords": [],
         "raw_sku_text": raw.sku_text if raw else None,
         "fields": base_fields,
     }

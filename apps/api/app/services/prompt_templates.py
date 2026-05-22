@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -31,7 +32,7 @@ def render_template_text(*, template_text: str, variables: dict[str, Any]) -> st
         if value is None:
             return match.group(0)
         if isinstance(value, (dict, list)):
-            return str(value)
+            return json.dumps(value, ensure_ascii=False)
         return str(value)
 
     return PLACEHOLDER_RE.sub(replace, template_text)
@@ -142,4 +143,3 @@ def resolve_prompt(
         return session.scalar(query.limit(1))
 
     return pick("task") or pick("category") or pick("global")
-
