@@ -21,6 +21,7 @@ from app.models.export_field_mapping import ExportFieldMapping
 from app.models.export_record import ExportRecord
 from app.models.export_template import ExportTemplate
 from app.models.product_asset import ProductAsset
+from app.models.product_ai_result import ProductAIResult
 from app.models.product_task import ProductTask
 from app.services.export_fields import apply_default_rules_with_options
 from app.services.export_templates import get_default_export_template
@@ -222,6 +223,7 @@ def _build_row(
     url_validation_cache: dict[str, dict[str, Any]] = {}
 
     selected_assets = _load_selected_assets(session, task_id=task.id)
+    image_settings = _normalize_export_image_settings(getattr(task, "export_image_settings_json", None))
 
     for m in mappings:
         key = m.field_key
@@ -237,12 +239,18 @@ def _build_row(
             path = path.removeprefix("export_field_drafts.").removeprefix("fields.")
             value = draft_fields.get(path)
             if _is_media_field(m.field_name) and not value:
-                value = _fill_media_field_by_name(m.field_name or "", selected_assets)
+                value = _fill_media_field_by_name(m.field_name or "", selected_assets, image_settings=image_settings)
                 if value:
                     source_meta["source_type"] = "asset_fallback"
+                    if _is_carousel_media_field(m.field_name):
+                        source_meta["size_chart_insert"] = image_settings
         elif m.source_type == "asset":
             slots = _parse_slots(m.source_path or "")
-            infos = [selected_assets.get(s) for s in slots if selected_assets.get(s)]
+            if _is_carousel_media_field(m.field_name) and any(slot.startswith("carousel_") for slot in slots):
+                infos = _arranged_carousel_assets(selected_assets, image_settings=image_settings)
+                source_meta["size_chart_insert"] = image_settings
+            else:
+                infos = [selected_assets.get(s) for s in slots if selected_assets.get(s)]
             infos = [item for item in infos if item]
             value = _format_asset_output(infos, m.transform_rule_json or {})
         elif m.source_type == "task":
@@ -295,8 +303,62 @@ def _build_row(
     lang_errors, lang_warnings = _validate_multilingual_carousel_diff(media_field_values)
     errors.extend(lang_errors)
     warnings.extend(lang_warnings)
+    warnings.extend(_validate_task_ai_readiness(session, task=task, export_fields=export_fields))
 
     return export_fields, field_sources, {"errors": errors, "warnings": warnings}
+
+
+def _validate_task_ai_readiness(
+    session: Session,
+    *,
+    task: ProductTask,
+    export_fields: dict[str, Any],
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    mode = str(task.generation_mode or "").strip()
+    ai = session.scalar(select(ProductAIResult).where(ProductAIResult.task_id == task.id).limit(1))
+
+    title_output = (ai.title_package or {}).get("output") if isinstance(ai, ProductAIResult) and isinstance(ai.title_package, dict) else None
+    product_info_output = (ai.product_info or {}).get("output") if isinstance(ai, ProductAIResult) and isinstance(ai.product_info, dict) else None
+    category_output = (ai.category_match or {}).get("output") if isinstance(ai, ProductAIResult) and isinstance(ai.category_match, dict) else None
+
+    if mode not in {"task_only", "no_ai"}:
+        if not isinstance(title_output, dict) or not (title_output.get("title_cn") or title_output.get("title_en")):
+            warnings.append(
+                {
+                    "field_key": "title_package",
+                    "type": "ai_title_missing",
+                    "message": "AI 标题包未生成或为空；导出字段可能使用原始标题或人工值兜底",
+                }
+            )
+        if not isinstance(category_output, dict) or not (category_output.get("best_path") or category_output.get("selected_category")):
+            warnings.append(
+                {
+                    "field_key": "category_path",
+                    "type": "category_recall_missing",
+                    "message": "类目召回结果为空；请确认采用类目是否正确",
+                }
+            )
+
+    if bool(getattr(task, "include_product_info", False)) and mode not in {"task_only", "no_ai"}:
+        if not isinstance(product_info_output, dict) or not product_info_output:
+            warnings.append(
+                {
+                    "field_key": "product_info",
+                    "type": "product_info_missing",
+                    "message": "已开启商品理解，但商品理解结果为空；标题和四宫格可能缺少商品摘要上下文",
+                }
+            )
+
+    if not str(export_fields.get("product_title_cn") or "").strip() and not str(export_fields.get("product_title_en") or "").strip():
+        warnings.append(
+            {
+                "field_key": "product_title_cn",
+                "type": "listing_title_missing",
+                "message": "中文标题和英文标题都为空，请先生成标题或手动填写",
+            }
+        )
+    return warnings
 
 
 def _load_selected_assets(session: Session, *, task_id: int) -> dict[str, AssetInfo]:
@@ -330,17 +392,54 @@ def _is_media_field(field_name: str | None) -> bool:
     return any(token in name for token in ("图", "图片", "视频", "轮播图", "预览图", "详情图文"))
 
 
-def _fill_media_field_by_name(field_name: str, selected_assets: dict[str, AssetInfo]) -> str:
+def _is_carousel_media_field(field_name: str | None) -> bool:
+    return "轮播图" in str(field_name or "")
+
+
+def _normalize_export_image_settings(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    enabled = raw.get("insert_size_chart_in_carousel")
+    if enabled is None:
+        enabled = raw.get("size_chart_in_carousel")
+    try:
+        position = int(raw.get("size_chart_position") or 3)
+    except (TypeError, ValueError):
+        position = 3
+    return {
+        "insert_size_chart_in_carousel": bool(True if enabled is None else enabled),
+        "size_chart_position": max(1, min(position, 10)),
+    }
+
+
+def _arranged_carousel_assets(
+    selected_assets: dict[str, AssetInfo],
+    *,
+    image_settings: dict[str, Any],
+) -> list[AssetInfo]:
+    carousel_infos = [
+        selected_assets[slot]
+        for index in range(1, 11)
+        for slot in [f"carousel_{index}"]
+        if selected_assets.get(slot) and selected_assets[slot].public_url
+    ]
+    size_info = selected_assets.get("size_chart")
+    if not image_settings.get("insert_size_chart_in_carousel") or not size_info or not size_info.public_url:
+        return carousel_infos
+    insert_index = max(0, min(int(image_settings.get("size_chart_position") or 3) - 1, len(carousel_infos)))
+    return [*carousel_infos[:insert_index], size_info, *carousel_infos[insert_index:]]
+
+
+def _fill_media_field_by_name(
+    field_name: str,
+    selected_assets: dict[str, AssetInfo],
+    *,
+    image_settings: dict[str, Any],
+) -> str:
     name = field_name.strip()
     if not name:
         return ""
     if "轮播图" in name:
-        urls = []
-        for idx in range(1, 11):
-            slot = f"carousel_{idx}"
-            info = selected_assets.get(slot)
-            if info and info.public_url:
-                urls.append(info.public_url)
+        urls = [info.public_url for info in _arranged_carousel_assets(selected_assets, image_settings=image_settings)]
         return ",".join(urls)
     if "预览图" in name:
         for slot in ("preview_1", "sku_1", "carousel_1"):

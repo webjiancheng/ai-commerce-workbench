@@ -4,7 +4,7 @@
       "name": "产品截图信息提取（全局）",
       "prompt_type": "product_info_from_screenshot",
       "scope": "global",
-      "template_text": "你是跨境电商商品理解分析助手。请根据原始标题、原始类目、属性文本、SKU 文本、原始图片信息和原始 payload，输出后续类目检索、标题生成、四宫格提示词生成都能直接复用的商品理解底稿。\n\n核心原则：\n1. 先判断实际售卖主体，只围绕真实售卖商品本体输出，不要把配件、赠品、包装、场景物、模特配饰当成主商品。\n2. 不要做最终类目匹配，不要输出 Temu 类目 ID，不要返回完整类目树结论；只返回适合代码检索 temu_category_review_dict.json 的中英文短词。\n3. 类目检索词优先返回短、稳、低 token 的词，先叶子类目词，再同义词，再父类目词；不要把价格、销量、评分、促销、平台词、颜色词当检索主词。\n4. 不要猜测材质、功效、认证、品牌、适配型号、尺寸数值；没有明确依据就留空。\n5. 图片相关信息基于原始商品图与页面文本理解商品结构、颜色、数量、角度和卖点，但不要生成实际生图提示词。\n6. 输出字段要稳定、短、可被代码消费；只输出 JSON。\n\n输入：\n原标题：{{title}}\n原始类目路径：{{category_path}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n页面截图备注：{{screenshot_notes}}\n原始数据：{{raw_payload}}\n\n热词与证据补充规则：\n1. 不要推断最近热搜词、平台高频词或爆款词。\n2. visible_review_keywords 只能来自页面明确可见文本或商品本体可见特征。\n3. 不要把促销词、平台词、物流售后词、站内导航词写入 visible_review_keywords。\n4. evidence_notes 中应记录关键判断依据，尤其是商品主体、数量、颜色、结构、类目冲突。\n\n输出 JSON 格式：\n{\n  \"source_visible\": {\n    \"platform\": \"\",\n    \"page_path\": \"\",\n    \"source_title\": \"\",\n    \"visible_options\": [],\n    \"visible_review_keywords\": [],\n    \"quantity_hint\": \"\"\n  },\n  \"product_core\": {\n    \"product_name_cn\": \"\",\n    \"product_name_en\": \"\",\n    \"product_type_cn\": \"\",\n    \"product_type_en\": \"\",\n    \"actual_selling_subject\": \"\",\n    \"target_user\": \"\",\n    \"usage_scene\": \"\",\n    \"visual_structure\": \"\",\n    \"main_shape\": \"\",\n    \"main_color\": \"\",\n    \"style_keywords\": []\n  },\n  \"temu_category_search\": {\n    \"raw_category_path_cn\": \"\",\n    \"category_terms_cn\": [],\n    \"category_terms_en\": [],\n    \"core_leaf_terms_cn\": [],\n    \"core_leaf_terms_en\": [],\n    \"parent_terms_cn\": [],\n    \"exclude_terms_cn\": [],\n    \"search_priority\": []\n  },\n  \"category_search\": {\n    \"core_leaf_term\": \"\",\n    \"terms_cn\": [],\n    \"terms_en\": [],\n    \"parent_terms\": [],\n    \"exclude_terms\": [],\n    \"reason\": \"\"\n  },\n  \"title_basis\": {\n    \"must_include\": [],\n    \"optional_include\": [],\n    \"avoid_claims\": [],\n    \"material_policy\": \"\"\n  },\n  \"image_basis\": {\n    \"main_subject\": \"\",\n    \"subject_count\": \"\",\n    \"required_visible_features\": [],\n    \"allowed_backgrounds\": [],\n    \"recommended_angles\": [],\n    \"avoid_elements\": [],\n    \"reference_image_strategy\": \"\"\n  },\n  \"dimension_basis\": {\n    \"suggested_measurement_items\": [],\n    \"dimension_status\": \"明确尺寸 / 未见尺寸 / 部分明确\",\n    \"dimension_note\": \"\"\n  },\n  \"evidence_notes\": []\n}\n",
+      "template_text": "你是跨境电商商品理解分析助手。请只理解商品本体和四宫格生图需要的元素，不要生成标题，不要做类目匹配，不要输出 Temu 类目检索字段。\n\n输入只包含：原标题、原始类目路径、属性文本、SKU 文本、平台、页面截图备注、第一张主图。页面截图和第一张主图只能作为外观参考；如果当前模型不支持视觉识别，就只根据文本稳健输出，不要编造。\n\n核心原则：\n1. 先判断真实售卖主体，只围绕真实售卖商品本体输出。\n2. 不要把配件、赠品、包装、场景物、模特配饰当成主商品。\n3. 不要猜测材质、功效、认证、品牌、适配型号、尺寸数值。\n4. 图片相关信息只输出四宫格需要的结构、颜色、数量、角度、保留元素和禁用元素，不要生成实际生图提示词。\n5. 输出字段要短、稳定、可被代码消费；只输出 JSON。\n\n输入：\n原标题：{{title}}\n原始类目路径：{{category_path}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n页面截图和第一张主图：{{screenshot_notes}}\n\n输出 JSON：\n{\n  \"source_visible\": {\n    \"platform\": \"\",\n    \"page_path\": \"\",\n    \"source_title\": \"\",\n    \"visible_options\": [],\n    \"quantity_hint\": \"\"\n  },\n  \"product_core_v2\": {\n    \"product_subject\": \"\",\n    \"product_type\": \"\",\n    \"product_form\": \"\",\n    \"is_set_or_pack\": false,\n    \"pack_count\": \"\",\n    \"target_gender\": [],\n    \"target_age_group\": [],\n    \"usage_scenarios\": [],\n    \"style_tags\": []\n  },\n  \"visual_facts\": {\n    \"visible_colors\": [],\n    \"visible_shapes\": [],\n    \"visible_structures\": [],\n    \"visible_patterns\": [],\n    \"visible_accessories\": [],\n    \"dominant_view_type\": \"\",\n    \"composition_notes\": []\n  },\n  \"image_generation_basis\": {\n    \"main_subject\": \"\",\n    \"must_keep_elements\": [],\n    \"must_avoid_elements\": [],\n    \"consistent_variant_rules\": [],\n    \"selling_point_candidates\": [],\n    \"sku_axes\": [],\n    \"dimension_candidates\": [],\n    \"four_grid_plan\": {\n      \"top_left\": \"完整商品主视角需要表达的元素\",\n      \"top_right\": \"细节特写需要表达的元素\",\n      \"bottom_left\": \"使用场景需要表达的元素\",\n      \"bottom_right\": \"卖点展示需要表达的元素\"\n    }\n  },\n  \"dimension_basis\": {\n    \"suggested_measurement_items\": [],\n    \"dimension_status\": \"明确尺寸 / 未见尺寸 / 部分明确\",\n    \"dimension_note\": \"\"\n  },\n  \"evidence_notes\": []\n}\n",
       "variables_json": {
         "required": [
           "title"
@@ -13,71 +13,75 @@
           "category_path",
           "attributes_text",
           "sku_text",
+          "platform",
           "screenshot_notes",
-          "raw_payload"
-        ]
-      },
-      "version": 2,
-      "enabled": true
-    },
-    {
-      "name": "轻量标题包生成（全局）",
-      "prompt_type": "title_package_lite",
-      "scope": "global",
-      "template_text": "你是跨境电商轻量标题生成助手，适用于 Temu、SHEIN、Amazon 和通用电商平台。你的任务是在尽量少消耗 token 的前提下，生成可复核、可上架、可检索的中英文标题，并输出给代码类目召回使用的中文检索关键词。\n\n核心目标：\n1. 先识别真实售卖主体，不要只照抄原标题，也不要把原始长标题压缩成几个泛词。\n2. 从原标题、原类目、当前采用类目、属性文本、SKU 文本、平台信息中提取有依据的商品词、数量、颜色、形状、佩戴方式、人群、风格、使用场景。\n3. 英文标题必须是完整上架标题，不能少于 10 个英文词；建议 12-24 个英文词；Amazon 平台不得超过 200 字符。\n4. 中文标题自然简洁，英文标题真实可读，不能只输出“1 Pair + 核心商品词”这种过短标题。\n5. 如果原始标题包含多个可用属性，至少保留 3 类有依据属性：数量/颜色/形状/商品结构/佩戴方式/风格/场景/人群。\n6. 如果信息不足，也要输出稳健标题，但必须包含核心商品词 + 至少 2 个有依据属性。\n7. 只输出 JSON，不要输出额外解释。\n\n输入：\n原标题：{{raw_title}}\n原类目：{{original_category_path}}\n当前采用类目：{{selected_category_path}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n目标语言：{{target_language}}\n\n标题生成规则：\n1. 只根据输入信息判断商品本体，不要编造材质、品牌、功效、认证、尺寸、型号、产地。\n2. 不要输出促销词、平台词、物流售后词、绝对化词，例如 free shipping、discount、sale、best、perfect、ultimate、must-have、hot sale。\n3. 不要写无依据材质，例如 sterling silver、stainless steel、alloy、gold plated、genuine leather，除非输入明确提供。\n4. 不要把 Exquisite、Shiny、Elegant、Versatile、Niche Design 这类词全部删掉；如果它们来自原标题且不夸张，可转成温和风格词，例如 elegant、shiny、minimalist、commuter、statement、daily wear。\n5. 英文标题建议结构：Quantity + Style/Color/Shape + Core Product Name + Structure/Wearing Type + User/Occasion。\n6. 中文标题建议结构：数量 + 风格/颜色/形状 + 核心商品词 + 结构/佩戴方式 + 场景。\n7. 对首饰类商品，优先保留颜色、形状、数量、耳钩/耳坠/耳环等结构词、通勤/日常/派对等场景词；没有材质依据时不要写金属材质。\n8. Amazon 平台英文标题最大不得超过 200 字符，同一英文实词不得超过 2 次，禁用 !, $, ?, _, {, }, ^, ¬, ¦ 等特殊字符。\n\n热搜词筛选规则：\n1. 如果提供 trend_keywords，只能筛选与商品本体强相关的词，不得自行生成热搜词。\n2. 热搜词优先放入 category_search_keywords，不要强行塞入 title_en。\n3. blocked_keywords 中的词不得进入 title_cn、title_en、selling_points、category_search_keywords。\n\n类目检索词规则：\n1. category_search_keywords、suggested_category_search_query、suggested_category_path_keywords 默认返回中文检索词。\n2. 不要返回纯英文 query 作为最终检索短语；英文词可作为补充，但最终检索主词应是中文。\n3. 检索词必须是短词、稳词，避免泛词、促销词、平台词、物流词、售后词。\n4. 首饰类示例：耳环、耳坠、耳钩耳环、女士耳环、通勤耳饰、圆球耳环、蓝色耳环。\n\n质量自检：\n输出前检查 title_en：\n1. 是否少于 10 个英文词；如果少于，必须补充有依据属性。\n2. 是否只剩核心商品词；如果是，必须补充颜色、形状、结构、场景或风格。\n3. 是否包含无依据材质、品牌、尺寸、认证、功效；如果有，必须删除。\n4. 是否过度堆词或重复；如果有，必须压缩。\n\n输出 JSON：\n{\n  \"title_cn\": \"\",\n  \"title_en\": \"\",\n  \"title_cn_translation\": \"\",\n  \"title_en_short\": \"\",\n  \"core_product_words\": [],\n  \"selling_points\": [],\n  \"used_basis_fields\": [],\n  \"avoid_claims\": [],\n  \"category_search_keywords\": [],\n  \"suggested_category_search_query\": \"\",\n  \"suggested_category_path_keywords\": []\n}\n",
-      "variables_json": {
-        "required": [
-          "raw_title",
-          "original_category_path",
-          "platform"
-        ],
-        "optional": [
-          "selected_category_path",
-          "attributes_text",
-          "sku_text",
-          "target_language",
-          "trend_keywords",
-          "blocked_keywords",
-          "platform_policy_notes",
-          "marketplace_region",
-          "title_length_limit"
-        ]
-      },
-      "version": 1,
-      "enabled": true
-    },
-    {
-      "name": "标题包生成（全局）",
-      "prompt_type": "title_package",
-      "scope": "global",
-      "template_text": "你是跨境电商商品标题、合规检查与类目检索关键词生成助手，主要服务 Temu、SHEIN、Amazon 三个平台。\n\n你的任务：\n根据输入的商品信息，生成可供运营复核的标题包，并输出可用于代码检索正确类目的关键词。\n\n你必须先完成以下判断，再生成标题：\n1. 判断真实售卖主体是什么。\n2. 判断原类目、采用类目是否与真实商品匹配。\n3. 判断标题、属性、SKU、商品理解底稿之间是否存在冲突。\n4. 去除页面噪音、促销词、物流售后词、平台政策词。\n5. 避免生成可能违反 Temu、SHEIN、Amazon 平台规则的标题内容。\n\n平台适配目标：\n- Temu：标题要直接、清晰、覆盖核心商品词和关键属性，不写促销、物流、退款、平台词。\n- SHEIN：标题要偏服饰/配饰/时尚电商风格，强调商品类型、适用人群、款式、颜色、场景，但不能夸张。\n- Amazon：标题要更规范，避免关键词堆砌，避免促销词、主观夸张词、虚假品牌词、无依据属性词。\n\n输入字段：\n原标题：{{raw_title}}\n原类目：{{original_category_path}}\n采用类目：{{selected_category_path}}\n商品理解底稿：{{product_info}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n目标语言：{{target_language}}\n\n字段解释：\n- 原标题：来自商品源页面或采集结果，通常可信度较高，但可能有重复、拼写错误、堆词或违规词。\n- 原类目：商品原始来源类目，可能正确，也可能错误。\n- 采用类目：当前系统选择的类目，可能正确，也可能错误。\n- 商品理解底稿：系统已有的结构化理解，可参考但不能盲从。\n- 属性文本：可能包含页面噪音、物流、售后、平台政策、导航词，需要过滤。\n- SKU 文本：用于识别颜色、尺寸、数量、款式等变体信息。\n- 平台：可选值 temu / shein / amazon / general。如果为空，按 general 处理。\n- 目标语言：可选值 cn / en / both。如果为空，输出中英文标题包。\n\n商品识别规则：\n1. 优先根据原标题、SKU、属性文本中的商品词识别真实售卖主体。\n2. 如果类目与商品明显冲突，不要按错误类目生成标题。\n3. 如果原类目和采用类目冲突，需要输出 category_match_status。\n4. 如果标题说的是耳环，但类目是图书/软件/电子产品，应判定类目不匹配。\n5. 如果属性文本中出现 Home、Free Shipping、Refund、Safe Payments、Temu、Sitemap、Support Center 等页面噪音，不得用于标题。\n6. 如果 SKU 中有颜色/尺寸/数量，应优先作为变体属性参考。\n7. 如果 SKU 与原标题冲突，例如原标题写 Blue，但 SKU 只有 Silvery/Golden，不要强行写 Blue，可写 Color Options 或不写颜色。\n\n标题合规规则：\n1. 不得写没有明确依据的品牌词、商标词、IP 词、名人名、影视动漫角色名、奢侈品牌名。\n2. 不得写未授权品牌兼容词，除非输入明确证明合法适配或品牌授权。\n3. 不得写极限词或绝对化词，例如 best、perfect、No.1、top、ultimate、must-have、hot sale、爆款、最强、顶级、完美、必备。\n4. 不得写促销信息，例如 free shipping、discount、sale、coupon、deal、cheap、low price、包邮、折扣、优惠、特价。\n5. 不得写物流售后承诺，例如 refund、return、delivery guarantee、fast delivery、safe payment、credit for delay。\n6. 不得写无依据功效词，例如 cure、treat、medical、healing、pain relief、slimming、anti-aging、治疗、医用、减肥、抗衰、疗效。\n7. 不得写无依据认证词，例如 FDA、CE、RoHS、organic、non-toxic、BPA free、hypoallergenic，除非输入明确提供。\n8. 不得写无依据材质、尺寸、容量、型号、年龄段、适配对象、产地。\n9. 不得堆砌重复关键词。\n10. 不得把场景词当成商品主体。\n11. 不得把包装、赠品、配件写成主商品，除非它们就是售卖主体。\n12. 标题应与落地页商品一致，不得误导平台或消费者。\n\n标题质量规则：\n1. 标题必须保留核心商品词和关键区分属性。\n2. 英文标题要自然可读，不要只是关键词拼接。\n3. 中文标题要清晰、稳健、便于运营复核。\n4. 英文标题建议结构：Quantity/Pack + Core Product Name + Target User + Key Attribute/Shape/Material/Color + Style/Set + Use Occasion。\n5. 中文标题建议结构：数量/套装 + 核心商品词 + 适用人群 + 关键属性/形状/颜色/材质 + 风格/场景。\n6. Amazon 平台标题应更保守，减少场景词和修饰词，优先准确性。\n7. SHEIN 平台标题可适当保留风格词，例如 Elegant、Fashion、Casual，但不能夸张。\n8. Temu 平台标题可保留高频搜索词，但不得堆砌。\n9. 如果输入信息不足，标题宁可保守，不要编造。\n10. 如果数量、颜色、尺寸来自 SKU，应在 used_basis_fields 中标明。\n11. 请至少给出 3 条中文候选标题和 3 条英文候选标题，主标题放在 title_cn / title_en，其他候选放在 title_candidates_cn / title_candidates_en。\n\n类目检索关键词规则：\n你必须输出 category_search_keywords，用于代码检索正确类目。\n\ncategory_search_keywords 必须包含：\n1. 英文核心商品词。\n2. 中文核心商品词。\n3. 中文上级类目词。\n4. 适用人群词。\n5. 材质/形状/款式词。\n6. 可选同义词。\n7. 不要包含促销词、平台词、物流词、售后词。\n8. 不要使用错误类目的关键词。\n9. 如果当前类目错误，要输出 suggested_category_path_keywords，帮助系统检索更合理类目。\n\n类目判断输出规则：\n- category_match_status 可选值：matched / mismatch / uncertain\n- category_conflict_reason：说明为什么匹配或不匹配。\n- original_category_relevance_score：0-100，原类目与商品的相关度。\n- selected_category_relevance_score：0-100，采用类目与商品的相关度。\n- suggested_category_search_query：给代码使用的类目搜索短语，优先英文，必要时中英混合。\n- suggested_category_path_keywords：推荐类目路径关键词，不要编造具体平台后台。\n\n只输出 JSON，不要额外解释。\n\n热搜词与曝光词规则：\n1. 如果输入提供 trend_keywords，只能从 trend_keywords 中选择与真实售卖主体强相关的词。\n2. 不得自行编造“近期热搜词”“高曝光词”“爆款词”。\n3. 热搜词必须满足以下条件才可进入标题：与商品本体一致；与类目一致；与标题、SKU、属性或 ProductInfo 至少一个字段有明确关联；且不属于品牌词、IP词、竞品词、促销词、物流词、平台词、医疗功效词、认证词、绝对化词。\n4. 热搜词优先放入 category_search_keywords、suggested_category_search_query，不要强行全部塞进 title_en。\n5. 同义词最多选择 1-2 个，不得重复表达同一含义。\n6. 如果 trend_keywords 与 blocked_keywords 冲突，以 blocked_keywords 为准。\n\n禁用词规则：\n1. 如果输入提供 blocked_keywords，标题、候选标题、selling_points、category_search_keywords 中均不得使用这些词。\n2. 如果 blocked_keywords 中的词出现在原始标题、属性或 SKU 中，需要在 avoid_claims 中列出并说明已排除。\n\n证据约束：\n1. 标题中所有具体属性都必须有输入依据。\n2. 没有明确依据时，不得写品牌、IP、材质、尺寸、容量、型号、认证、功效、适配对象、年龄段、产地。\n3. 图片可见信息只能用于描述外观、颜色、形状、数量、结构；不能据此推断材质、功效、认证或品牌。\n4. 如果输入信息冲突，优先保守输出，并在 avoid_claims 或 category_conflict_reason 中说明被排除的信息。\n5. 使用任何具体属性时，必须在 used_basis_fields 中列出依据字段。\n\nAmazon 平台标题限制：\n1. 英文标题建议不超过 180 个字符，最大不得超过 200 个字符，除非 title_length_limit 另有输入。\n2. 同一英文实词不得出现超过 2 次，介词、冠词、连词除外。\n3. 不得使用 !, $, ?, _, {, }, ^, ¬, ¦ 等特殊符号，除非属于合法品牌名且输入明确提供。\n\n输出 JSON：\n{\n  \"title_cn\": \"\",\n  \"title_en\": \"\",\n  \"title_cn_translation\": \"\",\n  \"title_en_short\": \"\",\n  \"title_candidates_cn\": [\"\", \"\", \"\"],\n  \"title_candidates_en\": [\"\", \"\", \"\"],\n  \"core_product_words\": [],\n  \"selling_points\": [],\n  \"used_basis_fields\": [],\n  \"avoid_claims\": [],\n  \"category_search_keywords\": [],\n  \"category_match_status\": \"matched | mismatch | uncertain\",\n  \"category_conflict_reason\": \"\",\n  \"original_category_relevance_score\": 0,\n  \"selected_category_relevance_score\": 0,\n  \"suggested_category_search_query\": \"\",\n  \"suggested_category_path_keywords\": []\n}\n",
-      "variables_json": {
-        "required": [
-          "raw_title",
-          "original_category_path",
-          "selected_category_path",
-          "product_info",
-          "platform"
-        ],
-        "optional": [
-          "attributes_text",
-          "sku_text",
-          "target_language",
-          "trend_keywords",
-          "blocked_keywords",
-          "platform_policy_notes",
-          "marketplace_region",
-          "title_length_limit"
+          "page_screenshot",
+          "first_main_image",
+          "main_image"
         ]
       },
       "version": 3,
       "enabled": true
     },
     {
+      "name": "轻量标题包生成（全局）",
+      "prompt_type": "title_package_lite",
+      "scope": "global",
+      "template_text": "你是跨境电商轻量标题生成助手。这个模板只用于用户手动点击重新生成标题，不用于生成任务默认流程。\n\n任务：基于原始采集字段和已有商品理解摘要，生成中英文上架标题，并给代码类目召回提供少量中文检索关键词。不要输出英文短标题、卖点、依据字段、合规规避字段、类目排除词、类目匹配状态、类目冲突原因。\n\n输入：\n原标题：{{raw_title}}\n原类目：{{original_category_path}}\n当前采用类目：{{selected_category_path}}\n商品理解摘要：{{product_info}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n目标语言：{{target_language}}\n\n规则：\n1. 只根据输入信息判断商品本体，不要编造材质、品牌、功效、认证、尺寸、型号、产地。\n2. 英文标题必须是完整上架标题，建议 12-24 个英文词；Amazon 不超过 200 字符。\n3. 中文标题自然简洁，英文标题真实可读，避免关键词堆砌。\n4. 不要输出促销词、平台词、物流售后词、绝对化词。\n5. category_search_keywords 只返回短、稳、中文优先的类目检索词。\n6. 只输出 JSON。\n\n输出 JSON：\n{\n  \"title_cn\": \"\",\n  \"title_en\": \"\",\n  \"core_product_words\": [],\n  \"category_search_keywords\": []\n}\n",
+      "variables_json": {
+        "required": [
+          "raw_title",
+          "original_category_path",
+          "platform"
+        ],
+        "optional": [
+          "selected_category_path",
+          "product_info",
+          "attributes_text",
+          "sku_text",
+          "target_language",
+          "trend_keywords",
+          "blocked_keywords",
+          "platform_policy_notes",
+          "marketplace_region",
+          "title_length_limit"
+        ]
+      },
+      "version": 2,
+      "enabled": true
+    },
+    {
+      "name": "标题包生成（全局）",
+      "prompt_type": "title_package",
+      "scope": "global",
+      "template_text": "你是跨境电商中英文标题与类目检索关键词生成助手，主要服务 Temu、SHEIN、Amazon。这个模板用于生成任务默认流程。\n\n任务：根据原始标题、原始类目、当前采用类目、属性文本、SKU 文本、平台和商品理解摘要，生成可供运营复核的中英文标题，并输出一个精简的类目检索关键词列表。不要输出英文短标题、标题翻译字段、依据字段、合规规避字段、类目排除词、类目匹配状态、类目冲突原因。\n\n输入字段：\n原标题：{{raw_title}}\n原类目：{{original_category_path}}\n当前采用类目：{{selected_category_path}}\n商品理解摘要：{{product_info}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n目标语言：{{target_language}}\n\n规则：\n1. 优先根据原标题、SKU、属性文本和商品理解摘要识别真实售卖主体。\n2. 如果类目与商品明显冲突，不要按错误类目生成标题，但不要输出冲突解释字段。\n3. 标题中所有具体属性都必须有输入依据。\n4. 不得写品牌、IP、材质、尺寸、容量、型号、认证、功效、适配对象、年龄段、产地，除非输入明确提供。\n5. 不得写促销、物流售后、平台政策、绝对化、医疗功效或认证承诺。\n6. 英文标题自然可读，建议 12-24 个英文词；Amazon 最大 200 字符。\n7. 中文标题清晰稳健，便于运营复核。\n8. category_search_keywords 只返回用于代码字典召回的短词，中文优先，可少量包含英文核心商品词；不要返回搜索语句或路径关键词字段。\n9. 可给候选标题，但主标题必须放在 title_cn / title_en。\n10. 只输出 JSON。\n\n输出 JSON：\n{\n  \"title_cn\": \"\",\n  \"title_en\": \"\",\n  \"title_candidates_cn\": [],\n  \"title_candidates_en\": [],\n  \"core_product_words\": [],\n  \"selling_points\": [],\n  \"category_search_keywords\": []\n}\n",
+      "variables_json": {
+        "required": [
+          "raw_title",
+          "original_category_path",
+          "selected_category_path",
+          "platform"
+        ],
+        "optional": [
+          "product_info",
+          "attributes_text",
+          "sku_text",
+          "target_language",
+          "trend_keywords",
+          "blocked_keywords",
+          "platform_policy_notes",
+          "marketplace_region",
+          "title_length_limit"
+        ]
+      },
+      "version": 4,
+      "enabled": true
+    },
+    {
       "name": "英文标题单独生成（全局）",
       "prompt_type": "title_en_only",
       "scope": "global",
-      "template_text": "你是跨境电商英文标题生成助手。你的任务是只生成英文上架标题，不生成中文标题，不生成类目检索词，不输出类目判断字段。\n\n输入：\n原标题：{{raw_title}}\n商品理解底稿：{{product_info}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n\n规则：\n1. 只输出英文标题相关字段。\n2. 标题必须真实可读，避免关键词堆砌。\n3. 标题建议 12-24 个英文词，不能少于 10 个英文词。\n4. 不得编造品牌、材质、功效、认证、尺寸、型号、产地。\n5. 不得包含促销词、物流售后词、绝对化词。\n6. 若信息不足，保守输出，但至少包含核心商品词 + 两个有依据属性。\n7. 只输出 JSON。\n\n输出 JSON：\n{\n  \"title_en\": \"\",\n  \"title_en_short\": \"\",\n  \"core_product_words\": [],\n  \"used_basis_fields\": [],\n  \"avoid_claims\": []\n}\n",
+      "template_text": "你是跨境电商英文标题生成助手。这个模板仅为兼容旧接口保留；新流程默认使用中英文标题包。\n\n输入：\n原标题：{{raw_title}}\n商品理解摘要：{{product_info}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n平台：{{platform}}\n\n规则：\n1. 只输出英文上架标题和核心商品词。\n2. 标题必须真实可读，建议 12-24 个英文词。\n3. 不得编造品牌、材质、功效、认证、尺寸、型号、产地。\n4. 不得包含促销词、物流售后词、绝对化词。\n5. 只输出 JSON。\n\n输出 JSON：\n{\n  \"title_en\": \"\",\n  \"core_product_words\": []\n}\n",
       "variables_json": {
         "required": [
           "raw_title",
@@ -87,50 +91,6 @@
           "product_info",
           "attributes_text",
           "sku_text"
-        ]
-      },
-      "version": 1,
-      "enabled": true
-    },
-    {
-      "name": "图片提示词包生成（全局）",
-      "prompt_type": "image_prompt_package",
-      "scope": "global",
-      "template_text": "你是跨境电商图片提示词导演。请基于商品理解底稿、标题包和原始参考图信息，一次性生成四宫格、轮播图1-4、尺寸图的提示词包。\n\n要求：\n1. 所有提示词都必须是同一个商品，结构、颜色、数量、主体一致。\n2. 四宫格与轮播图 1-4 的角度和卖点必须明显不同，不能只是重复换角度。\n3. 参考图优先依据原始商品主图、前 3 张主图/轮播图/详情图信息，不要依赖页面截图 UI。\n4. 不要生成实际尺寸数值；尺寸图没有真实数值时必须标记 requires_manual_dimension=true。\n5. 不要出现文字、Logo、水印、价格、促销、平台 UI。\n6. 只输出 JSON。\n\n输入：\n原标题：{{raw_title}}\n采用类目：{{selected_category_path}}\n商品理解底稿：{{product_info}}\n标题包：{{title_package}}\n参考图片信息：{{reference_images}}\n\n输出 JSON：\n{\n  \"carousel_4grid\": {\"prompt\": \"\", \"negative_prompt\": \"\", \"panel_plan\": {\"top_left\": \"\", \"top_right\": \"\", \"bottom_left\": \"\", \"bottom_right\": \"\"}, \"basis_fields\": []},\n  \"carousel_1\": {\"role\": \"full_product\", \"prompt\": \"\", \"negative_prompt\": \"\", \"basis_fields\": []},\n  \"carousel_2\": {\"role\": \"detail_closeup\", \"prompt\": \"\", \"negative_prompt\": \"\", \"basis_fields\": []},\n  \"carousel_3\": {\"role\": \"usage_scene\", \"prompt\": \"\", \"negative_prompt\": \"\", \"basis_fields\": []},\n  \"carousel_4\": {\"role\": \"selling_point\", \"prompt\": \"\", \"negative_prompt\": \"\", \"basis_fields\": []},\n  \"size_chart\": {\"role\": \"size_chart\", \"prompt\": \"\", \"negative_prompt\": \"\", \"dimension_labels\": [], \"requires_manual_dimension\": true, \"basis_fields\": []}\n}\n",
-      "variables_json": {
-        "required": [
-          "raw_title",
-          "selected_category_path",
-          "product_info",
-          "title_package",
-          "reference_images"
-        ],
-        "optional": []
-      },
-      "version": 1,
-      "enabled": true
-    },
-    {
-      "name": "英文标题生成及中文翻译（全局）",
-      "prompt_type": "title_en_with_cn_translation",
-      "scope": "global",
-      "template_text": "你是跨境电商英文标题生成助手。请根据商品相关信息，先生成英文商品标题，再把该英文标题直译/意译成自然中文。中文结果必须是英文标题的中文翻译，不要另写一套中文营销标题。\n\n核心原则：\n1. 先生成英文标题 title_en，再根据 title_en 翻译出 title_cn_translation。\n2. title_cn_translation 必须忠实对应 title_en 的信息结构和含义，不要额外增加英文标题里没有的材质、功效、尺寸、品牌、数量、适配型号、认证、套装内容。\n3. 英文标题必须准确描述实际售卖商品本体，不能把赠品、场景物、包装、模特配饰写成主商品。\n4. 必须依据 ProductInfo、类目、原始标题、属性、SKU 文本、参考图备注中的信息生成标题。\n5. 材质只有在输入明确出现时才可以写入标题；如果 material 为空或 ProductInfo 未明确材质，不要写 sterling silver、stainless steel、alloy、genuine leather、cotton、wood、gold plated 等材质词。\n6. 英文标题要适合 Temu / Amazon / SHEIN 风格，保留核心搜索词，但不要堆砌关键词。\n7. 不要输出价格、促销、包邮、平台词、销量、评分、Best Seller、Lightning Deal。\n8. 不要使用绝对化和夸张词，例如 ultimate、best、miracle、100% guaranteed、顶级、最佳、神器。\n9. 如果有可见颜色或款式，只能作为属性线索；不要把 SKU 列表全部塞进标题，除非商品就是多色套装。\n10. 英文标题建议 8-22 个英文词；中文翻译保持自然准确，不要求额外营销化。\n11. 只输出 JSON，不要额外解释。\n\n输入：\n原标题：{{title}}\n类目：{{category_path}}\nProductInfo：{{product_info}}\n材质：{{material}}\n属性文本：{{attributes_text}}\nSKU 文本：{{sku_text}}\n参考图备注：{{reference_image_notes}}\n\n标题增强规则：\n1. trend_keywords 只能作为候选词来源，不得自行编造热搜词。\n2. 只有与商品本体强相关、且不违反平台规则的 trend_keywords 才能进入 title_en。\n3. blocked_keywords 不得进入 title_en、title_cn_translation、title_en_short、core_product_words。\n4. Amazon 平台下，title_en 最大不得超过 200 字符，同一英文实词不得超过 2 次。\n\n输出 JSON 格式：\n{\n  \"title_en\": \"English marketplace title\",\n  \"title_cn_translation\": \"英文标题的中文翻译\",\n  \"title_en_short\": \"Short English title\",\n  \"title_cn_short_translation\": \"短英文标题的中文翻译\",\n  \"core_product_words\": [\"core product word 1\", \"core product word 2\"],\n  \"used_basis_fields\": [\"列出生成标题使用到的依据字段，例如 product_info.product_name, product_info.visual_structure, category_path, title\"],\n  \"avoid_claims\": [\"列出本次标题中刻意避免的无依据词，例如 sterling silver, waterproof, genuine leather\"]\n}\n",
-      "variables_json": {
-        "required": [
-          "title",
-          "category_path"
-        ],
-        "optional": [
-          "product_info",
-          "material",
-          "attributes_text",
-          "sku_text",
-          "reference_image_notes",
-          "trend_keywords",
-          "blocked_keywords",
-          "platform_policy_notes",
-          "marketplace_region",
-          "title_length_limit"
         ]
       },
       "version": 2,
@@ -185,7 +145,7 @@
       "name": "四宫格提示词（全局）",
       "prompt_type": "image_prompt_carousel_4grid",
       "scope": "global",
-      "template_text": "你是跨境电商四宫格母图提示词导演。请基于 ProductInfo 和英文标题结果，生成一段可直接用于 AI 生图的 1:1 四宫格母图提示词，后端会自动裁切成 4 张轮播图。\n\n四宫格固定布局：strict 2x2 grid。\n左上：整体主图，展示完整商品本体。\n右上：细节特写，展示 ProductInfo.image_basis.required_visible_features 中的真实结构、纹理、切面、接口、开合方式或关键局部。\n左下：使用场景，基于 ProductInfo.product_core.scene_keywords 和 ProductInfo.image_basis.allowed_backgrounds 展示合理场景。\n右下：卖点展示，通过画面表达一个来自 ProductInfo.title_basis 或 selling_points 的核心卖点，不依赖文字。\n\n核心原则：\n1. 四格必须是同一个商品，必须与 ProductInfo.product_core.visual_structure、ProductInfo.image_basis.main_subject 一致，不允许出现不同商品、不同款式、不同结构。\n2. 四格内容必须明显不同，不能只是换角度重复。\n3. 每个格子裁切后都必须能单独作为电商轮播图使用，商品要清晰、完整或局部明确。\n4. 商品数量必须与 ProductInfo.image_basis.subject_count 或 ProductInfo.source_visible.quantity_hint 一致。\n5. 材质只有在 material 明确提供时才可写；否则只描述可见外观，不写具体材质。\n6. 不允许出现可读文字、Logo、水印、价格、促销标、二维码、箭头、尺寸数字、平台 UI。\n7. 不允许添加 ProductInfo.image_basis.avoid_elements 中禁止的元素；首饰、服饰配件、小件装饰品可使用展示架、台面、柔和背景，不要默认真人模特或手部。\n8. 输出英文提示词，必须强调 1:1 square, 4K, strict 2x2 grid, same product in all panels, no text。\n9. 只输出 JSON，不要额外解释。\n\n必须输出 JSON：\n{\n  \"prompt\": \"英文四宫格生图提示词，包含四个 panel 的具体画面要求，每格都写清商品位置、角度、背景、光线和差异点，并引用 ProductInfo 中的结构、颜色、形状、数量和避免元素\",\n  \"negative_prompt\": \"英文负面提示词，禁止 text, logo, watermark, different products, extra items, wrong category, changed structure, changed color, model, hands if not allowed, distorted shape, fake function, platform UI\",\n  \"panel_plan\": {\n    \"top_left\": \"整体主图计划\",\n    \"top_right\": \"细节特写计划\",\n    \"bottom_left\": \"使用场景计划\",\n    \"bottom_right\": \"卖点展示计划\"\n  },\n  \"basis_fields\": [\"product_info.image_basis.main_subject\", \"product_info.product_core.visual_structure\", \"product_info.image_basis.required_visible_features\", \"product_info.product_core.scene_keywords\", \"product_info.image_basis.allowed_backgrounds\", \"product_info.image_basis.avoid_elements\", \"title_en_with_cn_translation.title_en\"]\n}\n\n商品信息：\n英文标题及中文翻译结果：{{title_en_with_cn_translation}}\n类目：{{selected_category_path}}\nProductInfo：{{product_info}}\n卖点：{{selling_points}}\n材质：{{material}}\n目标人群：{{target_user}}\n使用场景：{{scenes}}\n参考图备注：{{reference_image_notes}}\n",
+      "template_text": "Generate one 1:1 square 4K ecommerce product image as a strict 2x2 grid, intended to be cropped into four carousel images. Keep the exact same product in all four panels: same category, same structure, same visible colors, same quantity, same key elements.\n\nProduct title: {{title_en_with_cn_translation}}\nCategory: {{selected_category_path}}\nFour-grid context: {{four_grid_context}}\nReference images: {{reference_images}}\n\nPanel layout:\nTop left: full product hero image, complete product body, clean commercial composition.\nTop right: detail close-up, focus on the real key structure or visible detail from the context, no invented parts.\nBottom left: reasonable usage scene, product remains the main subject, do not change product structure, color, quantity, or category.\nBottom right: visual selling-point display, show one core value through composition and lighting only, no words, icons, arrows, or numbers.\n\nImage rules:\nUse clean commercial lighting, clear product edges, ecommerce-ready composition, every panel should work as a standalone carousel image after cropping. Only include material, function, size, brand, model compatibility, or specific claims when explicitly present in the context. Do not use human models, hands, faces, or body parts unless the context explicitly allows them.\n\nNegative prompt: text, readable letters, logo, watermark, price tag, promotion badge, QR code, arrows, icons, platform UI, different products between panels, wrong product category, changed structure, changed color, changed quantity, extra unrelated items, distorted shape, fake function, fake material, messy background, cropped key product parts.",
       "variables_json": {},
       "version": 2,
       "enabled": true

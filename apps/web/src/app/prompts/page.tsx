@@ -33,8 +33,6 @@ const PROMPT_TYPE_LABELS: Record<string, string> = {
   title_package: "标题包",
   title_en: "英文标题生成",
   title_en_only: "英文标题单独生成",
-  title_en_with_cn_translation: "英文标题及中文翻译",
-  image_prompt_package: "图片提示词包",
   image_prompt_main: "主图提示词",
   image_prompt_carousel_1: "轮播图1提示词",
   image_prompt_carousel_2: "轮播图2提示词",

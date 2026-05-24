@@ -31,7 +31,6 @@ const PREFERRED_TEXT_PURPOSES: AiPurpose[] = [
   "title_package_lite",
   "title_package",
   "product_info",
-  "image_prompt_package",
   "dimension_extract",
 ];
 const PREFERRED_IMAGE_PURPOSES: AiPurpose[] = ["image_4grid", "image_generate"];

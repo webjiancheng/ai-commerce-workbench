@@ -14,6 +14,7 @@ from app.core.task_status import (
     TitleStatus,
 )
 from app.models.export_field_draft import ExportFieldDraft
+from app.models.cost_record import CostRecord
 from app.models.image_generation_job import ImageGenerationJob
 from app.models.product_ai_result import ProductAIResult
 from app.models.product_task import ProductTask
@@ -62,6 +63,7 @@ def create_task_from_raw_product(
         image_prompt_status=ImagePromptStatus.pending.value,
         image_status=DEFAULT_IMAGE_STATUS,
         export_status=DEFAULT_EXPORT_STATUS,
+        export_image_settings_json={"insert_size_chart_in_carousel": True, "size_chart_position": 3},
     )
     session.add(task)
     session.commit()
@@ -214,10 +216,10 @@ def update_product_task(session: Session, task: ProductTask, payload: ProductTas
 
 _PROMPT_LABELS: dict[str, str] = {
     "product_info": "商品理解",
-    "category_match": "类目处理",
+    "category_match": "类目召回（代码）",
     "title_en": "英文标题",
     "title_package": "标题包",
-    "image_prompt_package": "图片提示词包",
+    "image_prompt_package": "图片提示词上下文（代码）",
 }
 
 
@@ -299,9 +301,12 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
     prompt_snapshot = ai_row.prompt_snapshot if isinstance(ai_row.prompt_snapshot, dict) else {}
     runtime_meta = prompt_snapshot.get("_runtime") if isinstance(prompt_snapshot.get("_runtime"), dict) else {}
 
+    title_package_payload = ai_row.title_package if isinstance(ai_row.title_package, dict) else {}
     for field_name, label in _PROMPT_LABELS.items():
         payload = getattr(ai_row, field_name, None)
         if not isinstance(payload, dict) or not payload:
+            continue
+        if field_name == "title_en" and payload == title_package_payload:
             continue
         output = payload.get("output")
         error = payload.get("error")
@@ -362,7 +367,10 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
     return events
 
 
-def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimelineEvent]:
+def _build_image_events(
+    jobs: list[ImageGenerationJob],
+    cost_by_job_id: dict[int, CostRecord],
+) -> list[ProductTaskTimelineEvent]:
     events: list[ProductTaskTimelineEvent] = []
     for job in jobs:
         target_slots = [slot for slot in (job.target_slots_json or []) if isinstance(slot, str)]
@@ -375,6 +383,20 @@ def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimel
             else "default_provider"
         )
         runtime_base_url = provider_config.get("base_url")
+        pricing = provider_snapshot.get("pricing_json") if isinstance(provider_snapshot.get("pricing_json"), dict) else {}
+        cost_record = cost_by_job_id.get(job.id)
+        estimated_cost = (
+            float(cost_record.estimated_cost)
+            if cost_record is not None and cost_record.estimated_cost is not None
+            else float(pricing.get("estimated_cost_per_image"))
+            if pricing.get("estimated_cost_per_image") is not None
+            else None
+        )
+        currency = (
+            str(cost_record.currency)
+            if cost_record is not None
+            else str(pricing.get("currency") or "USD")
+        )
         meta = {
             "job_id": job.id,
             "job_type": job.job_type,
@@ -385,6 +407,11 @@ def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimel
             "size": job.size,
             "provider_source": provider_source,
             "base_url": runtime_base_url,
+            "estimated_cost": estimated_cost,
+            "currency": currency,
+            "prompt_template_id": job.prompt_template_id,
+            "prompt_snapshot": job.prompt_snapshot,
+            "final_prompt": job.final_prompt,
         }
         events.append(
             _event(
@@ -436,7 +463,12 @@ def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimel
                         else (job.error_message or "图片生成失败。")
                     ),
                     source="image_generation_jobs",
-                    meta=meta | {"output_asset_ids": job.output_asset_ids_json or []},
+                    meta=meta
+                    | {
+                        "parent_asset_id": job.parent_asset_id,
+                        "output_asset_ids": job.output_asset_ids_json or [],
+                        "error_message": job.error_message,
+                    },
                 )
             )
     return events
@@ -473,6 +505,8 @@ def get_product_task_timeline(session: Session, task: ProductTask) -> ProductTas
         .where(ImageGenerationJob.product_task_id == task.id)
         .order_by(ImageGenerationJob.created_at.asc(), ImageGenerationJob.id.asc())
     ).all()
+    cost_rows = session.scalars(select(CostRecord).where(CostRecord.product_task_id == task.id)).all()
+    cost_by_job_id = {int(row.job_id): row for row in cost_rows if row.job_id is not None}
 
     events: list[ProductTaskTimelineEvent] = [
         _event(
@@ -519,7 +553,7 @@ def get_product_task_timeline(session: Session, task: ProductTask) -> ProductTas
                 )
             )
 
-    events.extend(_build_image_events(jobs))
+    events.extend(_build_image_events(jobs, cost_by_job_id))
     events.extend(_build_exception_events(task))
     events.append(
         _event(

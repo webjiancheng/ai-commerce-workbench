@@ -53,6 +53,7 @@ class ProductTaskUpdate(BaseModel):
     selected_category_id: str | None = None
     generation_mode: GenerationMode | None = None
     include_product_info: bool | None = None
+    export_image_settings_json: dict[str, Any] | None = None
     notes: str | None = None
 
 
@@ -75,6 +76,7 @@ class ProductTaskListItem(BaseModel):
     export_status: ExportStatus
     selected_category_id: str | None
     category_candidates_json: list[object] = Field(default_factory=list)
+    export_image_settings_json: dict[str, Any] = Field(default_factory=dict)
     exception_status: str | None = None
     exception_level: str | None = None
     exception_reasons_json: list[object] = Field(default_factory=list)

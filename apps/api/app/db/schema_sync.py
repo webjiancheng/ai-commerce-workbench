@@ -56,6 +56,12 @@ def ensure_product_tasks_schema(engine: Engine) -> None:
         _add_column(engine, table="product_tasks", column_sql="image_prompt_status VARCHAR(32) NOT NULL DEFAULT 'pending'")
     if "category_candidates_json" not in existing_columns:
         _add_column(engine, table="product_tasks", column_sql="category_candidates_json JSONB NOT NULL DEFAULT '[]'::jsonb")
+    if "export_image_settings_json" not in existing_columns:
+        _add_column(
+            engine,
+            table="product_tasks",
+            column_sql="export_image_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb",
+        )
 
     existing_indexes_info = {idx["name"]: idx for idx in inspector.get_indexes("product_tasks")}
     existing_indexes = set(existing_indexes_info.keys())
@@ -88,6 +94,16 @@ def ensure_product_tasks_schema(engine: Engine) -> None:
             index_name="ix_product_tasks_export_status",
             index_sql="product_tasks (export_status)",
         )
+
+
+def ensure_raw_products_schema(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if "raw_products" not in inspector.get_table_names():
+        return
+
+    existing_columns = {col["name"] for col in inspector.get_columns("raw_products")}
+    if "sku_props_json" not in existing_columns:
+        _add_column(engine, table="raw_products", column_sql="sku_props_json JSONB NOT NULL DEFAULT '[]'::jsonb")
 
 
 def ensure_product_ai_results_schema(engine: Engine) -> None:

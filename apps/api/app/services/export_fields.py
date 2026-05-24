@@ -334,7 +334,8 @@ def _build_base_fields(session: Session, *, task: ProductTask) -> tuple[dict[str
         title_cn = (title_pkg_out or {}).get("title_cn") if isinstance(title_pkg_out, dict) else None
         title_en = (title_pkg_out or {}).get("title_en") if isinstance(title_pkg_out, dict) else None
         if title_en is None and isinstance(ai.title_en, dict):
-            title_en = (((ai.title_en or {}).get("output") or {}).get("title"))
+            title_en_out = ((ai.title_en or {}).get("output") or {})
+            title_en = title_en_out.get("title_en") or title_en_out.get("title")
 
         effective_category_path = task.selected_category_id or cat_path or (raw.category_path if raw else None)
         ai_fields = {

@@ -18,6 +18,7 @@ from app.db.schema_sync import (
     ensure_cost_records_schema,
     ensure_batch_edit_queue_schema,
     ensure_cost_configs_schema,
+    ensure_raw_products_schema,
 )
 from app.models.default_rule import DefaultRule
 from app.models.ai_import_batch import AiImportBatch
@@ -41,6 +42,7 @@ from app.services.export_seed import seed_default_export_template
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_raw_products_schema(engine)
     ensure_product_tasks_schema(engine)
     ensure_product_ai_results_schema(engine)
     ensure_provider_configs_schema(engine)

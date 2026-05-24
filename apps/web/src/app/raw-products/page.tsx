@@ -48,6 +48,7 @@ type RawProductDetail = {
   shop_name: string | null;
   attributes_text: string | null;
   sku_text: string | null;
+  sku_props: RawSkuPropItem[];
   stock: string | null;
   collector: string | null;
   main_image: string | null;
@@ -61,6 +62,16 @@ type RawProductDetail = {
   task_id: number | null;
   task_created: boolean;
   created_at: string;
+};
+
+type RawSkuPropItem = {
+  group_name: string;
+  option_name: string;
+  image_url: string | null;
+  hint_text?: string | null;
+  group_index: number;
+  option_index: number;
+  selected?: boolean;
 };
 
 type ProductAsset = {
@@ -135,6 +146,30 @@ function uniqueImages(urls: Array<string | null | undefined>): string[] {
   return out;
 }
 
+function makeEmptySkuProp(groupIndex = 0, optionIndex = 0): RawSkuPropItem {
+  return {
+    group_name: "",
+    option_name: "",
+    image_url: null,
+    hint_text: null,
+    group_index: groupIndex,
+    option_index: optionIndex,
+    selected: false,
+  };
+}
+
+function normalizeSkuProps(items: RawSkuPropItem[] | null | undefined): RawSkuPropItem[] {
+  return (items || []).map((item, index) => ({
+    group_name: String(item?.group_name || "").trim(),
+    option_name: String(item?.option_name || "").trim(),
+    image_url: item?.image_url ? String(item.image_url).trim() || null : null,
+    hint_text: item?.hint_text ? String(item.hint_text).trim() || null : null,
+    group_index: Number.isFinite(item?.group_index) ? Number(item.group_index) : 0,
+    option_index: Number.isFinite(item?.option_index) ? Number(item.option_index) : index,
+    selected: Boolean(item?.selected),
+  }));
+}
+
 function appendUnique(images: string[], url: string, options?: { prepend?: boolean }): string[] {
   const clean = url.trim();
   if (!clean) return images;
@@ -181,11 +216,9 @@ function fileToDataUrl(file: File): Promise<string> {
 function getCreateTaskPurposes(mode: GenerationMode, includeProductInfo: boolean): AiPurpose[] {
   if (mode === "task_only") return ["title"];
   if (mode === "title_only") {
-    return includeProductInfo ? ["title_package_lite", "product_info", "title"] : ["title_package_lite", "title"];
+    return includeProductInfo ? ["title_package", "product_info", "title"] : ["title_package", "title"];
   }
-  return includeProductInfo
-    ? ["image_prompt_package", "title_package", "product_info", "title"]
-    : ["image_prompt_package", "title_package", "title"];
+  return includeProductInfo ? ["title_package", "product_info", "title"] : ["title_package", "title"];
 }
 
 export default function RawProductsPage() {
@@ -386,6 +419,7 @@ export default function RawProductsPage() {
           shopName: normalizeInput(detail.shop_name || ""),
           attributesText: normalizeInput(detail.attributes_text || ""),
           skuText: normalizeInput(detail.sku_text || ""),
+          skuProps: normalizeSkuProps(detail.sku_props),
           stock: normalizeInput(detail.stock || ""),
           collector: normalizeInput(detail.collector || ""),
           mainImage: normalizeInput(detail.main_image || ""),
@@ -594,7 +628,7 @@ export default function RawProductsPage() {
                       className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900 focus:ring-slate-400 disabled:cursor-not-allowed"
                     />
                     <span
-                      title="默认开启。开启后会先做页面截图和商品信息理解，给标题、类目和四宫格提示词补充上下文；关闭后会直接基于原标题、属性和图片继续生成，速度更快，但图片和标题上下文会更弱。"
+                      title="默认开启。开启后会先做商品理解，给标题和四宫格提示词补充上下文；关闭后直接基于原标题、属性、SKU 和图片生成，速度更快，但标题和四宫格上下文会更弱。"
                       className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-semibold text-slate-500"
                     >
                       ?
@@ -637,6 +671,86 @@ export default function RawProductsPage() {
               </div>
 
               <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-medium text-slate-800">SKU 规格采集</div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        把插件识别到的颜色、款式、尺寸等选项放在这里，后续会同步到上架台继续编辑。
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        patchDetail({
+                          sku_props: [...normalizeSkuProps(detail.sku_props), makeEmptySkuProp(detail.sku_props.length, detail.sku_props.length)],
+                        })
+                      }
+                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs text-slate-700"
+                    >
+                      添加 SKU 项
+                    </button>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {normalizeSkuProps(detail.sku_props).length ? (
+                      normalizeSkuProps(detail.sku_props).map((item, index) => (
+                        <div key={`sku-prop-${index + 1}`} className="grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-2 md:grid-cols-[120px_1fr_1fr_auto]">
+                          <input
+                            value={item.group_name}
+                            onChange={(event) =>
+                              patchDetail({
+                                sku_props: normalizeSkuProps(detail.sku_props).map((row, rowIndex) =>
+                                  rowIndex === index ? { ...row, group_name: event.target.value } : row,
+                                ),
+                              })
+                            }
+                            className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                            placeholder="规格组，如颜色/尺寸"
+                          />
+                          <input
+                            value={item.option_name}
+                            onChange={(event) =>
+                              patchDetail({
+                                sku_props: normalizeSkuProps(detail.sku_props).map((row, rowIndex) =>
+                                  rowIndex === index ? { ...row, option_name: event.target.value } : row,
+                                ),
+                              })
+                            }
+                            className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                            placeholder="选项值，如黑色/S"
+                          />
+                          <input
+                            value={item.image_url || ""}
+                            onChange={(event) =>
+                              patchDetail({
+                                sku_props: normalizeSkuProps(detail.sku_props).map((row, rowIndex) =>
+                                  rowIndex === index ? { ...row, image_url: event.target.value || null } : row,
+                                ),
+                              })
+                            }
+                            className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                            placeholder="对应 SKU 图 URL，可留空"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              patchDetail({
+                                sku_props: normalizeSkuProps(detail.sku_props).filter((_, rowIndex) => rowIndex !== index),
+                              })
+                            }
+                            className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"
+                          >
+                            删除
+                          </button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-xs text-slate-500">
+                        这条原始采集数据还没有结构化 SKU 规格。可以等插件新采集，也可以先手动补。
+                      </div>
+                    )}
+                  </div>
+                </div>
                 <div className="mb-2 text-sm font-medium text-slate-800">图片纠错工作区</div>
                 <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs text-amber-900">
                   <div className="font-medium">先看关系，再改图</div>

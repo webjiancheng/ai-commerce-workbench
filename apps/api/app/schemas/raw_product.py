@@ -24,6 +24,7 @@ class RawProductCreate(BaseModel):
     shop_name: str | None = Field(default=None, alias="shopName")
     attributes_text: str | None = Field(default=None, alias="attributesText")
     sku_text: str | None = Field(default=None, alias="skuText")
+    sku_props: list[dict] = Field(default_factory=list, alias="skuProps")
     stock: str | None = None
     collector: str | None = None
     main_image: str | None = Field(default=None, alias="mainImage")
@@ -52,6 +53,7 @@ class RawProductUpdate(BaseModel):
     shop_name: str | None = Field(default=None, alias="shopName")
     attributes_text: str | None = Field(default=None, alias="attributesText")
     sku_text: str | None = Field(default=None, alias="skuText")
+    sku_props: list[dict] | None = Field(default=None, alias="skuProps")
     stock: str | None = None
     collector: str | None = None
     main_image: str | None = Field(default=None, alias="mainImage")
@@ -103,6 +105,7 @@ class RawProductDetail(BaseModel):
     shop_name: str | None
     attributes_text: str | None
     sku_text: str | None
+    sku_props: list[dict] = Field(default_factory=list, validation_alias="sku_props_json")
     stock: str | None
     collector: str | None
     main_image: str | None

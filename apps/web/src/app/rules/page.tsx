@@ -180,21 +180,14 @@ function toTextMap(input: Record<string, unknown> | null | undefined): Record<st
   return out;
 }
 
-function formatDate(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
 function getLayerBadgeClass(layer: string): string {
   if (layer === "manual") return "bg-rose-100 text-rose-700";
   if (layer === "category") return "bg-blue-100 text-blue-700";
   return "bg-slate-100 text-slate-600";
 }
 
-function getStatusBadgeClass(status: string): string {
-  if (status === "filled") return "bg-emerald-100 text-emerald-700";
-  return "bg-amber-100 text-amber-700";
+function getOptionListId(fieldKey: string): string {
+  return `field-options-${encodeURIComponent(fieldKey)}`;
 }
 
 /* ───────────────── component ───────────────── */
@@ -424,7 +417,6 @@ export default function RulesPage() {
 
   const filledCount = allFieldEntries.filter((e) => e.status === "filled").length;
   const emptyCount = allFieldEntries.length - filledCount;
-  const manualCount = allFieldEntries.filter((e) => e.layer === "manual").length;
   const manualEmptyCount = allFieldEntries.filter((e) => e.layer === "manual" && e.status === "empty").length;
 
   const previewFilled = allFieldEntries.filter((e) => e.status === "filled").slice(0, 20);
@@ -741,43 +733,48 @@ export default function RulesPage() {
                   {isActive && (
                     <div className="border-t border-slate-100 p-3">
                       <div className="grid gap-x-4 gap-y-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                        {groupFields.map((field) => (
-                          <label key={field.key} className="flex items-center gap-2">
-                            <div className="w-24 shrink-0 text-xs font-medium text-slate-500">{field.label}</div>
-                            {field.type === "select" && field.options ? (
-                              <select
-                                value={values[field.key] || ""}
-                                onChange={(e) => updateValue(field.key, e.target.value)}
-                                className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
-                              >
-                                <option value="">--</option>
-                                {field.options.filter((o) => o).map((opt) => (
-                                  <option key={opt} value={opt}>{opt}</option>
-                                ))}
-                              </select>
-                            ) : field.type === "number" ? (
-                              <input
-                                type="number"
-                                value={values[field.key] || ""}
-                                onChange={(e) => updateValue(field.key, e.target.value)}
-                                className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
-                              />
-                            ) : field.type === "textarea" ? (
-                              <textarea
-                                value={values[field.key] || ""}
-                                onChange={(e) => updateValue(field.key, e.target.value)}
-                                rows={1}
-                                className="flex-1 resize-none rounded-lg border border-slate-200 px-2 py-1.5 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
-                              />
-                            ) : (
-                              <input
-                                value={values[field.key] || ""}
-                                onChange={(e) => updateValue(field.key, e.target.value)}
-                                className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
-                              />
-                            )}
-                          </label>
-                        ))}
+                        {groupFields.map((field) => {
+                          const optionListId = field.options?.length ? getOptionListId(field.key) : undefined;
+                          return (
+                            <label key={field.key} className="flex items-center gap-2" title={field.hint || ""}>
+                              <div className="w-24 shrink-0 text-xs font-medium text-slate-500">{field.label}</div>
+                              {field.type === "number" ? (
+                                <input
+                                  type="number"
+                                  value={values[field.key] || ""}
+                                  onChange={(e) => updateValue(field.key, e.target.value)}
+                                  placeholder={field.hint || ""}
+                                  className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                                />
+                              ) : field.type === "textarea" ? (
+                                <textarea
+                                  value={values[field.key] || ""}
+                                  onChange={(e) => updateValue(field.key, e.target.value)}
+                                  rows={1}
+                                  placeholder={field.hint || "可输入多个值，用逗号分隔"}
+                                  className="flex-1 resize-none rounded-lg border border-slate-200 px-2 py-1.5 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                                />
+                              ) : (
+                                <>
+                                  <input
+                                    value={values[field.key] || ""}
+                                    onChange={(e) => updateValue(field.key, e.target.value)}
+                                    list={optionListId}
+                                    placeholder={field.options?.length ? "选择或直接输入" : field.hint || ""}
+                                    className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                                  />
+                                  {optionListId ? (
+                                    <datalist id={optionListId}>
+                                      {(field.options || []).filter((o) => o).map((opt) => (
+                                        <option key={opt} value={opt} />
+                                      ))}
+                                    </datalist>
+                                  ) : null}
+                                </>
+                              )}
+                            </label>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -817,23 +814,23 @@ export default function RulesPage() {
 
           {/* 导出时将自动补齐 */}
           <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="mb-2 text-xs font-semibold text-slate-700">导出时自动补齐</div>
+            <div className="mb-2 text-xs font-semibold text-slate-700">规则怎么生效</div>
             <div className="space-y-1 text-[11px] text-slate-500">
               <div className="flex items-center gap-1.5">
                 <span className="text-emerald-500">✓</span>
-                <span>站点、仓库、币种、库存、尺寸重量</span>
+                <span>保存的是字段默认值，不会立即改商品任务</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className="text-emerald-500">✓</span>
-                <span>镀层、主体材质、风格、场合</span>
+                <span>工作台“生成/刷新导出草稿”时写入导出字段</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className="text-blue-500">✓</span>
-                <span>图片、视频（从商品资产）</span>
+                <span>下拉字段只是推荐值，也可以直接输入模板外的值</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className="text-blue-500">✓</span>
-                <span>商品名称、英文名称、货号（AI生成）</span>
+                <span>人工覆盖过的导出字段会优先保留</span>
               </div>
             </div>
           </div>
@@ -846,7 +843,6 @@ export default function RulesPage() {
             </div>
             <div className="space-y-1">
               {previewFilled.map((entry) => {
-                const def = Object.values(ALL_FIELD_DEFS).find((d) => d.key === entry.key);
                 return (
                   <div key={entry.key} className="flex items-start justify-between gap-2 rounded-lg border border-slate-100 bg-slate-50 px-2.5 py-1.5">
                     <div className="min-w-0 flex-1">

@@ -1,13 +1,17 @@
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8000";
+const DEFAULT_WEB_URL = "http://127.0.0.1:3000";
 let serverUrl = DEFAULT_SERVER_URL;
+let webUrl = DEFAULT_WEB_URL;
 let currentProduct = null;
 let currentCollector = "";
+let currentTaskId = null;
 let correctionOpen = false;
 let assignTarget = "main";
 let assignMode = false; // true: 点击图片=归类；false: 点击图片=是否同步
 let buckets = { main: [], sku: [], detail: [], size: [] };
 let picked = new Set(); // 用于“归类到”：跨组挑图
 let syncSelected = { main: new Set(), sku: new Set(), detail: new Set(), size: new Set(), video: new Set() }; // 控制提交到本地工作台的数量
+let skuPropSelected = new Set();
 let dragPayload = null;
 let zoomPreviewEl = null;
 
@@ -16,9 +20,14 @@ document.addEventListener("DOMContentLoaded", init);
 async function init() {
   document.querySelector("#collect").addEventListener("click", collectOnly);
   document.querySelector("#sync").addEventListener("click", collectAndSync);
+  document.querySelector("#syncCreate").addEventListener("click", collectSyncAndCreateTask);
   document.querySelector("#shot").addEventListener("click", takeScreenshot);
   document.querySelector("#toggleCorrect").addEventListener("click", toggleCorrection);
+  document.querySelector("#openWorkbench").addEventListener("click", openWorkbench);
+  document.querySelector("#toggleSettings").addEventListener("click", toggleSettings);
   await initServerUrlField();
+  await initWebUrlField();
+  await initTaskOptions();
   await initCollectorField();
   await previewCurrentTab();
 }
@@ -35,6 +44,41 @@ async function initServerUrlField() {
     serverUrl = normalizeServerUrl(event.target.value || DEFAULT_SERVER_URL);
     await chrome.storage.local.set({ serverUrl });
   });
+}
+
+async function initWebUrlField() {
+  const input = document.querySelector("#webUrl");
+  if (!input) return;
+
+  const stored = await chrome.storage.local.get({ webUrl: DEFAULT_WEB_URL });
+  webUrl = normalizeBaseUrl(stored.webUrl || DEFAULT_WEB_URL, DEFAULT_WEB_URL);
+  input.value = webUrl;
+
+  input.addEventListener("input", async (event) => {
+    webUrl = normalizeBaseUrl(event.target.value || DEFAULT_WEB_URL, DEFAULT_WEB_URL);
+    await chrome.storage.local.set({ webUrl });
+  });
+}
+
+async function initTaskOptions() {
+  const stored = await chrome.storage.local.get({
+    generationMode: "title_and_4grid",
+    includeProductInfo: true
+  });
+  const mode = document.querySelector("#generationMode");
+  const include = document.querySelector("#includeProductInfo");
+  if (mode) {
+    mode.value = stored.generationMode || "title_and_4grid";
+    mode.addEventListener("change", async (event) => {
+      await chrome.storage.local.set({ generationMode: event.target.value || "title_and_4grid" });
+    });
+  }
+  if (include) {
+    include.checked = stored.includeProductInfo !== false;
+    include.addEventListener("change", async (event) => {
+      await chrome.storage.local.set({ includeProductInfo: Boolean(event.target.checked) });
+    });
+  }
 }
 
 async function initCollectorField() {
@@ -133,6 +177,58 @@ async function collectAndSync() {
   }
 }
 
+async function collectSyncAndCreateTask() {
+  setSyncingState(true, "正在提交并生成…");
+  setStatus("同步中");
+  setMessage("正在提交并生成上架任务…");
+
+  try {
+    const product = await prepareProductForSubmit();
+    const rawResult = await postProduct(product);
+    if (!rawResult.ok || !rawResult.id) throw new Error(rawResult.error || rawResult.detail || "原始数据提交失败");
+
+    setMessage("正在创建上架任务…");
+    const taskResult = await createTaskFromRawProduct(rawResult.id);
+    if (!taskResult.ok || !taskResult.id) throw new Error(taskResult.detail || "创建任务失败");
+
+    currentTaskId = taskResult.id;
+    showOpenWorkbenchButton();
+    setSyncingState(false);
+    setStatus("已完成");
+    setMessage(`已生成上架任务 #${taskResult.id}。`);
+    document.querySelector("#summary").value = [
+      `原始采集：#${rawResult.id}`,
+      `上架任务：#${taskResult.id}`,
+      `生成模式：${getGenerationMode()}`
+    ].join("\n");
+  } catch (error) {
+    setSyncingState(false);
+    setStatus("失败");
+    setMessage(error.message || "提交并生成失败");
+  }
+}
+
+async function prepareProductForSubmit() {
+  const hasExisting = Boolean(currentProduct);
+  const product = hasExisting ? { ...currentProduct } : await collectCurrentPage();
+  product.collector = currentCollector;
+  currentProduct = product;
+  if (!hasExisting) hydrateBucketsFromProduct(product);
+  else applyBucketsToProduct(product);
+  renderAll(product);
+
+  setMessage("正在检查本地服务…");
+  const serverReady = await checkServer();
+  if (!serverReady) throw new Error("本地服务未启动，请先启动 API 服务");
+
+  setMessage("正在截图并上传…");
+  product.screenshot = await captureAndUploadScreenshot(product.platformSku || product.sourceId || product.url);
+  currentProduct = product;
+  renderAll(product);
+  applyBucketsToProduct(product);
+  return product;
+}
+
 async function collectCurrentPage() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   let response;
@@ -214,9 +310,32 @@ async function postProduct(product) {
   const response = await fetch(`${serverUrl}/api/raw-products`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(product)
+    body: JSON.stringify(sanitizeProductForSubmit(product))
   });
   return response.json();
+}
+
+function sanitizeProductForSubmit(product) {
+  const { _allSkuProps, ...rest } = product || {};
+  return rest;
+}
+
+async function createTaskFromRawProduct(rawProductId) {
+  const response = await fetch(`${serverUrl}/api/raw-products/${rawProductId}/create-task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      split_count: 1,
+      generation_mode: getGenerationMode(),
+      include_product_info: getIncludeProductInfo()
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = typeof data?.detail === "string" ? data.detail : `HTTP ${response.status}`;
+    return { ok: false, detail };
+  }
+  return data;
 }
 
 function renderProduct(product) {
@@ -250,10 +369,12 @@ function renderSyncResult(result) {
 }
 
 function summarize(product) {
+  const skuPropCount = Array.isArray(product.skuProps) ? product.skuProps.length : 0;
   return [
     `标题：${product.title || "-"}`,
     `主图：${product.mainImages?.length || 0}`,
-    `SKU：${product.skuImages?.length || 0}`,
+    `规格图：${product.skuImages?.length || 0}`,
+    `规格/属性：${skuPropCount}`,
     `详情：${product.detailImages?.length || 0}`,
     `视频：${product.videoUrl ? "有" : "无"}`,
     `采集人：${product.collector || currentCollector || "-"}`
@@ -270,6 +391,9 @@ function toggleCorrection() {
 }
 
 function hydrateBucketsFromProduct(product) {
+  if (product && !Array.isArray(product._allSkuProps)) {
+    product._allSkuProps = Array.isArray(product.skuProps) ? product.skuProps.slice() : [];
+  }
   buckets = {
     main: Array.isArray(product?.mainImages) ? product.mainImages.filter(Boolean) : [],
     sku: Array.isArray(product?.skuImages) ? product.skuImages.filter(Boolean) : [],
@@ -283,6 +407,7 @@ function hydrateBucketsFromProduct(product) {
     size: new Set(buckets.size),
     video: new Set(product?.videoUrl ? [product.videoUrl] : [])
   };
+  skuPropSelected = new Set((product?._allSkuProps || product?.skuProps || []).map((item, index) => skuPropKey(item, index)));
   picked = new Set();
 }
 
@@ -294,6 +419,8 @@ function applyBucketsToProduct(product) {
   product.mainImage = product.mainImages[0] || "";
   product.carouselImages = product.mainImages.slice();
   product.skuImage = product.skuImages[0] || product.mainImage || "";
+  const allSkuProps = Array.isArray(product._allSkuProps) ? product._allSkuProps : (product.skuProps || []);
+  product.skuProps = filterSkuPropsForSync(allSkuProps, product.skuImages);
   if (product.videoUrl && !syncSelected.video.has(product.videoUrl)) product.videoUrl = "";
   return product;
 }
@@ -387,6 +514,25 @@ function renderCorrectionPanel() {
     };
   });
 
+  panel.querySelectorAll("input[data-invert-sku-props]").forEach((input) => {
+    const props = getAllSkuProps();
+    const keys = props.map((item, index) => skuPropKey(item, index));
+    const selectedCount = keys.filter((key) => skuPropSelected.has(key)).length;
+    input.disabled = keys.length === 0;
+    input.checked = keys.length > 0 && selectedCount === keys.length;
+    input.indeterminate = selectedCount > 0 && selectedCount < keys.length;
+    input.onchange = (event) => {
+      event.preventDefault();
+      if (selectedCount === keys.length) {
+        keys.forEach((key) => skuPropSelected.delete(key));
+      } else {
+        keys.forEach((key) => skuPropSelected.add(key));
+      }
+      applyBucketsToProduct(currentProduct || {});
+      renderCorrectionPanel();
+    };
+  });
+
   // per-group “下载选中”
   panel.querySelectorAll("button[data-download-selected]").forEach((button) => {
     const group = button.getAttribute("data-download-selected");
@@ -407,6 +553,7 @@ function renderCorrectionPanel() {
     const grid = panel.querySelector(`[data-grid="${group}"]`);
     if (!grid) continue;
     grid.innerHTML = "";
+    grid.classList.toggle("sku-grid", group === "sku");
     const urls = getTabUrls(group);
     if (!urls.length) {
       const empty = document.createElement("div");
@@ -416,8 +563,57 @@ function renderCorrectionPanel() {
       grid.appendChild(empty);
       continue;
     }
-    urls.forEach((url, index) => grid.appendChild(buildThumb({ url, group, index })));
+    urls.forEach((url, index) => {
+      grid.appendChild(group === "sku" ? buildSkuCard({ url, group, index }) : buildThumb({ url, group, index }));
+    });
   }
+}
+
+function buildSkuCard({ url, group, index }) {
+  const card = document.createElement("div");
+  const isSelected = syncSelected.sku?.has?.(url) || false;
+  card.className = `sku-card${isSelected ? "" : " is-off"}`;
+  const thumb = buildThumb({ url, group, index });
+  const props = getSkuPropsForImage(url);
+
+  const info = document.createElement("div");
+  info.className = "sku-info";
+  const checkbox = document.createElement("label");
+  checkbox.innerHTML = `<input type="checkbox" ${isSelected ? "checked" : ""}><span>同步规格图</span>`;
+  checkbox.querySelector("input").addEventListener("change", (event) => {
+    event.stopPropagation();
+    if (event.target.checked) syncSelected.sku.add(url);
+    else syncSelected.sku.delete(url);
+    applyBucketsToProduct(currentProduct || {});
+    renderCorrectionPanel();
+  });
+
+  const tags = document.createElement("div");
+  tags.className = "sku-tags";
+  if (props.length) {
+    props.forEach((item, propIndex) => {
+      const key = skuPropKey(item, propIndex);
+      const tag = document.createElement("label");
+      tag.className = "sku-tag";
+      tag.innerHTML = `<input type="checkbox" ${skuPropSelected.has(key) ? "checked" : ""}> ${escapeHtml(formatSkuProp(item))}`;
+      tag.querySelector("input").addEventListener("change", (event) => {
+        event.stopPropagation();
+        if (event.target.checked) skuPropSelected.add(key);
+        else skuPropSelected.delete(key);
+        applyBucketsToProduct(currentProduct || {});
+      });
+      tags.appendChild(tag);
+    });
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "sku-empty-tag";
+    empty.textContent = "未识别规格/属性";
+    tags.appendChild(empty);
+  }
+
+  info.append(checkbox, tags);
+  card.append(thumb, info);
+  return card;
 }
 
 function toggleAssign(url) {
@@ -556,6 +752,49 @@ function buildThumb({ url, group }) {
   return button;
 }
 
+function getSkuPropsForImage(url) {
+  return getAllSkuProps().filter((item) => normalizeImageKey(item?.imageUrl || item?.image_url || "") === normalizeImageKey(url));
+}
+
+function getAllSkuProps() {
+  return Array.isArray(currentProduct?._allSkuProps) ? currentProduct._allSkuProps : (currentProduct?.skuProps || []);
+}
+
+function filterSkuPropsForSync(props, skuImages) {
+  const selectedImages = new Set((skuImages || []).map(normalizeImageKey));
+  return (props || []).filter((item, index) => {
+    const imageKey = normalizeImageKey(item?.imageUrl || item?.image_url || "");
+    const selectedByProp = skuPropSelected.has(skuPropKey(item, index));
+    return selectedByProp && (!imageKey || selectedImages.has(imageKey));
+  });
+}
+
+function skuPropKey(item, _index) {
+  return [
+    item?.groupName || item?.group_name || "",
+    item?.optionName || item?.option_name || "",
+    item?.imageUrl || item?.image_url || ""
+  ].join("__");
+}
+
+function formatSkuProp(item) {
+  const group = item?.groupName || item?.group_name || "规格";
+  const option = item?.optionName || item?.option_name || item?.hintText || item?.hint_text || "";
+  return option ? `${group}: ${option}` : group;
+}
+
+function normalizeImageKey(url) {
+  return String(url || "").split("?")[0].replace(/\/+$/, "");
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function reorderBucket(group, draggedUrl, targetUrl) {
   const list = buckets[group] || [];
   const fromIndex = list.indexOf(draggedUrl);
@@ -668,6 +907,7 @@ function setMessage(text) {
 
 function setSyncingState(isSyncing, buttonText) {
   const syncBtn = document.querySelector("#sync");
+  const syncCreateBtn = document.querySelector("#syncCreate");
   const collectBtn = document.querySelector("#collect");
   const shotBtn = document.querySelector("#shot");
   let overlay = document.querySelector(".sync-overlay");
@@ -680,6 +920,7 @@ function setSyncingState(isSyncing, buttonText) {
       syncBtn.innerHTML = `<span class="btn-spinner"></span>${buttonText || "同步中…"}`;
     }
     if (collectBtn) { collectBtn.disabled = true; }
+    if (syncCreateBtn) { syncCreateBtn.disabled = true; }
     if (shotBtn) { shotBtn.disabled = true; }
 
     // 添加顶部进度条
@@ -696,6 +937,7 @@ function setSyncingState(isSyncing, buttonText) {
       syncBtn.textContent = "提交本地";
     }
     if (collectBtn) { collectBtn.disabled = false; }
+    if (syncCreateBtn) { syncCreateBtn.disabled = false; }
     if (shotBtn) { shotBtn.disabled = false; }
 
     // 移除进度条
@@ -703,12 +945,38 @@ function setSyncingState(isSyncing, buttonText) {
   }
 }
 
+function getGenerationMode() {
+  return document.querySelector("#generationMode")?.value || "title_and_4grid";
+}
+
+function getIncludeProductInfo() {
+  return document.querySelector("#includeProductInfo")?.checked !== false;
+}
+
+function showOpenWorkbenchButton() {
+  const button = document.querySelector("#openWorkbench");
+  if (button) button.classList.remove("is-hidden");
+}
+
+function openWorkbench() {
+  const target = `${webUrl}/product-tasks${currentTaskId ? `?task_id=${encodeURIComponent(currentTaskId)}` : ""}`;
+  chrome.tabs.create({ url: target });
+}
+
+function toggleSettings() {
+  const panel = document.querySelector("#settingsPanel");
+  panel?.classList.toggle("is-hidden");
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeServerUrl(value) {
+  return normalizeBaseUrl(value, DEFAULT_SERVER_URL);
+}
+
+function normalizeBaseUrl(value, fallback) {
   const url = String(value || "").trim();
-  if (!url) return DEFAULT_SERVER_URL;
-  return url.replace(/\/+$/, "");
+  return (url || fallback).replace(/\/+$/, "");
 }

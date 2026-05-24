@@ -77,6 +77,7 @@ async function collectProductAsync() {
   const shopName = readShopName();
   const attributesText = readAttributesText();
   const skuText = readSkuText();
+  const skuProps = readSkuProps(platform);
   const stock = readStockText();
   const currency = inferCurrency(platform, price);
   const platformSku = sourceId ? `${platformCode(platform)}-${sourceId}` : makeProductCode(url);
@@ -103,6 +104,7 @@ async function collectProductAsync() {
     shopName,
     attributesText,
     skuText,
+    skuProps,
     stock,
     mainImage: mainImages[0] || "",
     mainImages,
@@ -461,7 +463,7 @@ function readSkuText() {
       .filter(isVisible)
       .map((node) => clean(node.textContent))
       .filter((value) => value && value.length <= 500)
-      .filter((value) => !/物流|运费|采购量|库存|成交|发货|客服|shipping|delivery|service/i.test(value));
+      .filter((value) => !isSkuNoiseText(value));
     if (groups.length) return unique(groups).slice(0, 10).join(" | ");
   }
 
@@ -481,8 +483,287 @@ function readSkuText() {
     .filter(isVisible)
     .map((node) => clean(node.textContent))
     .filter((value) => value && value.length <= 400)
-    .filter((value) => !/shipping|delivery|refund|return|service|物流|退货|客服/i.test(value));
+    .filter((value) => !isSkuNoiseText(value));
   return unique(groups).slice(0, 8).join(" | ");
+}
+
+const SKU_NOISE_PATTERN = /shipping|delivery|refund|return|service|coupon|discount|promo|promotion|voucher|deal|sale|save|free|活动|促销|优惠|折扣|券|满减|立减|省|包邮|保障|服务|物流|运费|退货|客服|发货|配送|支付|付款|广告|推荐|榜单|销量|已售|评价|评论|关注|分享|收藏|店铺|直播|秒杀|限时/i;
+const SKU_AXIS_PATTERN = /颜色|色系|色号|尺寸|尺码|规格|款式|样式|型号|容量|口味|数量|组合|套餐|材质|Color|Colour|Size|Style|Type|Model|Capacity|Pack|Material|Flavor/i;
+const SKU_VALUE_BAD_PATTERN = /¥|￥|\$|€|£|%|折|券|满|减|省|起|到手|立省|下单|包邮|已售|销量|评价|评论|收藏|关注|分享|客服|服务|物流|发货|配送/i;
+
+function isSkuNoiseText(value) {
+  const text = clean(value || "");
+  if (!text) return true;
+  if (SKU_NOISE_PATTERN.test(text)) return true;
+  if (text.length > 80 && !/颜色|尺寸|尺码|规格|款式|型号|容量|Color|Size|Style|Model|Capacity/i.test(text)) return true;
+  return false;
+}
+
+function isLikelySkuAxisLabel(value) {
+  const text = clean(value || "");
+  if (!text || isSkuNoiseText(text)) return false;
+  if (text.length > 18) return false;
+  return SKU_AXIS_PATTERN.test(text);
+}
+
+function isLikelySkuOptionText(value) {
+  const text = clean(value || "");
+  if (!text || isSkuNoiseText(text)) return false;
+  if (SKU_VALUE_BAD_PATTERN.test(text)) return false;
+  if (text.length > 40) return false;
+  return true;
+}
+
+function readSkuProps(platform = detectPlatform()) {
+  const roots = getSkuPropRoots(platform);
+  const items = [];
+
+  roots.forEach((root, groupIndex) => {
+    const groupName = inferSkuGroupName(root, groupIndex);
+    const optionNodes = getSkuOptionNodes(root);
+
+    optionNodes.forEach((node, optionIndex) => {
+      const imageUrl = getSkuOptionImageUrl(node);
+      const optionName = inferSkuOptionName(node, groupName, optionIndex);
+      const hintText = inferSkuOptionHint(node, optionName);
+      if (!isLikelySkuAxisLabel(groupName) || !isLikelySkuOptionText(optionName) || isSkuNoiseText(hintText || optionName)) return;
+      if (!imageUrl && !optionName) return;
+      items.push({
+        groupName,
+        optionName,
+        imageUrl,
+        hintText,
+        groupIndex,
+        optionIndex,
+        selected: isSkuOptionSelected(node)
+      });
+    });
+  });
+
+  return dedupeSkuProps(items);
+}
+
+function getSkuPropRoots(platform = detectPlatform()) {
+  const selectors = platform === "1688"
+    ? [
+        ".sku-prop",
+        ".prop-item",
+        ".sku-item-wrapper",
+        ".sku-wrapper",
+        ".sku-selector",
+        ".obj-sku",
+        "[class*='skuProp']",
+        "[class*='prop-item']"
+      ]
+    : platform === "Temu"
+      ? [
+          "#rightContent ._2nVeyNCz",
+          "._2nVeyNCz",
+          "#rightContent ._3csHYvw1",
+          "._3csHYvw1",
+          "[class*='sku']",
+          "[class*='Sku']",
+          "[class*='spec']",
+          "[class*='variant']"
+        ]
+      : [
+          "[class*='sku']",
+          "[class*='Sku']",
+          "[class*='spec']",
+          "[class*='Spec']",
+          "[class*='variant']",
+          "[class*='Variant']"
+        ];
+
+  const roots = [];
+  const seen = new Set();
+  for (const selector of selectors) {
+    for (const node of Array.from(document.querySelectorAll(selector))) {
+      if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+      if (!isLikelySkuPropRoot(node)) continue;
+      const key = node;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      roots.push(node);
+      if (roots.length >= 8) return roots;
+    }
+  }
+  return roots;
+}
+
+function isLikelySkuPropRoot(root) {
+  const text = clean(root.textContent || "");
+  if (!text || isSkuNoiseText(text)) return false;
+  if (text.length > 900) return false;
+  const hasImages = Boolean(root.querySelector("img"));
+  const hasAxisLabel = SKU_AXIS_PATTERN.test(text);
+  const optionLikeCount = Array.from(root.querySelectorAll("button,li,label,[role='button'],[class*='item'],[class*='Item']"))
+    .filter((node) => node instanceof HTMLElement)
+    .filter(isVisible)
+    .map((node) => clean(node.textContent || node.getAttribute?.("aria-label") || node.getAttribute?.("title") || ""))
+    .filter(isLikelySkuOptionText)
+    .length;
+  return hasAxisLabel || (hasImages && optionLikeCount > 0);
+}
+
+function getSkuOptionNodes(root) {
+  const selectors = [
+    "button",
+    "li",
+    "label",
+    "[role='button']",
+    "[class*='sku-item']",
+    "[class*='skuItem']",
+    "[class*='prop-item']",
+    "[class*='propItem']",
+    "[class*='value-item']",
+    "[class*='valueItem']",
+    "[class*='option-item']",
+    "[class*='optionItem']",
+    "[class*='variant-item']",
+    "[class*='variantItem']"
+  ];
+  const nodes = Array.from(root.querySelectorAll(selectors.join(",")))
+    .filter((node) => node instanceof HTMLElement)
+    .filter(isVisible)
+    .filter((node) => {
+      const text = clean(node.textContent || "");
+      const hasImage = Boolean(node.querySelector("img"));
+      const nestedCount = node.querySelectorAll(selectors.join(",")).length;
+      if (nestedCount >= 4) return false;
+      if (!hasImage && !text) return false;
+      if (text && !isLikelySkuOptionText(text)) return false;
+      return true;
+    });
+
+  if (nodes.length) return nodes;
+
+  return Array.from(root.querySelectorAll("img"))
+    .map((img) => img.closest("button,li,label,div,span") || img)
+    .filter(Boolean)
+    .filter((node, index, list) => list.indexOf(node) === index);
+}
+
+function inferSkuGroupName(root, groupIndex) {
+  const attrCandidates = [
+    root.getAttribute?.("data-title"),
+    root.getAttribute?.("aria-label"),
+    root.getAttribute?.("data-testid"),
+    root.previousElementSibling?.textContent
+  ];
+  for (const raw of attrCandidates) {
+    const label = normalizeSkuGroupLabel(raw);
+    if (label) return label;
+  }
+
+  const labelNodes = Array.from(root.querySelectorAll("legend,dt,strong,h2,h3,h4,label,span,p,div"));
+  for (const node of labelNodes) {
+    const text = normalizeSkuGroupLabel(node.textContent);
+    if (text) return text;
+  }
+
+  return `规格${groupIndex + 1}`;
+}
+
+function normalizeSkuGroupLabel(value) {
+  const text = clean(value || "");
+  if (!text) return "";
+  const prefix = text.includes(":") || text.includes("：") ? text.split(/[:：]/)[0] : text;
+  const normalized = clean(prefix).replace(/^select\s+/i, "");
+  if (!isLikelySkuAxisLabel(normalized)) return "";
+  if (/^(please|choose|select)\b/i.test(normalized)) return "";
+  return normalized;
+}
+
+function inferSkuOptionName(node, groupName, optionIndex) {
+  const attrCandidates = [
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("title"),
+    node.getAttribute?.("data-title"),
+    node.getAttribute?.("data-name"),
+    node.getAttribute?.("data-value")
+  ];
+  for (const raw of attrCandidates) {
+    const normalized = normalizeSkuOptionLabel(raw, groupName);
+    if (normalized) return normalized;
+  }
+
+  const img = node.querySelector("img");
+  const imageLabel = normalizeSkuOptionLabel(img?.getAttribute?.("alt") || img?.getAttribute?.("title") || "", groupName);
+  if (imageLabel) return imageLabel;
+
+  const text = normalizeSkuOptionLabel(node.textContent, groupName);
+  if (text) return text;
+
+  return `选项${optionIndex + 1}`;
+}
+
+function normalizeSkuOptionLabel(value, groupName = "") {
+  const group = clean(groupName || "");
+  let text = clean(value || "");
+  if (!text) return "";
+  if (group) {
+    const escaped = group.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    text = clean(text.replace(new RegExp(`^${escaped}\\s*[:：-]?\\s*`, "i"), ""));
+  }
+  text = clean(text.replace(/\b(selected|unavailable|sold out)\b/ig, ""));
+  if (!isLikelySkuOptionText(text)) return "";
+  return text;
+}
+
+function inferSkuOptionHint(node, optionName) {
+  const text = clean(node.textContent || "");
+  if (!text || text === optionName || text.length > 120) return "";
+  if (isSkuNoiseText(text)) return "";
+  return text;
+}
+
+function getSkuOptionImageUrl(node) {
+  const img = node.querySelector("img");
+  if (!img) return "";
+  return normalizeImageAssetUrl(
+    img.getAttribute("src") ||
+    img.getAttribute("data-src") ||
+    img.getAttribute("data-lazy-src") ||
+    img.currentSrc ||
+    img.src ||
+    ""
+  );
+}
+
+function isSkuOptionSelected(node) {
+  const className = String(node.className || "");
+  return (
+    node.getAttribute?.("aria-pressed") === "true" ||
+    node.getAttribute?.("aria-selected") === "true" ||
+    /\b(active|selected|current|checked)\b/i.test(className)
+  );
+}
+
+function dedupeSkuProps(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const groupName = clean(item?.groupName || "");
+    const optionName = clean(item?.optionName || "");
+    const imageUrl = clean(item?.imageUrl || "");
+    const hintText = clean(item?.hintText || "");
+    if (!groupName && !optionName && !imageUrl) continue;
+    if (!isLikelySkuAxisLabel(groupName) || !isLikelySkuOptionText(optionName || hintText)) continue;
+    const key = `${groupName}__${optionName}__${imageUrl}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      groupName: groupName || "规格",
+      optionName,
+      imageUrl: imageUrl || null,
+      hintText: hintText || null,
+      groupIndex: Number.isFinite(item?.groupIndex) ? Number(item.groupIndex) : 0,
+      optionIndex: Number.isFinite(item?.optionIndex) ? Number(item.optionIndex) : 0,
+      selected: Boolean(item?.selected)
+    });
+  }
+  return out;
 }
 
 function readStockText() {
@@ -1657,6 +1938,13 @@ function ensureProductPanelRoot() {
   display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;
   background:#1664ff;color:#fff;box-shadow:0 2px 4px rgba(31,35,41,0.12)
 }
+#${PANEL_ROOT_ID} .psync-sku-tags{
+  position:absolute;left:4px;right:4px;bottom:4px;display:flex;flex-wrap:wrap;gap:3px;pointer-events:none
+}
+#${PANEL_ROOT_ID} .psync-sku-tag{
+  max-width:100%;padding:2px 5px;border-radius:999px;background:rgba(0,109,117,0.88);
+  color:#fff;font-size:10px;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+}
 
 /* 空状态 */
 #${PANEL_ROOT_ID} .psync-empty{
@@ -1705,6 +1993,7 @@ function buildPanelBody() {
   toolbar.innerHTML = `
     <button type="button" class="psync-tool" data-action="collect">重新采集</button>
     <button type="button" class="psync-tool psync-tool-primary" data-action="sync">提交本地</button>
+    <button type="button" class="psync-tool" data-action="sync-create">提交并生成</button>
     <button type="button" class="psync-tool" data-action="toggle-correct">${panelState.correctionOpen ? "收起纠错" : "手动纠错"}</button>
     <button type="button" class="psync-tool" data-action="shot">截图</button>
     <button type="button" class="psync-tool" data-action="download">下载</button>
@@ -1713,6 +2002,10 @@ function buildPanelBody() {
   toolbar.querySelector('[data-action="sync"]').addEventListener("click", (event) => {
     event.preventDefault();
     collectAndSyncFromPanel();
+  });
+  toolbar.querySelector('[data-action="sync-create"]').addEventListener("click", (event) => {
+    event.preventDefault();
+    collectSyncCreateFromPanel();
   });
   toolbar.querySelector('[data-action="toggle-correct"]').addEventListener("click", (event) => {
     event.preventDefault();
@@ -1751,7 +2044,7 @@ function buildPanelBody() {
     const sizeCount = panelState.buckets?.size?.length || 0;
     summary.innerHTML = `
       <div class="psync-summary-row"><span>主图</span><strong>${mainCount}</strong></div>
-      <div class="psync-summary-row"><span>SKU</span><strong>${skuCount}</strong></div>
+      <div class="psync-summary-row"><span>规格图</span><strong>${skuCount}</strong></div>
       <div class="psync-summary-row"><span>详情</span><strong>${detailCount}</strong></div>
       <div class="psync-summary-row"><span>尺寸</span><strong>${sizeCount}</strong></div>
     `;
@@ -1763,7 +2056,7 @@ function buildPanelBody() {
   tabs.className = "psync-tabs";
   tabs.innerHTML = `
     <div class="psync-tab"><button type="button" class="psync-pill" data-bucket="main">主图<span class="psync-count" data-count="main">0</span></button><label class="psync-check"><input type="checkbox" data-selectall="main" aria-label="全选主图"><span>全选</span></label></div>
-    <div class="psync-tab"><button type="button" class="psync-pill" data-bucket="sku">SKU<span class="psync-count" data-count="sku">0</span></button><label class="psync-check"><input type="checkbox" data-selectall="sku" aria-label="全选SKU"><span>全选</span></label></div>
+    <div class="psync-tab"><button type="button" class="psync-pill" data-bucket="sku">规格/属性<span class="psync-count" data-count="sku">0</span></button><label class="psync-check"><input type="checkbox" data-selectall="sku" aria-label="全选规格属性"><span>全选</span></label></div>
     <div class="psync-tab"><button type="button" class="psync-pill" data-bucket="detail">详情<span class="psync-count" data-count="detail">0</span></button><label class="psync-check"><input type="checkbox" data-selectall="detail" aria-label="全选详情"><span>全选</span></label></div>
     <button type="button" class="psync-pill" data-bucket="size">尺寸<span class="psync-count" data-count="size">0</span></button>
     <div class="psync-tab"><button type="button" class="psync-pill" data-bucket="video">视频<span class="psync-count" data-count="video">0</span></button><label class="psync-check"><input type="checkbox" data-selectall="video" aria-label="全选视频"><span>全选</span></label></div>
@@ -1799,7 +2092,7 @@ function buildPanelBody() {
     assign.innerHTML = `
       <span class="psync-assign-label">归类到</span>
       <button type="button" class="psync-pill" data-assign="main">主图</button>
-      <button type="button" class="psync-pill" data-assign="sku">SKU</button>
+      <button type="button" class="psync-pill" data-assign="sku">规格/属性</button>
       <button type="button" class="psync-pill" data-assign="detail">详情</button>
       <button type="button" class="psync-pill" data-assign="size">尺寸（已归类${sizeAssignedCount}张）</button>
     `;
@@ -1880,6 +2173,64 @@ async function collectAndSyncFromPanel() {
   toast("已提交到本地工作台");
 }
 
+async function collectSyncCreateFromPanel() {
+  setPanelSyncingState(true, "生成中…");
+
+  const serverOk = await checkLocalSyncServer();
+  if (!serverOk) {
+    setPanelSyncingState(false);
+    toast("本地服务未启动，请先启动 API 服务");
+    return;
+  }
+
+  setPanelSyncingState(true, "采集中…");
+  await collectAndShowInPanel();
+  const baseProduct = panelState.product;
+  if (!baseProduct) {
+    setPanelSyncingState(false);
+    toast("采集失败：未读取到商品信息");
+    return;
+  }
+
+  let screenshot = panelState.screenshot;
+  if (!screenshot) {
+    try {
+      setPanelSyncingState(true, "截图中…");
+      screenshot = await captureAndUploadScreenshot(baseProduct.platformSku || baseProduct.sourceId || baseProduct.url);
+      panelState.screenshot = screenshot;
+    } catch (error) {
+      setPanelSyncingState(false);
+      toast(error.message || "截图失败");
+      return;
+    }
+  }
+
+  const filtered = applySyncOptions(baseProduct, panelState.syncOptions || {});
+  filtered.screenshot = screenshot || "";
+  filtered.collector = await getCollectorName();
+
+  setPanelSyncingState(true, "提交本地…");
+  const rawResult = await postProductToLocalServer(filtered);
+  if (!rawResult?.ok || !rawResult.id) {
+    setPanelSyncingState(false);
+    toast(rawResult?.error || rawResult?.detail || "原始数据提交失败");
+    return;
+  }
+
+  setPanelSyncingState(true, "创建任务…");
+  const taskResult = await createTaskFromRawProduct(rawResult.id);
+  if (!taskResult?.ok || !taskResult.id) {
+    setPanelSyncingState(false);
+    toast(taskResult?.detail || "创建任务失败");
+    return;
+  }
+
+  setPanelSyncingState(false);
+  toast(`已生成上架任务 #${taskResult.id}`);
+  const webUrl = await getWebUrl();
+  window.open(`${webUrl}/product-tasks?task_id=${encodeURIComponent(taskResult.id)}`, "_blank", "noopener");
+}
+
 async function getCollectorName() {
   try {
     const stored = await chrome.storage.local.get({ collector: "" });
@@ -1896,6 +2247,7 @@ function applySyncOptions(product, options) {
 
   if (!options.sku) next.skuImages = [];
   else next.skuImages = (panelState.buckets?.sku || []).slice();
+  next.skuProps = filterPanelSkuProps(next.skuProps || [], next.skuImages || []);
 
   if (!options.detail) next.detailImages = [];
   else next.detailImages = (panelState.buckets?.detail || []).slice();
@@ -1961,30 +2313,67 @@ async function postProductToLocalServer(product) {
   const response = await fetch(`${baseUrl}/api/raw-products`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(product)
+    body: JSON.stringify(sanitizePanelProductForSubmit(product))
   });
   return response.json();
 }
 
+function sanitizePanelProductForSubmit(product) {
+  const { _allSkuProps, ...rest } = product || {};
+  return rest;
+}
+
+async function createTaskFromRawProduct(rawProductId) {
+  const baseUrl = await getServerUrl();
+  const stored = await chrome.storage.local.get({
+    generationMode: "title_and_4grid",
+    includeProductInfo: true
+  });
+  const response = await fetch(`${baseUrl}/api/raw-products/${rawProductId}/create-task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      split_count: 1,
+      generation_mode: stored.generationMode || "title_and_4grid",
+      include_product_info: stored.includeProductInfo !== false
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) return { ok: false, detail: typeof data?.detail === "string" ? data.detail : `HTTP ${response.status}` };
+  return data;
+}
+
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8000";
+const DEFAULT_WEB_URL = "http://127.0.0.1:3000";
 let cachedServerUrl = "";
+let cachedWebUrl = "";
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
-  if (!changes?.serverUrl) return;
-  cachedServerUrl = normalizeServerUrl(changes.serverUrl.newValue || DEFAULT_SERVER_URL);
+  if (changes?.serverUrl) cachedServerUrl = normalizeBaseUrl(changes.serverUrl.newValue, DEFAULT_SERVER_URL);
+  if (changes?.webUrl) cachedWebUrl = normalizeBaseUrl(changes.webUrl.newValue, DEFAULT_WEB_URL);
 });
 
 async function getServerUrl() {
   if (cachedServerUrl) return cachedServerUrl;
   const stored = await chrome.storage.local.get({ serverUrl: DEFAULT_SERVER_URL });
-  cachedServerUrl = normalizeServerUrl(stored.serverUrl || DEFAULT_SERVER_URL);
+  cachedServerUrl = normalizeBaseUrl(stored.serverUrl, DEFAULT_SERVER_URL);
   return cachedServerUrl;
 }
 
+async function getWebUrl() {
+  if (cachedWebUrl) return cachedWebUrl;
+  const stored = await chrome.storage.local.get({ webUrl: DEFAULT_WEB_URL });
+  cachedWebUrl = normalizeBaseUrl(stored.webUrl, DEFAULT_WEB_URL);
+  return cachedWebUrl;
+}
+
 function normalizeServerUrl(value) {
+  return normalizeBaseUrl(value, DEFAULT_SERVER_URL);
+}
+
+function normalizeBaseUrl(value, fallback) {
   const url = String(value || "").trim();
-  if (!url) return DEFAULT_SERVER_URL;
-  return url.replace(/\/+$/, "");
+  return (url || fallback).replace(/\/+$/, "");
 }
 
 function buildMediaGroup(label, urls, kind, isVideo = false) {
@@ -2085,6 +2474,20 @@ function buildMediaGroup(label, urls, kind, isVideo = false) {
           badge.textContent = String(meta.index + 1);
           button.appendChild(badge);
         }
+        if (kind === "sku") {
+          const tags = getPanelSkuPropsForImage(url).slice(0, 3);
+          if (tags.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "psync-sku-tags";
+            tags.forEach((item) => {
+              const tag = document.createElement("span");
+              tag.className = "psync-sku-tag";
+              tag.textContent = formatPanelSkuProp(item);
+              wrap.appendChild(tag);
+            });
+            button.appendChild(wrap);
+          }
+        }
       }
 
       if (panelState.selectedUrls?.has?.(url)) {
@@ -2096,6 +2499,29 @@ function buildMediaGroup(label, urls, kind, isVideo = false) {
 
   section.append(head, grid);
   return section;
+}
+
+function getPanelSkuPropsForImage(url) {
+  const props = Array.isArray(panelState.product?.skuProps) ? panelState.product.skuProps : [];
+  return props.filter((item) => normalizePanelImageKey(item?.imageUrl || item?.image_url || "") === normalizePanelImageKey(url));
+}
+
+function filterPanelSkuProps(props, skuImages) {
+  const selectedImages = new Set((skuImages || []).map(normalizePanelImageKey));
+  return (props || []).filter((item) => {
+    const imageKey = normalizePanelImageKey(item?.imageUrl || item?.image_url || "");
+    return !imageKey || selectedImages.has(imageKey);
+  });
+}
+
+function formatPanelSkuProp(item) {
+  const group = item?.groupName || item?.group_name || "规格";
+  const option = item?.optionName || item?.option_name || item?.hintText || item?.hint_text || "";
+  return option ? `${group}: ${option}` : group;
+}
+
+function normalizePanelImageKey(url) {
+  return String(url || "").split("?")[0].replace(/\/+$/, "");
 }
 
 function getBucketMeta(bucket, url) {
@@ -2241,7 +2667,7 @@ function getActiveBucketRenderData() {
   const bucket = panelState.activeBucket || "main";
 
   if (bucket === "main") return { label: "主图", urls: getActiveBucketUrls(), kind: "main", isVideo: false };
-  if (bucket === "sku") return { label: "SKU", urls: getActiveBucketUrls(), kind: "sku", isVideo: false };
+  if (bucket === "sku") return { label: "规格/属性", urls: getActiveBucketUrls(), kind: "sku", isVideo: false };
   if (bucket === "detail") return { label: "详情", urls: getActiveBucketUrls(), kind: "detail", isVideo: false };
   if (bucket === "size") return { label: "尺寸", urls: getActiveBucketUrls(), kind: "size", isVideo: false };
   if (bucket === "video") return { label: "视频", urls: product.videoUrl ? [product.videoUrl] : [], kind: "video", isVideo: true };

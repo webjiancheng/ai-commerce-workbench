@@ -67,14 +67,6 @@ const BUILT_IN_PURPOSES: PurposeDefinition[] = [
     builtIn: true,
   },
   {
-    key: 'image_prompt_package',
-    label: 'AI 图片提示词包',
-    capability: 'text',
-    group: '提示词与解析',
-    description: '用文本模型产出生图 prompt。',
-    builtIn: true,
-  },
-  {
     key: 'dimension_extract',
     label: '尺寸识别 / 尺寸图解析',
     capability: 'text',

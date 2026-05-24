@@ -9,6 +9,12 @@ from sqlalchemy.orm import Session
 from app.models.prompt_template import PromptTemplate
 
 
+OBSOLETE_DEFAULT_PROMPT_TYPES: tuple[str, ...] = (
+    "image_prompt_package",
+    "title_en_with_cn_translation",
+)
+
+
 def seed_default_prompt_templates(session: Session) -> int:
     """
     Seed default global prompt templates from a JSON file.
@@ -24,6 +30,19 @@ def seed_default_prompt_templates(session: Session) -> int:
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
         return 0
+
+    changed = 0
+    obsolete_templates = session.scalars(
+        select(PromptTemplate).where(
+            PromptTemplate.prompt_type.in_(OBSOLETE_DEFAULT_PROMPT_TYPES),
+            PromptTemplate.scope == "global",
+            PromptTemplate.category_id.is_(None),
+            PromptTemplate.task_id.is_(None),
+        )
+    ).all()
+    for template in obsolete_templates:
+        session.delete(template)
+        changed += 1
 
     created = 0
     for item in items:
@@ -72,6 +91,6 @@ def seed_default_prompt_templates(session: Session) -> int:
         session.add(template)
         created += 1
 
-    if created:
+    if created or changed:
         session.commit()
-    return created
+    return created + changed

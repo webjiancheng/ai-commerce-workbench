@@ -10,32 +10,55 @@
       <section class="hero">
         <p class="eyebrow">Product Capture</p>
         <h1>商品采集</h1>
-        <p class="sub">采集商品图片、标题、价格、SKU 和详情，提交到本地 Temu AI 上架工作台。</p>
+        <p class="sub">采集商品图片、标题、价格、规格属性和详情，提交到 Temu AI 上架工作台。</p>
       </section>
 
       <section class="actions">
         <button id="collect" class="primary">采集</button>
         <button id="sync" class="secondary">提交本地</button>
+        <button id="syncCreate" class="secondary" type="button">提交并生成</button>
         <button id="shot" class="secondary" type="button">截图</button>
         <button id="toggleCorrect" class="ghost" type="button">手动纠错</button>
+        <button id="openWorkbench" class="ghost is-hidden" type="button">打开上架台</button>
+        <button id="toggleSettings" class="ghost" type="button">配置</button>
       </section>
 
       <section class="filters">
         <label class="field">
-          <span>本地工作台地址</span>
-          <input id="serverUrl" type="url" placeholder="http://127.0.0.1:8000" autocomplete="off">
-        </label>
-        <label class="field">
           <span>采集人</span>
           <input id="collector" type="text" placeholder="例如：team-a" autocomplete="off">
         </label>
+        <div class="taskOptions">
+          <label class="field compact">
+            <span>生成模式</span>
+            <select id="generationMode">
+              <option value="title_and_4grid">AI 标题 + 类目 + 四宫格</option>
+              <option value="title_only">AI 标题 + 类目</option>
+              <option value="task_only">仅创建任务</option>
+            </select>
+          </label>
+          <label class="check productInfoCheck">
+            <input id="includeProductInfo" type="checkbox" checked>
+            <span>商品理解</span>
+          </label>
+        </div>
+        <div id="settingsPanel" class="settingsPanel is-hidden">
+          <label class="field">
+            <span>接口地址</span>
+            <input id="serverUrl" type="url" placeholder="http://127.0.0.1:8000" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>工作台地址</span>
+            <input id="webUrl" type="url" placeholder="http://127.0.0.1:3000" autocomplete="off">
+          </label>
+        </div>
       </section>
 
       <section class="stats">
         <article><span>平台</span><strong id="platform">-</strong></article>
         <article><span>价格</span><strong id="price">-</strong></article>
         <article><span>主图</span><strong id="mainCount">0</strong></article>
-        <article><span>SKU</span><strong id="skuCount">0</strong></article>
+        <article><span>规格图</span><strong id="skuCount">0</strong></article>
         <article><span>详情</span><strong id="detailCount">0</strong></article>
       </section>
 
@@ -44,7 +67,7 @@
           <span class="assignLabel">归类到</span>
           <button id="assignMode" type="button" class="pill">归类模式：关</button>
           <button type="button" class="pill" data-assign="main">主图</button>
-          <button type="button" class="pill" data-assign="sku">SKU</button>
+          <button type="button" class="pill" data-assign="sku">规格/属性</button>
           <button type="button" class="pill" data-assign="detail">详情</button>
           <button type="button" class="pill" data-assign="size">尺寸</button>
         </div>
@@ -61,9 +84,10 @@
 
         <section class="group" data-group="sku">
           <header class="groupHead">
-            <div class="groupTitle">SKU</div>
+            <div class="groupTitle">规格/属性</div>
             <div class="groupMeta"><span class="count" data-count="sku">0</span></div>
-            <label class="check"><input type="checkbox" data-invert="sku"><span>全选/反选</span></label>
+            <label class="check"><input type="checkbox" data-invert="sku"><span>规格图全选/反选</span></label>
+            <label class="check"><input type="checkbox" data-invert-sku-props="1"><span>规格属性全选/反选</span></label>
             <button class="ghost small" type="button" data-download-selected="sku">下载选中</button>
           </header>
           <div class="grid" data-grid="sku"></div>

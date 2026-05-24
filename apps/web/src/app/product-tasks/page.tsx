@@ -26,7 +26,7 @@ type ImagePromptStatus = "pending" | "running" | "ready" | "failed";
 type ExportStatus = "pending" | "ready" | "running" | "exported" | "failed";
 
 // 归一化历史 enum 到三模式口径
-export type NormalizedGenerationMode = "task_only" | "title_only" | "title_and_4grid";
+type NormalizedGenerationMode = "task_only" | "title_only" | "title_and_4grid";
 
 const BACKWARD_COMPAT_MAP: Record<string, NormalizedGenerationMode> = {
   no_ai: "task_only",
@@ -34,7 +34,7 @@ const BACKWARD_COMPAT_MAP: Record<string, NormalizedGenerationMode> = {
   full_later: "title_and_4grid",
 };
 
-export function normalizeGenerationMode(raw: string): NormalizedGenerationMode {
+function normalizeGenerationMode(raw: string): NormalizedGenerationMode {
   return BACKWARD_COMPAT_MAP[raw] as NormalizedGenerationMode || (raw as NormalizedGenerationMode);
 }
 
@@ -42,12 +42,17 @@ function getGenerationModeLabel(mode: string): string {
   switch (mode) {
     case "task_only": return "仅创建任务，不使用 AI";
     case "title_only": return "AI 标题 + 类目";
-    case "title_and_4grid": return "AI 标题 + 类目 + 商品理解 + 四宫格";
+    case "title_and_4grid": return "AI 标题 + 类目 + 四宫格";
     default: return mode;
   }
 }
 
 type GenerationMode = "task_only" | "title_only" | "title_and_4grid" | "no_ai" | "title_and_image_prompts" | "full_later";
+
+type ExportImageSettings = {
+  insert_size_chart_in_carousel?: boolean;
+  size_chart_position?: number;
+};
 
 type ProductTaskListItem = {
   id: number;
@@ -59,6 +64,7 @@ type ProductTaskListItem = {
   source_id: string | null;
   platform_sku: string | null;
   generation_mode: GenerationMode;
+  include_product_info: boolean;
   main_status: TaskMainStatus;
   category_status: CategoryStatus;
   title_status: string;
@@ -67,6 +73,7 @@ type ProductTaskListItem = {
   export_status: ExportStatus;
   selected_category_id: string | null;
   category_candidates_json: unknown[];
+  export_image_settings_json: ExportImageSettings;
   exception_status: string | null;
   exception_level: string | null;
   exception_reasons_json: unknown[];
@@ -138,6 +145,7 @@ type RawProductDetail = {
   category_path: string | null;
   platform_sku: string | null;
   sku_text?: string | null;
+  sku_props: RawSkuPropItem[];
   source_id: string | null;
   screenshot_url: string | null;
   main_image: string | null;
@@ -147,6 +155,52 @@ type RawProductDetail = {
   size_chart_images: string[];
   created_at: string;
 };
+
+type RawSkuPropItem = {
+  group_name: string;
+  option_name: string;
+  image_url: string | null;
+  hint_text?: string | null;
+  group_index: number;
+  option_index: number;
+  selected?: boolean;
+};
+
+function normalizeRawSkuProps(items: RawSkuPropItem[] | null | undefined): RawSkuPropItem[] {
+  return (items || []).map((item, index) => ({
+    group_name: String(item?.group_name || "").trim(),
+    option_name: String(item?.option_name || "").trim(),
+    image_url: item?.image_url ? String(item.image_url).trim() || null : null,
+    hint_text: item?.hint_text ? String(item.hint_text).trim() || null : null,
+    group_index: Number.isFinite(item?.group_index) ? Number(item.group_index) : 0,
+    option_index: Number.isFinite(item?.option_index) ? Number(item.option_index) : index,
+    selected: Boolean(item?.selected),
+  }));
+}
+
+function makeEmptyRawSkuProp(groupIndex = 0, optionIndex = 0): RawSkuPropItem {
+  return {
+    group_name: "",
+    option_name: "",
+    image_url: null,
+    hint_text: null,
+    group_index: groupIndex,
+    option_index: optionIndex,
+    selected: false,
+  };
+}
+
+function buildSpecTypeFromRawSkuProps(items: RawSkuPropItem[] | null | undefined): string {
+  const groups = Array.from(
+    new Set(
+      normalizeRawSkuProps(items)
+        .map((item) => item.group_name)
+        .filter(Boolean),
+    ),
+  );
+  if (!groups.length) return "";
+  return groups.slice(0, 2).join("/");
+}
 
 function buildAiRequestHeaders(
   includeJsonContentType = false,
@@ -166,16 +220,16 @@ function buildAiRequestHeaders(
 
 function mapPromptTypesToPurposes(promptTypes?: string[]): AiPurpose[] {
   if (!promptTypes?.length) {
-    return ["image_prompt_package", "title_package", "product_info", "title"];
+    return ["title_package", "product_info", "title"];
   }
 
   const mapped = new Set<AiPurpose>();
   for (const type of promptTypes) {
     if (type === "product_info_from_screenshot") mapped.add("product_info");
     else if (type === "title_package_lite") mapped.add("title_package_lite");
-    else if (type === "title_package") mapped.add("title_package");
+    else if (type === "title_package" || type === "title_en_with_cn_translation" || type === "title_en") mapped.add("title_package");
     else if (type === "dimension_extract_from_image") mapped.add("dimension_extract");
-    else if (type.startsWith("image_prompt_") || type === "image_prompt_package") mapped.add("image_prompt_package");
+    else if (type.startsWith("image_prompt_") || type === "image_prompt_package") mapped.add("title_package");
     else mapped.add("title");
   }
   return Array.from(mapped);
@@ -666,6 +720,159 @@ function statusText(status: string): string {
   return map[status] || status;
 }
 
+function logEventStatusColor(status: string): string {
+  if (status === "success" || status === "completed") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (status === "failed" || status === "warning" || status === "blocking") return "border-rose-200 bg-rose-50 text-rose-700";
+  if (status === "running" || status === "queued" || status === "started") return "border-amber-200 bg-amber-50 text-amber-800";
+  return "border-slate-200 bg-white text-slate-500";
+}
+
+function getEventJobId(event: ProductTaskTimelineEvent): number | null {
+  const raw = event.meta?.job_id;
+  const id = Number(raw);
+  return Number.isFinite(id) ? id : null;
+}
+
+function imageJobFinishedEvent(events: ProductTaskTimelineEvent[], jobId: number | null): ProductTaskTimelineEvent | null {
+  if (!jobId) return null;
+  return (
+    events.find(
+      (event) =>
+        event.stage === "image.result" &&
+        getEventJobId(event) === jobId &&
+        (event.status === "success" || event.status === "failed"),
+    ) || null
+  );
+}
+
+function displayTimelineEvent(
+  event: ProductTaskTimelineEvent,
+  allEvents: ProductTaskTimelineEvent[],
+): ProductTaskTimelineEvent {
+  if (event.stage === "image.queued" || event.stage === "image.running") {
+    const resultEvent = imageJobFinishedEvent(allEvents, getEventJobId(event));
+    if (resultEvent?.status === "success") {
+      return {
+        ...event,
+        status: "completed",
+        title: event.stage === "image.queued" ? event.title.replace("已创建", "已创建并完成") : event.title.replace("开始执行", "执行已完成"),
+        message: `${event.message} 该图片任务后续已完成，见完成事件。`,
+      };
+    }
+    if (resultEvent?.status === "failed") {
+      return {
+        ...event,
+        status: "failed",
+        title: event.stage === "image.queued" ? event.title.replace("已创建", "已创建后失败") : event.title.replace("开始执行", "执行失败"),
+        message: `${event.message} 该图片任务后续失败，见失败事件。`,
+      };
+    }
+  }
+  return event;
+}
+
+function getLatestImageJobSummaries(events: ProductTaskTimelineEvent[]): ProductTaskTimelineEvent[] {
+  const imageEvents = events.filter((event) => String(event.stage).startsWith("image."));
+  const grouped = new Map<number, ProductTaskTimelineEvent[]>();
+  const ungrouped: ProductTaskTimelineEvent[] = [];
+
+  for (const event of imageEvents) {
+    const jobId = getEventJobId(event);
+    if (!jobId) {
+      ungrouped.push(event);
+      continue;
+    }
+    grouped.set(jobId, [...(grouped.get(jobId) || []), event]);
+  }
+
+  const summaries = Array.from(grouped.entries()).map(([jobId, jobEvents]) => {
+    const result = jobEvents.find((event) => event.stage === "image.result");
+    const running = jobEvents.find((event) => event.stage === "image.running");
+    const queued = jobEvents.find((event) => event.stage === "image.queued");
+    const base = result || running || queued || jobEvents[jobEvents.length - 1];
+    if (!base) return null;
+    const slotText = String(base.meta?.target_slots || base.meta?.slot || "-");
+    if (result) {
+      return {
+        ...result,
+        title: result.status === "success" ? `图片任务 #${jobId} 已完成` : `图片任务 #${jobId} 失败`,
+        message:
+          result.status === "success"
+            ? `已输出 ${Array.isArray(result.meta?.output_asset_ids) ? result.meta.output_asset_ids.length : 0} 张图；目标槽位：${slotText}。`
+            : result.message,
+      };
+    }
+    if (running) return { ...running, title: `图片任务 #${jobId} 执行中` };
+    return { ...base, title: `图片任务 #${jobId} 已提交`, message: `${base.message} 等待后台开始执行。` };
+  }).filter((event): event is ProductTaskTimelineEvent => Boolean(event));
+
+  return [...summaries, ...ungrouped].sort((a, b) => {
+    const at = a.ts ? new Date(a.ts).getTime() : 0;
+    const bt = b.ts ? new Date(b.ts).getTime() : 0;
+    return bt - at;
+  });
+}
+
+function eventUsage(event: ProductTaskTimelineEvent): Record<string, unknown> {
+  return (event.meta?.usage as Record<string, unknown> | undefined) || {};
+}
+
+function eventCost(event: ProductTaskTimelineEvent): Record<string, unknown> {
+  return (event.meta?.cost as Record<string, unknown> | undefined) || {};
+}
+
+function eventRuntime(event: ProductTaskTimelineEvent): Record<string, unknown> {
+  return (event.meta?.runtime as Record<string, unknown> | undefined) || {};
+}
+
+function eventProvider(event: ProductTaskTimelineEvent): Record<string, unknown> {
+  return (event.meta?.provider as Record<string, unknown> | undefined) || {};
+}
+
+function isModelCallEvent(event: ProductTaskTimelineEvent): boolean {
+  const provider = eventProvider(event);
+  const runtime = eventRuntime(event);
+  const providerSource = String(provider.provider_source || runtime.provider_source || "").toLowerCase();
+  const providerName = String(provider.provider_name || runtime.provider_name || "").toLowerCase();
+  const model = String(event.meta?.model || runtime.model || "");
+  const usage = eventUsage(event);
+  const hasTokens = Number(usage.total_tokens || usage.prompt_tokens || usage.completion_tokens || 0) > 0;
+  const hasPrompt = Boolean(event.meta?.has_prompt || (typeof event.meta?.prompt === "string" && event.meta.prompt && event.meta.prompt !== "dynamic_image_prompt_context"));
+  if (providerSource === "code" || providerName.startsWith("dynamic_") || model.startsWith("code.")) return false;
+  return hasTokens || hasPrompt;
+}
+
+function modelCallSummary(event: ProductTaskTimelineEvent, fallbackCurrency = "USD"): string {
+  const runtime = eventRuntime(event);
+  const usage = eventUsage(event);
+  const cost = eventCost(event);
+  const provider = eventProvider(event);
+  const model = String(event.meta?.model || runtime.model || "-");
+  const providerName = String(provider.provider_display_name || runtime.provider_display_name || provider.provider_name || runtime.provider_name || "-");
+  const totalTokens = Number(usage.total_tokens || 0);
+  const promptTokens = Number(usage.prompt_tokens || 0);
+  const completionTokens = Number(usage.completion_tokens || 0);
+  const currency = String(cost.currency || fallbackCurrency);
+  const estimatedCost = Number(cost.estimated_cost);
+  const tokenText = totalTokens
+    ? `${formatInteger(totalTokens)} tokens（in ${formatInteger(promptTokens)} / out ${formatInteger(completionTokens)}）`
+    : "tokens 未返回";
+  const costText = Number.isFinite(estimatedCost) ? formatMoney(estimatedCost, currency) : "费用未估算";
+  return `${providerName} / ${model} · ${tokenText} · ${costText}`;
+}
+
+function dedupeCompatAiEvents(events: ProductTaskTimelineEvent[]): ProductTaskTimelineEvent[] {
+  const titlePackage = events.find((event) => event.stage === "ai.title_package");
+  return events.filter((event) => {
+    if (event.stage !== "ai.title_en" || !titlePackage) return true;
+    const sameTime = event.ts === titlePackage.ts;
+    const sameModel = String(event.meta?.model || "") === String(titlePackage.meta?.model || "");
+    const sameUsage = formatJson(event.meta?.usage) === formatJson(titlePackage.meta?.usage);
+    const sameOutput = formatJson(event.meta?.output) === formatJson(titlePackage.meta?.output);
+    return !(sameTime && sameModel && sameUsage && sameOutput);
+  });
+}
+
 function formatDateTime(value: string | null | undefined): string {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
@@ -754,6 +961,20 @@ function slotHasRemovalMarker(assetsBySlot: AssetsBySlotResponse | undefined, sl
 
 function rawCarouselSequence(raw: RawProductDetail | null | undefined): string[] {
   return Array.from(new Set([...(raw?.main_image ? [raw.main_image] : []), ...(raw?.carousel_images || [])]));
+}
+
+function normalizeExportImageSettings(settings: ExportImageSettings | null | undefined): Required<ExportImageSettings> {
+  const rawPosition = Number(settings?.size_chart_position || 3);
+  return {
+    insert_size_chart_in_carousel: settings?.insert_size_chart_in_carousel !== false,
+    size_chart_position: Number.isFinite(rawPosition) ? Math.max(1, Math.min(Math.trunc(rawPosition), 10)) : 3,
+  };
+}
+
+function insertItemAtPosition<T>(items: T[], item: T | null, enabled: boolean, position: number): T[] {
+  if (!enabled || !item) return items;
+  const index = Math.max(0, Math.min(position - 1, items.length));
+  return [...items.slice(0, index), item, ...items.slice(index)];
 }
 
 function rawImageForCarouselSlot(raw: RawProductDetail | null | undefined, slot: string): string | null {
@@ -1134,7 +1355,7 @@ function ProductTasksPageInner() {
   async function generateFourGrid(taskId: number): Promise<void> {
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-images`, {
       method: "POST",
-      headers: buildAiRequestHeaders(true, ["image_prompt_package", "dimension_extract", "title_package"]),
+      headers: buildAiRequestHeaders(true, ["dimension_extract", "title_package"]),
       body: JSON.stringify({
         job_type: "carousel_4grid",
         slots: ["carousel_1", "carousel_2", "carousel_3", "carousel_4"],
@@ -1147,7 +1368,7 @@ function ProductTasksPageInner() {
   async function runAi(taskId: number): Promise<void> {
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/run-ai`, {
       method: "POST",
-      headers: buildAiRequestHeaders(true, ["image_prompt_package", "title_package", "product_info", "title"]),
+      headers: buildAiRequestHeaders(true, ["title_package", "product_info", "title"]),
       body: JSON.stringify({}),
     });
     const result = (await response.json()) as { detail?: string };
@@ -1155,9 +1376,9 @@ function ProductTasksPageInner() {
   }
 
   async function generateTitles(taskId: number): Promise<void> {
-    const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-title-en-only`, {
+    const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-titles`, {
       method: "POST",
-      headers: buildAiRequestHeaders(false, ["title"]),
+      headers: buildAiRequestHeaders(false, ["title_package_lite", "title"]),
     });
     const result = (await response.json()) as { detail?: string };
     if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
@@ -1328,6 +1549,22 @@ function ProductTasksPageInner() {
     if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
   }
 
+  async function handleBulkApplyDefaults(): Promise<void> {
+    if (!selectedIds.length) {
+      setNotice("请先选择商品");
+      return;
+    }
+    const ok = window.confirm(
+      `将为已选择的 ${selectedIds.length} 个商品生成或刷新导出字段草稿。\n\n会写入上架默认值规则、AI 标题/类目、商品资产等可导出字段；已人工覆盖的字段会尽量保留。是否继续？`,
+    );
+    if (!ok) return;
+    await runBulkAction(
+      "生成导出草稿",
+      applyDefaults,
+      "已为 {count} 个商品生成/刷新导出字段草稿。",
+    );
+  }
+
   async function deleteTask(taskId: number): Promise<void> {
     const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}`, {
       method: "DELETE",
@@ -1351,13 +1588,20 @@ function ProductTasksPageInner() {
         body: JSON.stringify({ product_task_ids: selectedIds }),
       });
       const result = (await response.json()) as {
-        rows?: { task_id?: number; validation_result?: { errors?: { field_name?: string; message?: string; type?: string }[]; warnings?: unknown[] } }[];
+        rows?: {
+          task_id?: number;
+          validation_result?: {
+            errors?: { field_name?: string; message?: string; type?: string }[];
+            warnings?: { field_name?: string; field_key?: string; message?: string; type?: string }[];
+          };
+        }[];
         detail?: string;
       };
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
 
       // Collect all errors with readable messages
       const allErrors: string[] = [];
+      const allWarnings: string[] = [];
       for (const row of result.rows || []) {
         const taskId = row.task_id || "?";
         for (const err of row.validation_result?.errors || []) {
@@ -1372,6 +1616,10 @@ function ProductTasksPageInner() {
             message = "轮播图数量不足（至少3张）";
           }
           allErrors.push(`#${taskId} 【${fieldName}】${message}`);
+        }
+        for (const warning of row.validation_result?.warnings || []) {
+          const fieldName = warning.field_name || warning.field_key || "提示";
+          allWarnings.push(`#${taskId} 【${fieldName}】${warning.message || warning.type || "需要复核"}`);
         }
       }
 
@@ -1389,7 +1637,13 @@ function ProductTasksPageInner() {
         const moreText = errorsCount > 10 ? `\n...还有 ${errorsCount - 10} 个错误` : "";
         setError(`校验未通过，共 ${errorsCount} 个错误：\n${errorSummary}${moreText}`);
       } else {
-        setNotice(`已校验 ${selectedIds.length} 个商品，全部通过！警告 ${warningsCount} 条。`);
+        const warningSummary = allWarnings.slice(0, 5).join("\n");
+        const moreWarnings = warningsCount > 5 ? `\n...还有 ${warningsCount - 5} 条警告` : "";
+        setNotice(
+          warningSummary
+            ? `已校验 ${selectedIds.length} 个商品，无阻断错误。警告 ${warningsCount} 条：\n${warningSummary}${moreWarnings}`
+            : `已校验 ${selectedIds.length} 个商品，全部通过！警告 0 条。`,
+        );
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量校验失败");
@@ -1507,7 +1761,7 @@ function ProductTasksPageInner() {
             </div>
           </div>
 
-          <div className="mt-6 grid gap-3 lg:grid-cols-[1.3fr_0.7fr_0.7fr_0.7fr_auto]">
+          <div className={["mt-6 grid gap-3", isLogsRoute ? "lg:grid-cols-[1.4fr_0.75fr_0.75fr_0.75fr_auto]" : "lg:grid-cols-[1.3fr_0.7fr_0.7fr_0.7fr_auto]"].join(" ")}>
             <input
               value={keyword}
               onChange={(event) => setKeyword(event.target.value)}
@@ -1582,6 +1836,8 @@ function ProductTasksPageInner() {
               >
                 {lowConfidenceOnly ? "低置信度：开" : "低置信度：关"}
               </button>
+              {!isLogsRoute ? (
+                <>
               <button
                 type="button"
                 onClick={() =>
@@ -1637,10 +1893,9 @@ function ProductTasksPageInner() {
               </button>
               <button
                 type="button"
-                onClick={() =>
-                  void runBulkAction("批量应用默认值", applyDefaults, "已为 {count} 个商品应用默认值。")
-                }
+                onClick={() => void handleBulkApplyDefaults()}
                 disabled={!selectedIds.length || bulkLoading !== null}
+                title="根据上架默认值规则、AI结果和商品资产生成或刷新导出字段草稿，不是直接导出 Excel。"
                 className={[
                   "h-11 rounded-full px-4 text-sm",
                   !selectedIds.length || bulkLoading !== null
@@ -1648,7 +1903,7 @@ function ProductTasksPageInner() {
                     : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50",
                 ].join(" ")}
               >
-                批量应用默认值
+                批量生成导出草稿
               </button>
               <button
                 type="button"
@@ -1689,22 +1944,30 @@ function ProductTasksPageInner() {
               >
                 批量删除
               </button>
+                </>
+              ) : null}
             </div>
           </div>
 
           {error ? <div className="mt-4 text-sm text-rose-600">加载失败：{error}</div> : null}
           {notice ? <div className="mt-4 text-sm text-emerald-700">{notice}</div> : null}
-          <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-            已选择 {selectedIds.length} 个商品任务
-            {bulkLoading ? <span className="ml-2 text-slate-500">当前操作：{bulkLoading}</span> : null}
-          </div>
+          {!isLogsRoute ? (
+            <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+              已选择 {selectedIds.length} 个商品任务
+              {bulkLoading ? <span className="ml-2 text-slate-500">当前操作：{bulkLoading}</span> : null}
+            </div>
+          ) : (
+            <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+              日志台只保留排查相关筛选。批量上架、导出、删除请回到上架加工工作台执行。
+            </div>
+          )}
 
-          {selectedIds.length ? (
+          {!isLogsRoute && selectedIds.length ? (
             <div className="mt-4 rounded-[22px] border border-slate-200 bg-slate-50 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-semibold text-slate-900">批量处理工具栏</div>
-                  <div className="mt-1 text-xs text-slate-500">围绕最终导出结果批量处理标题、类目、默认值和图片。</div>
+                  <div className="mt-1 text-xs text-slate-500">先批量处理标题和类目，再生成导出草稿，最后校验或导出 Excel。</div>
                 </div>
                 <div className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600">
                   当前选中 {selectedIds.length} 条
@@ -1771,11 +2034,12 @@ function ProductTasksPageInner() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => void runBulkAction("批量应用默认值", applyDefaults, "已为 {count} 个商品应用默认值。")}
+                  onClick={() => void handleBulkApplyDefaults()}
                   disabled={bulkLoading !== null}
+                  title="根据上架默认值规则、AI结果和商品资产生成或刷新导出字段草稿，不是直接导出 Excel。"
                   className="h-11 rounded-full border border-slate-300 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
                 >
-                  上架默认值
+                  生成导出草稿
                 </button>
                 <button
                   type="button"
@@ -2061,11 +2325,16 @@ function ImagesTab({
   const [selectedTargetSlot, setSelectedTargetSlot] = useState<string>("carousel_1");
   const [assigning, setAssigning] = useState(false);
   const [draggedSlot, setDraggedSlot] = useState<string | null>(null);
-  const [busySlot, setBusySlot] = useState<string | null>(null);
+  const [busySlots, setBusySlots] = useState<Record<string, string>>({});
   const [removedSlots, setRemovedSlots] = useState<Record<string, boolean>>({});
   const [skuCodeDraft, setSkuCodeDraft] = useState("");
   const [skuTextDraft, setSkuTextDraft] = useState("");
+  const [skuPropsDraft, setSkuPropsDraft] = useState<RawSkuPropItem[]>([]);
   const [skuSaving, setSkuSaving] = useState(false);
+  const initialImageSettings = normalizeExportImageSettings(task.export_image_settings_json);
+  const [insertSizeChartInCarousel, setInsertSizeChartInCarousel] = useState(initialImageSettings.insert_size_chart_in_carousel);
+  const [sizeChartPosition, setSizeChartPosition] = useState(initialImageSettings.size_chart_position);
+  const [imageSettingsSaving, setImageSettingsSaving] = useState(false);
 
   async function readErrorDetail(res: Response): Promise<string> {
     try {
@@ -2102,12 +2371,20 @@ function ImagesTab({
 
   useEffect(() => {
     setRemovedSlots({});
+    setBusySlots({});
   }, [task.id]);
 
   useEffect(() => {
     setSkuCodeDraft(raw?.platform_sku || task.platform_sku || "");
     setSkuTextDraft(raw?.sku_text || "");
-  }, [raw?.id, raw?.platform_sku, raw?.sku_text, task.platform_sku]);
+    setSkuPropsDraft(normalizeRawSkuProps(raw?.sku_props));
+  }, [raw?.id, raw?.platform_sku, raw?.sku_text, raw?.sku_props, task.platform_sku]);
+
+  useEffect(() => {
+    const next = normalizeExportImageSettings(task.export_image_settings_json);
+    setInsertSizeChartInCarousel(next.insert_size_chart_in_carousel);
+    setSizeChartPosition(next.size_chart_position);
+  }, [task.id, task.export_image_settings_json]);
 
   async function pollJob(jobId: number): Promise<void> {
     setJobStatus(`job ${jobId}: queued`);
@@ -2125,28 +2402,50 @@ function ImagesTab({
     await onRefresh?.();
   }
 
+  function markSlotsBusy(slots: string[], label: string): () => void {
+    setBusySlots((prev) => {
+      const next = { ...prev };
+      slots.forEach((slot) => {
+        next[slot] = label;
+      });
+      return next;
+    });
+    return () => {
+      setBusySlots((prev) => {
+        const next = { ...prev };
+        slots.forEach((slot) => {
+          delete next[slot];
+        });
+        return next;
+      });
+    };
+  }
+
   async function generateCarousel4Grid(): Promise<void> {
     setOpError(null);
     setJobStatus(null);
+    const clearBusy = markSlotsBusy(["carousel_4grid", "carousel_1", "carousel_2", "carousel_3", "carousel_4"], "四宫格生成中");
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-images`, {
         method: "POST",
-        headers: buildAiRequestHeaders(true, ["image_prompt_package", "dimension_extract", "title_package"]),
+        headers: buildAiRequestHeaders(true, ["dimension_extract", "title_package"]),
         body: JSON.stringify({ job_type: "carousel_4grid" }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
       const data = (await res.json()) as { job_ids: number[] };
       const jobId = data.job_ids?.[0];
-      if (jobId) void pollJob(jobId);
+      if (jobId) await pollJob(jobId);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "生成失败");
+    } finally {
+      clearBusy();
     }
   }
 
   async function generateSingle(slot: string): Promise<void> {
     setOpError(null);
     setJobStatus(null);
-    setBusySlot(slot);
+    const clearBusy = markSlotsBusy([slot], "AI 生成中");
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-image`, {
         method: "POST",
@@ -2154,27 +2453,28 @@ function ImagesTab({
           true,
           slot === "size_chart"
             ? ["dimension_extract", "title_package", "product_info"]
-            : ["title_package", "product_info", "image_prompt_package"],
+            : ["title_package", "product_info"],
         ),
         body: JSON.stringify({ slot }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
       const data = (await res.json()) as { job_id: number };
-      if (data.job_id) void pollJob(data.job_id);
+      if (data.job_id) await pollJob(data.job_id);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "生成失败");
     } finally {
-      setBusySlot(null);
+      clearBusy();
     }
   }
 
   async function generateSellingImages(): Promise<void> {
     setOpError(null);
     setJobStatus(null);
+    const clearBusy = markSlotsBusy(["carousel_1", "carousel_2", "carousel_3", "carousel_4"], "批量生成中");
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-selling-images`, {
         method: "POST",
-        headers: buildAiRequestHeaders(true, ["title_package", "product_info", "image_prompt_package"]),
+        headers: buildAiRequestHeaders(true, ["title_package", "product_info"]),
         body: JSON.stringify({ slots: ["carousel_1", "carousel_2", "carousel_3", "carousel_4"] }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -2185,16 +2485,19 @@ function ImagesTab({
       }
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "卖点主图生成失败");
+    } finally {
+      clearBusy();
     }
   }
 
   async function generateSkuImage(): Promise<void> {
     setOpError(null);
     setJobStatus(null);
+    const clearBusy = markSlotsBusy(["sku_image"], "SKU 图生成中");
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-sku-image`, {
         method: "POST",
-        headers: buildAiRequestHeaders(true, ["title_package", "product_info", "image_prompt_package"]),
+        headers: buildAiRequestHeaders(true, ["title_package", "product_info"]),
         body: JSON.stringify({}),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -2202,12 +2505,15 @@ function ImagesTab({
       if (data.job_id) await pollJob(data.job_id);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "SKU图生成失败");
+    } finally {
+      clearBusy();
     }
   }
 
   async function generateSizeImage(): Promise<void> {
     setOpError(null);
     setJobStatus(null);
+    const clearBusy = markSlotsBusy(["size_chart"], "尺寸图生成中");
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-size-image`, {
         method: "POST",
@@ -2219,6 +2525,8 @@ function ImagesTab({
       if (data.job_id) await pollJob(data.job_id);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "尺寸图生成失败");
+    } finally {
+      clearBusy();
     }
   }
 
@@ -2234,9 +2542,29 @@ function ImagesTab({
     }
   }
 
-  async function regenerate(assetId: number): Promise<void> {
+  async function saveExportImageSettings(next: Required<ExportImageSettings>): Promise<void> {
+    setImageSettingsSaving(true);
+    setOpError(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ export_image_settings_json: next }),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      await onRefresh?.();
+      setJobStatus(`尺寸图导出位置已保存：${next.insert_size_chart_in_carousel ? `第 ${next.size_chart_position} 张` : "不插入轮播图"}`);
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "保存尺寸图导出位置失败");
+    } finally {
+      setImageSettingsSaving(false);
+    }
+  }
+
+  async function regenerate(slot: string, assetId: number): Promise<void> {
     setOpError(null);
     setJobStatus(null);
+    const clearBusy = markSlotsBusy([slot], "重生成中");
     try {
       const res = await fetch(`${apiBaseUrl}/api/assets/${assetId}/regenerate`, {
         method: "POST",
@@ -2245,9 +2573,11 @@ function ImagesTab({
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
       const data = (await res.json()) as { job_id: number };
-      if (data.job_id) void pollJob(data.job_id);
+      if (data.job_id) await pollJob(data.job_id);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "重生成失败");
+    } finally {
+      clearBusy();
     }
   }
 
@@ -2277,7 +2607,18 @@ function ImagesTab({
   const selectedExtraCarouselAssets = extraCarouselSlots
     .map((slot) => ({ slot, asset: latestAsset(assets[slot]) }))
     .filter((item) => item.asset?.public_url);
-  const carouselExportValue = [...selectedCarouselAssets, ...selectedExtraCarouselAssets]
+  const sizeChartExportAsset = latestAsset(assets.size_chart);
+  const baseCarouselExportAssets: { slot: string; asset: ProductAsset | null }[] = [
+    ...selectedCarouselAssets,
+    ...selectedExtraCarouselAssets,
+  ];
+  const arrangedCarouselExportAssets = insertItemAtPosition(
+    baseCarouselExportAssets,
+    sizeChartExportAsset?.public_url ? { slot: "size_chart", asset: sizeChartExportAsset } : null,
+    insertSizeChartInCarousel,
+    sizeChartPosition,
+  );
+  const carouselExportValue = arrangedCarouselExportAssets
     .map((item) => item.asset?.public_url)
     .filter(Boolean)
     .join(",");
@@ -2320,30 +2661,30 @@ function ImagesTab({
       return { label: "尺寸图", promptTypes: ["dimension_extract_from_image", "image_prompt_dimension"] };
     }
     if (slot === "sku_image") {
-      return { label: "SKU 图", promptTypes: ["product_info_from_screenshot", "image_prompt_package"] };
+      return { label: "SKU 图", promptTypes: ["product_info_from_screenshot", "image_prompt_main"] };
     }
     if (slot === "carousel_4grid") {
-      return { label: "四宫格", promptTypes: ["image_prompt_carousel_4grid", "image_prompt_package", "title_package"] };
+      return { label: "四宫格", promptTypes: ["image_prompt_carousel_4grid", "title_package"] };
     }
     if (slot === "carousel_1") {
-      return { label: "轮播1（主图）", promptTypes: ["image_prompt_carousel_1", "image_prompt_main", "image_prompt_package"] };
+      return { label: "轮播1（主图）", promptTypes: ["image_prompt_carousel_1", "image_prompt_main"] };
     }
     if (slot === "carousel_2") {
-      return { label: "轮播2（细节）", promptTypes: ["image_prompt_carousel_2", "image_prompt_package"] };
+      return { label: "轮播2（细节）", promptTypes: ["image_prompt_carousel_2"] };
     }
     if (slot === "carousel_3") {
-      return { label: "轮播3（场景）", promptTypes: ["image_prompt_carousel_3", "image_prompt_package"] };
+      return { label: "轮播3（场景）", promptTypes: ["image_prompt_carousel_3"] };
     }
     if (slot === "carousel_4") {
-      return { label: "轮播4（卖点）", promptTypes: ["image_prompt_carousel_4", "image_prompt_package"] };
+      return { label: "轮播4（卖点）", promptTypes: ["image_prompt_carousel_4"] };
     }
     if (slot.startsWith("carousel_")) {
-      return { label: slotLabel(slot), promptTypes: ["image_prompt_package"] };
+      return { label: slotLabel(slot), promptTypes: ["image_prompt_carousel_4grid"] };
     }
     if (slot === "main") {
-      return { label: "主图", promptTypes: ["image_prompt_main", "image_prompt_package"] };
+      return { label: "主图", promptTypes: ["image_prompt_main"] };
     }
-    return { label: slotLabel(slot), promptTypes: ["image_prompt_package", "title_package"] };
+    return { label: slotLabel(slot), promptTypes: ["title_package"] };
   }
 
   function focusRawOverview(slot: string): void {
@@ -2357,6 +2698,18 @@ function ImagesTab({
     return latestAsset(assets[slot]);
   }
 
+  function patchSkuPropDraft(index: number, patch: Partial<RawSkuPropItem>): void {
+    setSkuPropsDraft((rows) => rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)));
+  }
+
+  function addSkuPropDraft(): void {
+    setSkuPropsDraft((rows) => [...rows, makeEmptyRawSkuProp(rows.length, rows.length)]);
+  }
+
+  function removeSkuPropDraft(index: number): void {
+    setSkuPropsDraft((rows) => rows.filter((_, rowIndex) => rowIndex !== index));
+  }
+
   async function assignCandidateToSlot(payload: {
     targetSlot: string;
     sourceAssetId?: number;
@@ -2365,6 +2718,7 @@ function ImagesTab({
   }, options: { syncTable?: boolean; showStatus?: boolean } = {}): Promise<void> {
     const syncTable = options.syncTable ?? true;
     const showStatus = options.showStatus ?? true;
+    const clearBusy = markSlotsBusy([payload.targetSlot], "替换图片中");
     setAssigning(true);
     setOpError(null);
     try {
@@ -2388,6 +2742,7 @@ function ImagesTab({
       setOpError(err instanceof Error ? err.message : "放入图片失败");
     } finally {
       setAssigning(false);
+      clearBusy();
     }
   }
 
@@ -2430,17 +2785,18 @@ function ImagesTab({
 
   async function uploadToSlot(slot: string, file: File): Promise<void> {
     setSelectedTargetSlot(slot);
-    setBusySlot(slot);
+    const clearBusy = markSlotsBusy([slot], "上传中");
     const reader = new FileReader();
     reader.onload = async () => {
       const result = typeof reader.result === "string" ? reader.result : "";
       if (!result) {
-        setBusySlot(null);
+        clearBusy();
         return;
       }
       await assignCandidateToSlot({ targetSlot: slot, imageDataUrl: result });
-      setBusySlot(null);
+      clearBusy();
     };
+    reader.onerror = () => clearBusy();
     reader.readAsDataURL(file);
   }
 
@@ -2483,9 +2839,9 @@ function ImagesTab({
   }
 
   async function deleteSlotImage(slot: string): Promise<void> {
+    const clearBusy = markSlotsBusy([slot], "删除中");
     setAssigning(true);
     setOpError(null);
-    setBusySlot(slot);
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/remove-slot-image`, {
         method: "POST",
@@ -2512,7 +2868,7 @@ function ImagesTab({
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "删除图片失败");
     } finally {
-      setBusySlot(null);
+      clearBusy();
       setAssigning(false);
     }
   }
@@ -2531,6 +2887,7 @@ function ImagesTab({
         body: JSON.stringify({
           platform_sku: skuCodeDraft.trim() || null,
           sku_text: skuTextDraft.trim() || null,
+          skuProps: normalizeRawSkuProps(skuPropsDraft),
         }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -2628,7 +2985,7 @@ function ImagesTab({
                 selected={selectedTargetSlot === slot}
                 dragged={draggedSlot === slot}
                 draggedSlot={draggedSlot}
-                busy={busySlot === slot || assigning}
+                busyLabel={busySlots[slot] || (assigning ? "同步图片中" : null)}
                 onSelectSlot={setSelectedTargetSlot}
                 onDragStart={setDraggedSlot}
                 onReorder={reorderSlots}
@@ -2654,6 +3011,7 @@ function ImagesTab({
             assets={assets.carousel_4grid || []}
             onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
             onGenerate={generateCarousel4Grid}
+            busyLabel={busySlots.carousel_4grid || null}
             onOpenPrompt={() => {
               const config = getPromptEditorConfig("carousel_4grid");
               onOpenPromptEditor(config.label, config.promptTypes);
@@ -2670,7 +3028,7 @@ function ImagesTab({
                 selected={selectedTargetSlot === slot}
                 dragged={draggedSlot === slot}
                 draggedSlot={draggedSlot}
-                busy={busySlot === slot || assigning}
+                busyLabel={busySlots[slot] || (assigning ? "同步图片中" : null)}
                 onSelectSlot={setSelectedTargetSlot}
                 onDragStart={setDraggedSlot}
                 onReorder={reorderSlots}
@@ -2699,7 +3057,7 @@ function ImagesTab({
               <div className="mt-1 text-xs text-slate-500">前 4 张之外的轮播位继续往下排，用于补充展示，不再单独拆“附加轮播图位”。</div>
             </div>
             <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600">
-              当前 {selectedCarouselAssets.length + selectedExtraCarouselAssets.length} 张
+              导出 {arrangedCarouselExportAssets.length} 张
             </div>
           </div>
           <div className="mt-4 grid gap-3 xl:grid-cols-4">
@@ -2712,7 +3070,7 @@ function ImagesTab({
                 selected={selectedTargetSlot === slot}
                 dragged={draggedSlot === slot}
                 draggedSlot={draggedSlot}
-                busy={busySlot === slot || assigning}
+                busyLabel={busySlots[slot] || (assigning ? "同步图片中" : null)}
                 onSelectSlot={setSelectedTargetSlot}
                 onDragStart={setDraggedSlot}
                 onReorder={reorderSlots}
@@ -2744,7 +3102,7 @@ function ImagesTab({
               selected={selectedTargetSlot === slot}
               dragged={draggedSlot === slot}
               draggedSlot={draggedSlot}
-              busy={busySlot === slot || assigning}
+              busyLabel={busySlots[slot] || (assigning ? "同步图片中" : null)}
               onSelectSlot={setSelectedTargetSlot}
               onDragStart={setDraggedSlot}
               onReorder={reorderSlots}
@@ -2763,6 +3121,59 @@ function ImagesTab({
               }}
             />
           ))}
+        </div>
+
+        <div className="mt-4 rounded-[18px] border border-amber-200 bg-amber-50 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-amber-950">尺寸图导出位置</div>
+              <div className="mt-1 text-xs text-amber-800">
+                默认把尺寸图放到轮播第 3 张；导出时只调整导出顺序，不移动上方图片槽位，第 3 张及后面的轮播图会自动后排。
+              </div>
+              {!sizeChartExportAsset?.public_url ? (
+                <div className="mt-2 text-xs text-amber-700">当前还没有已采用的尺寸图，勾选后会在有尺寸图时生效。</div>
+              ) : null}
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="inline-flex items-center gap-2 rounded-full border border-amber-300 bg-white px-3 py-2 text-xs text-amber-900">
+                <input
+                  type="checkbox"
+                  checked={insertSizeChartInCarousel}
+                  onChange={(event) => {
+                    const next = {
+                      insert_size_chart_in_carousel: event.target.checked,
+                      size_chart_position: sizeChartPosition,
+                    };
+                    setInsertSizeChartInCarousel(next.insert_size_chart_in_carousel);
+                    void saveExportImageSettings(next);
+                  }}
+                />
+                导出轮播中插入尺寸图
+              </label>
+              <label className="flex items-center gap-2 text-xs text-amber-900">
+                放在第
+                <select
+                  value={sizeChartPosition}
+                  disabled={!insertSizeChartInCarousel}
+                  onChange={(event) => {
+                    const next = {
+                      insert_size_chart_in_carousel: insertSizeChartInCarousel,
+                      size_chart_position: Number(event.target.value),
+                    };
+                    setSizeChartPosition(next.size_chart_position);
+                    void saveExportImageSettings(next);
+                  }}
+                  className="rounded-full border border-amber-300 bg-white px-3 py-2 text-xs text-amber-950 disabled:opacity-60"
+                >
+                  {Array.from({ length: 10 }, (_, index) => index + 1).map((position) => (
+                    <option key={position} value={position}>{position}</option>
+                  ))}
+                </select>
+                张
+              </label>
+              {imageSettingsSaving ? <span className="text-xs text-amber-700">保存中...</span> : null}
+            </div>
+          </div>
         </div>
 
         <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
@@ -2830,6 +3241,58 @@ function ImagesTab({
                 placeholder="例如：颜色: 银色; 尺寸: 8mm"
               />
             </label>
+          </div>
+          <div className="mt-4 rounded-[14px] border border-slate-200 bg-slate-50 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">结构化 SKU 规格</div>
+                <div className="mt-1 text-xs text-slate-500">这里保存插件识别到的颜色、款式、尺寸等选项，上架补充里的 SKU 行会优先拿它来预填。</div>
+              </div>
+              <button
+                type="button"
+                onClick={addSkuPropDraft}
+                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              >
+                添加选项
+              </button>
+            </div>
+            <div className="mt-3 space-y-2">
+              {skuPropsDraft.length ? (
+                skuPropsDraft.map((item, index) => (
+                  <div key={`sku-prop-draft-${index + 1}`} className="grid gap-2 rounded-[12px] border border-slate-200 bg-white p-2 xl:grid-cols-[120px_1fr_1fr_auto]">
+                    <input
+                      value={item.group_name}
+                      onChange={(event) => patchSkuPropDraft(index, { group_name: event.target.value })}
+                      className="rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                      placeholder="规格组"
+                    />
+                    <input
+                      value={item.option_name}
+                      onChange={(event) => patchSkuPropDraft(index, { option_name: event.target.value })}
+                      className="rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                      placeholder="选项值"
+                    />
+                    <input
+                      value={item.image_url || ""}
+                      onChange={(event) => patchSkuPropDraft(index, { image_url: event.target.value || null })}
+                      className="rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                      placeholder="对应 SKU 图 URL，可留空"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeSkuPropDraft(index)}
+                      className="rounded-[10px] border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-[12px] border border-dashed border-slate-200 bg-white p-3 text-xs text-slate-500">
+                  还没有结构化 SKU 规格。可以重新采集，也可以先手动补。
+                </div>
+              )}
+            </div>
           </div>
           <div className="mt-3">
             <button
@@ -2949,7 +3412,7 @@ function LayoutCompareCard({
   assets,
   selected,
   dragged,
-  busy,
+  busyLabel,
   onSelectSlot,
   onDragStart,
   onReorder,
@@ -2970,7 +3433,7 @@ function LayoutCompareCard({
   assets: ProductAsset[];
   selected: boolean;
   dragged: boolean;
-  busy: boolean;
+  busyLabel: string | null;
   onSelectSlot: (slot: string) => void;
   onDragStart: (slot: string | null) => void;
   onReorder: (sourceSlot: string, targetSlot: string) => Promise<void>;
@@ -2978,7 +3441,7 @@ function LayoutCompareCard({
   onUploadToSlot: (slot: string, file: File) => Promise<void>;
   onGenerateSingle: (slot: string) => Promise<void>;
   onSetFinal: (assetId: number) => Promise<void>;
-  onRegenerate: (assetId: number) => Promise<void>;
+  onRegenerate: (slot: string, assetId: number) => Promise<void>;
   onDeleteSlot: (slot: string) => Promise<void>;
   onAssignFromAsset: (slot: string, sourceAssetId: number) => Promise<void>;
   onAssignFromUrl: (slot: string, sourceUrl: string) => Promise<void>;
@@ -3077,9 +3540,10 @@ function LayoutCompareCard({
       </div>
 
       <div className="relative mt-3 grid gap-3 md:grid-cols-2">
-        {busy ? (
-          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[16px] bg-white/80 text-sm text-slate-700">
-            正在处理 {slotLabel(slot)}…
+        {busyLabel ? (
+          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[16px] bg-white/85 text-sm font-medium text-slate-700 shadow-inner">
+            <span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-slate-900" />
+            {busyLabel} · {slotLabel(slot)}
           </div>
         ) : null}
         <div className="rounded-[16px] border border-slate-200 bg-white p-2">
@@ -3148,9 +3612,10 @@ function LayoutCompareCard({
         <button
           type="button"
           onClick={() => void onGenerateSingle(slot)}
-          className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+          disabled={Boolean(busyLabel)}
+          className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          AI 生成
+          {busyLabel ? "生成中..." : "AI 生成"}
         </button>
         <button
           type="button"
@@ -3177,10 +3642,11 @@ function LayoutCompareCard({
             </button>
             <button
               type="button"
-              onClick={() => void onRegenerate(finalAsset.id)}
-              className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              onClick={() => void onRegenerate(slot, finalAsset.id)}
+              disabled={Boolean(busyLabel)}
+              className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              重生成
+              {busyLabel ? "重生成中..." : "重生成"}
             </button>
           </>
         ) : null}
@@ -3195,12 +3661,14 @@ function FourGridCenterCard({
   onPreview,
   onGenerate,
   onOpenPrompt,
+  busyLabel,
 }: {
   rawImage: string | null;
   assets: ProductAsset[];
   onPreview: (src: string, caption: string) => void;
   onGenerate: () => Promise<void>;
   onOpenPrompt: () => void;
+  busyLabel: string | null;
 }) {
   const asset = assets[0] || null;
   return (
@@ -3214,7 +3682,13 @@ function FourGridCenterCard({
           {assets.length} 张
         </div>
       </div>
-      <div className="mt-4 space-y-3">
+      <div className="relative mt-4 space-y-3">
+        {busyLabel ? (
+          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[16px] bg-white/85 text-sm font-medium text-slate-700 shadow-inner">
+            <span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-slate-900" />
+            {busyLabel}
+          </div>
+        ) : null}
         <div className="rounded-[16px] border border-slate-200 bg-white p-2">
           <div className="text-[11px] font-medium text-slate-500">上：原始参考图（主图）</div>
           {rawImage ? (
@@ -3252,9 +3726,10 @@ function FourGridCenterCard({
         <button
           type="button"
           onClick={() => void onGenerate()}
-          className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800"
+          disabled={Boolean(busyLabel)}
+          className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          生成/重生成四宫格
+          {busyLabel ? "生成中..." : "生成/重生成四宫格"}
         </button>
         <button
           type="button"
@@ -3493,23 +3968,43 @@ function ReviewBoard({
           const thumbnail = taskThumbnail(item, meta);
           const timeline = timelineMap[item.id];
           const summary = timeline?.summary;
-          const recentEvents = timeline?.events.slice(-6).reverse() || [];
+          const imageSummaries = getLatestImageJobSummaries(timeline?.events || []);
+          const recentEvents = (timeline?.events || [])
+            .filter((event) => event.stage !== "image.runtime")
+            .slice(-5)
+            .reverse()
+            .map((event) => displayTimelineEvent(event, timeline?.events || []));
           const blocked = Boolean(
             summary?.last_error_message || summary?.exception_level === "blocking" || summary?.main_status === "failed",
           );
           const headline = summary?.current_step || statusText(item.main_status);
+          const modeLabel = getGenerationModeLabel(normalizeGenerationMode(item.generation_mode));
+          const titleText = detail?.title || item.title;
 
           return (
             <button key={item.id} type="button" onClick={() => onOpenDrawer(item.id)} className="text-left">
-              <article className="rounded-[24px] border border-slate-200 bg-white p-5 shadow-[0_14px_50px_rgba(15,23,42,0.06)] transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_20px_70px_rgba(15,23,42,0.08)]">
+              <article className="rounded-[24px] border border-slate-200 bg-white p-4 shadow-[0_14px_50px_rgba(15,23,42,0.06)] transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_20px_70px_rgba(15,23,42,0.08)]">
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0">
-                    <div className="text-xs text-slate-500">任务日志 · Task #{item.id}</div>
-                    <div className="mt-2 line-clamp-2 text-base font-semibold text-slate-900">
-                      {detail?.title || item.title}
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                      <span>Task #{item.id}</span>
+                      <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-slate-700">
+                        {modeLabel}
+                      </span>
                     </div>
-                    <div className="mt-2 text-xs text-slate-500">
-                      当前类目：{detail?.selected_category_id || detail?.ai?.category_best_path || "-"}
+                    <div className="mt-2 line-clamp-2 text-base font-semibold text-slate-900">
+                      {titleText}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                      <span className={["rounded-full border px-2 py-0.5", logEventStatusColor(summary?.main_status || item.main_status)].join(" ")}>
+                        {statusText(summary?.main_status || item.main_status)}
+                      </span>
+                      <span className={["rounded-full border px-2 py-0.5", logEventStatusColor(summary?.image_status || item.image_status)].join(" ")}>
+                        图片 {statusText(summary?.image_status || item.image_status)}
+                      </span>
+                      <span className={["rounded-full border px-2 py-0.5", logEventStatusColor(summary?.export_status || item.export_status)].join(" ")}>
+                        导出 {statusText(summary?.export_status || item.export_status)}
+                      </span>
                     </div>
                   </div>
                   <div className="shrink-0">
@@ -3525,9 +4020,14 @@ function ReviewBoard({
                   </div>
                 </div>
 
-                <div className="mt-4 rounded-[16px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="font-medium text-slate-900">流程日志</div>
+                    <div>
+                      <div className="font-medium text-slate-900">当前卡点</div>
+                      <div className="mt-1 line-clamp-1 text-[11px] text-slate-500">
+                        类目：{statusText(summary?.category_status || item.category_status)} / 标题：{statusText(summary?.title_status || item.title_status)}
+                      </div>
+                    </div>
                     <span
                       className={[
                         "rounded-full border px-3 py-1",
@@ -3548,7 +4048,7 @@ function ReviewBoard({
                           <div
                             className={[
                               "flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold",
-                              event.status === "success"
+                              event.status === "success" || event.status === "completed"
                                 ? "bg-emerald-100 text-emerald-700"
                                 : event.status === "running" || event.status === "started" || event.status === "queued"
                                   ? "bg-amber-100 text-amber-800"
@@ -3568,16 +4068,10 @@ function ReviewBoard({
                           <div
                             className={[
                               "rounded-full border px-2 py-0.5 text-[10px]",
-                              event.status === "success"
-                                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                : event.status === "running" || event.status === "started" || event.status === "queued"
-                                  ? "border-amber-200 bg-amber-50 text-amber-800"
-                                  : event.status === "failed" || event.status === "warning"
-                                    ? "border-rose-200 bg-rose-50 text-rose-700"
-                                    : "border-slate-200 bg-white text-slate-500",
+                              logEventStatusColor(event.status),
                             ].join(" ")}
                           >
-                            {statusText(event.status)}
+                            {event.status === "completed" ? "已完成" : statusText(event.status)}
                           </div>
                         </div>
                       ))
@@ -3589,22 +4083,28 @@ function ReviewBoard({
                   </div>
                 </div>
 
-                <div className="mt-3 grid gap-2 sm:grid-cols-2 text-xs text-slate-600">
+                <div className="mt-3 grid gap-2 text-xs text-slate-600">
                   <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-3">
-                    <div className="text-[11px] text-slate-500">本次任务记录</div>
-                    <div className="mt-1">创建：{formatDateTime(item.created_at)}</div>
-                    <div className="mt-1">主状态：{statusText(summary?.main_status || item.main_status)}</div>
-                    <div className="mt-1">图片状态：{statusText(summary?.image_status || item.image_status)}</div>
-                    <div className="mt-1">导出状态：{statusText(summary?.export_status || item.export_status)}</div>
-                  </div>
-                  <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-3">
-                    当前卡点：{headline}
-                    <div className="mt-1">
-                      {recentEvents[0]?.message ||
-                        `类目 ${statusText(summary?.category_status || item.category_status)} / 标题 ${statusText(summary?.title_status || item.title_status)}`}
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-[11px] text-slate-500">图片任务</div>
+                      <div className="text-[11px] text-slate-400">创建：{formatDateTime(item.created_at)}</div>
+                    </div>
+                    <div className="mt-2 space-y-1">
+                      {imageSummaries.length ? (
+                        imageSummaries.slice(0, 2).map((event, index) => (
+                          <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="flex items-center justify-between gap-2">
+                            <span className="line-clamp-1">{event.title}</span>
+                            <span className={["shrink-0 rounded-full border px-2 py-0.5 text-[10px]", logEventStatusColor(event.status)].join(" ")}>
+                              {event.status === "completed" ? "已完成" : statusText(event.status)}
+                            </span>
+                          </div>
+                        ))
+                      ) : (
+                        <div>未触发图片生成</div>
+                      )}
                     </div>
                   </div>
-                  <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-3 sm:col-span-2">
+                  <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-3">
                     下一步：
                     {summary?.main_status === "review_ready"
                       ? " 进入人工复核，检查标题、类目、主图轮播。"
@@ -3621,6 +4121,26 @@ function ReviewBoard({
           );
         })
       )}
+    </div>
+  );
+}
+
+function actionLoadingText(action: string): string {
+  const map: Record<string, string> = {
+    "run-ai": "AI 生成中",
+    "gen-title": "标题生成中",
+    "save-title": "标题保存中",
+    "save-category": "类目保存中",
+    "gen-4grid": "四宫格生成中",
+  };
+  return map[action] || "处理中";
+}
+
+function InlineLoadingOverlay({ label }: { label: string }) {
+  return (
+    <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[12px] bg-white/85 text-xs font-medium text-slate-700 shadow-inner">
+      <span className="mr-2 h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-300 border-t-slate-900" />
+      {label}
     </div>
   );
 }
@@ -3683,7 +4203,7 @@ function WorkbenchTable({
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="英文标题"
-                onEditPrompt={() => onOpenPromptEditor("英文标题", ["title_en", "title_en_only", "title_package_lite", "title_package", "title_en_with_cn_translation", "product_info_from_screenshot"])}
+                onEditPrompt={() => onOpenPromptEditor("英文标题", ["title_en", "title_en_only", "title_package_lite", "title_package", "product_info_from_screenshot"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">
@@ -3695,13 +4215,13 @@ function WorkbenchTable({
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="SKU 图/字段"
-                onEditPrompt={() => onOpenPromptEditor("SKU 图/字段", ["product_info_from_screenshot", "image_prompt_package"])}
+                onEditPrompt={() => onOpenPromptEditor("SKU 图/字段", ["product_info_from_screenshot", "image_prompt_main"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="主图 / 四宫格"
-                onEditPrompt={() => onOpenPromptEditor("主图 / 四宫格", ["image_prompt_main", "image_prompt_carousel_1", "image_prompt_carousel_2", "image_prompt_carousel_3", "image_prompt_carousel_4", "image_prompt_carousel_4grid", "image_prompt_package"])}
+                onEditPrompt={() => onOpenPromptEditor("主图 / 四宫格", ["image_prompt_main", "image_prompt_carousel_1", "image_prompt_carousel_2", "image_prompt_carousel_3", "image_prompt_carousel_4", "image_prompt_carousel_4grid"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">主图轮播图</th>
@@ -3729,6 +4249,7 @@ function WorkbenchTable({
               const meta = rowMeta[item.id];
               const detail = meta?.detail || null;
               const rowAction = rowLoading[item.id] || "";
+              const rowActionLabel = rowAction ? actionLoadingText(rowAction) : "";
               const thumbnail = taskThumbnail(item, meta);
               const fourGridSlotKeys = ["carousel_1", "carousel_2", "carousel_3", "carousel_4"] as const;
               const fourGridImages = fourGridSlotKeys.map((slot) => tableSlotImage(meta?.assets, meta?.raw, slot));
@@ -3806,7 +4327,10 @@ function WorkbenchTable({
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    <div className="w-[280px] space-y-2">
+                    <div className="relative w-[280px] space-y-2">
+                      {rowAction === "run-ai" || rowAction === "gen-title" ? (
+                        <InlineLoadingOverlay label={rowActionLabel} />
+                      ) : null}
                       <div className="rounded-[12px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
                         <div className="text-[11px] text-slate-500">原英文标题（采集）</div>
                         <HoverTitleText value={originalEnTitleText} />
@@ -3838,7 +4362,7 @@ function WorkbenchTable({
                           disabled={rowAction !== ""}
                           className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
                         >
-                          {rowAction === "gen-title" ? "生成中..." : "重生英文标题"}
+                          {rowAction === "gen-title" ? "生成中..." : "重生成标题"}
                         </button>
                         <button
                           type="button"
@@ -3932,7 +4456,11 @@ function WorkbenchTable({
                   <td className="px-4 py-3">
                     {hasFourGrid ? (
                       <div>
-                        <TableFourGridCell parentAsset={fourGridParent} slotImages={fourGridImages} />
+                        <TableFourGridCell
+                          parentAsset={fourGridParent}
+                          slotImages={fourGridImages}
+                          busyLabel={rowAction === "gen-4grid" ? rowActionLabel : item.image_status === "running" || item.main_status === "image_running" ? "图片生成中" : null}
+                        />
                         <div className="mt-2 flex flex-wrap gap-2">
                           <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] text-slate-600">
                             前 4 位 {visibleFourGridCount}/4
@@ -3956,9 +4484,10 @@ function WorkbenchTable({
                           <button
                             type="button"
                             onClick={() => onGenerateFourGrid(item.id)}
-                            className="rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                            disabled={rowAction !== ""}
+                            className="rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            重生成
+                            {rowAction === "gen-4grid" ? "生成中..." : "重生成"}
                           </button>
                         </div>
                       </div>
@@ -3974,15 +4503,20 @@ function WorkbenchTable({
                         <button
                           type="button"
                           onClick={() => onGenerateFourGrid(item.id)}
-                          className="rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                          disabled={rowAction !== ""}
+                          className="rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          生成四宫格
+                          {rowAction === "gen-4grid" ? "生成中..." : "生成四宫格"}
                         </button>
                       </div>
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    <TableCarouselFieldCell assets={meta?.assets} raw={meta?.raw || null} />
+                    <TableCarouselFieldCell
+                      assets={meta?.assets}
+                      raw={meta?.raw || null}
+                      busyLabel={rowAction === "gen-4grid" ? rowActionLabel : item.image_status === "running" || item.main_status === "image_running" ? "图片生成中" : null}
+                    />
                   </td>
                   <td className="px-4 py-3">
                     <div className="space-y-2">
@@ -4102,12 +4636,15 @@ function WorkbenchTable({
 function TableFourGridCell({
   parentAsset,
   slotImages,
+  busyLabel,
 }: {
   parentAsset: ProductAsset | null;
   slotImages: TableSlotImage[];
+  busyLabel?: string | null;
 }) {
   return (
-    <div className="w-[180px] space-y-2">
+    <div className="relative w-[180px] space-y-2">
+      {busyLabel ? <InlineLoadingOverlay label={busyLabel} /> : null}
       <div className="rounded-[12px] border border-amber-200 bg-amber-50 p-2">
         <div className="mb-1 text-center text-[10px] text-amber-700">四宫格母图</div>
         <div className="flex justify-center">
@@ -4129,9 +4666,11 @@ function TableFourGridCell({
 function TableCarouselFieldCell({
   assets,
   raw,
+  busyLabel,
 }: {
   assets: AssetsBySlotResponse | undefined;
   raw: RawProductDetail | null;
+  busyLabel?: string | null;
 }) {
   const carouselSlots = [
     "carousel_1",
@@ -4148,7 +4687,8 @@ function TableCarouselFieldCell({
   const visibleCount = slotImages.filter((item) => item.publicUrl).length;
 
   return (
-    <div className="w-[180px] space-y-2">
+    <div className="relative w-[180px] space-y-2">
+      {busyLabel ? <InlineLoadingOverlay label={busyLabel} /> : null}
       <div className="grid grid-cols-4 gap-1">
         {slotImages.map((image, index) => (
           <div key={image.slot} className="space-y-1">
@@ -4233,7 +4773,7 @@ function DrawerTabContent({
   }
 
   if (tab === "trace") {
-    return <TraceTab task={task} raw={raw} timeline={timeline} />;
+    return <TraceTab task={task} raw={raw} timeline={timeline} isLogsRoute={isLogsRoute} />;
   }
 
   if (isLogsRoute) {
@@ -4245,7 +4785,7 @@ function DrawerTabContent({
   }
 
   if (tab === "defaults") {
-    return <DefaultsTab task={task} />;
+    return <DefaultsTab task={task} raw={raw} />;
   }
 
   return <RawDataTab task={task} raw={raw} />;
@@ -4338,13 +4878,17 @@ function TraceTab({
   task,
   raw,
   timeline,
+  isLogsRoute,
 }: {
   task: ProductTaskDetail;
   raw: RawProductDetail | null;
   timeline: ProductTaskTimelineResponse | null;
+  isLogsRoute: boolean;
 }) {
   const allEvents = timeline?.events || [];
-  const aiEvents = allEvents.filter((event) => String(event.stage).startsWith("ai."));
+  const aiEvents = dedupeCompatAiEvents(allEvents.filter((event) => String(event.stage).startsWith("ai.")));
+  const modelEvents = aiEvents.filter(isModelCallEvent);
+  const codeStepEvents = aiEvents.filter((event) => !isModelCallEvent(event));
   const backendEvents = allEvents.filter((event) => !String(event.stage).startsWith("ai."));
   const normMode = normalizeGenerationMode(task.generation_mode);
   const categoryEvent = aiEvents.find((event) => event.stage === "ai.category_match") || null;
@@ -4360,68 +4904,56 @@ function TraceTab({
   const categoryKeywords = ((categoryOutput.category_search_keywords as unknown[]) || [])
     .map((item) => String(item || "").trim())
     .filter(Boolean);
-  const categoryPathKeywords = ((categoryOutput.suggested_category_path_keywords as unknown[]) || [])
-    .map((item) => String(item || "").trim())
-    .filter(Boolean);
-  const categorySearchQuery = String(categoryOutput.suggested_category_search_query || "").trim();
   const runtimeFromEvents =
     ((aiEvents.find((event) => event.meta?.runtime)?.meta?.runtime as Record<string, unknown> | undefined) || {});
-  const timelineEventsForDisplay = (() => {
+  const timelineEventsForDisplay = allEvents;
+  const expectedModelStages = (() => {
     const normMode = normalizeGenerationMode(task.generation_mode);
-    if (normMode !== "title_only") return allEvents;
-    return allEvents.filter((event) => {
-      const stage = String(event.stage || "");
-      return (
-        stage === "task.created" ||
-        stage === "ai.title_package" ||
-        stage === "ai.category_match" ||
-        stage === "task.current_state" ||
-        stage === "exception" ||
-        stage.startsWith("image.") ||
-        stage.startsWith("export.")
-      );
-    });
-  })();
-  const expectedAiStages = (() => {
-    const normMode = normalizeGenerationMode(task.generation_mode);
-    if (normMode === "title_only") return ["ai.title_package", "ai.category_match"];
-    if (normMode === "title_and_4grid") {
-      return ["ai.title_package", "ai.category_match", "ai.product_info", "ai.image_prompt_package"];
+    if (normMode === "title_only") {
+      return task.include_product_info
+        ? ["ai.product_info", "ai.title_package"]
+        : ["ai.title_package"];
     }
-    return ["ai.category_match"];
+    if (normMode === "title_and_4grid") {
+      return task.include_product_info
+        ? ["ai.product_info", "ai.title_package"]
+        : ["ai.title_package"];
+    }
+    return [];
   })();
   const flowPlan = (() => {
     const normMode = normalizeGenerationMode(task.generation_mode);
     if (normMode === "title_only") {
       return [
-        { label: "标题生成", value: "title_package_lite -> 一次轻量 AI 调用，返回标题 + 类目检索字段" },
+        { label: "商品理解", value: task.include_product_info ? "product_info_from_screenshot -> 先生成商品摘要，补充标题上下文" : "已关闭，标题只使用原始采集字段" },
+        { label: "标题生成", value: "title_package -> 生成中英文标题 + 类目检索关键词" },
         { label: "类目处理", value: "category_match -> 基于 AI 检索词和原始字段做代码字典召回，默认采用第 1 候选" },
       ];
     }
     if (normMode === "title_and_4grid") {
       return [
-        { label: "标题生成", value: "title_package_lite -> 基于 raw 字段做标题包和类目检索关键词" },
-        { label: "类目处理", value: "category_match -> 结合标题包和原始字段做代码字典检索" },
-        { label: "商品理解", value: "product_info_from_screenshot -> product_info（后置增强，仅服务图片）" },
-        { label: "动态图片提示词", value: "image_prompt_package -> 代码拼装商品理解/标题/类目字段，供四宫格、SKU 图、轮播主图、尺寸图使用" },
+        { label: "商品理解", value: task.include_product_info ? "product_info_from_screenshot -> 输出商品摘要和四宫格元素" : "已关闭，四宫格使用原始采集字段补上下文" },
+        { label: "标题生成", value: "title_package -> 生成中英文标题 + 类目检索关键词" },
+        { label: "类目处理", value: "category_match -> 结合标题关键词和原始字段做代码字典检索" },
+        { label: "图片提示词上下文", value: "image_prompt_package -> 代码拼装精简上下文，不调模型；真正耗 token 的是后续图片模型出图" },
         { label: "四宫格出图", value: "bootstrap -> image_prompt_carousel_4grid -> 自动生成母图并裁切 carousel_1~4" },
       ];
     }
     return [{ label: "当前模式", value: "task_only，不触发 AI，只保留原始采集和人工处理。" }];
   })();
-  const totalPromptTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.prompt_tokens || 0), 0);
-  const totalCompletionTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.completion_tokens || 0), 0);
-  const totalTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.total_tokens || 0), 0);
-  const totalEstimatedCost = aiEvents.reduce((sum, event) => {
+  const totalPromptTokens = modelEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.prompt_tokens || 0), 0);
+  const totalCompletionTokens = modelEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.completion_tokens || 0), 0);
+  const totalTokens = modelEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.total_tokens || 0), 0);
+  const totalEstimatedCost = modelEvents.reduce((sum, event) => {
     const cost = Number((event.meta?.cost as Record<string, unknown> | undefined)?.estimated_cost);
     return sum + (Number.isFinite(cost) ? cost : 0);
   }, 0);
   const costCurrency = String(
-    ((aiEvents.find((event) => (event.meta?.cost as Record<string, unknown> | undefined)?.currency)?.meta?.cost as Record<string, unknown> | undefined)?.currency ||
+    ((modelEvents.find((event) => (event.meta?.cost as Record<string, unknown> | undefined)?.currency)?.meta?.cost as Record<string, unknown> | undefined)?.currency ||
       (runtimeFromEvents.pricing as Record<string, unknown> | undefined)?.currency ||
       "USD"),
   );
-  const aiStepRows = aiEvents.map((event) => {
+  const aiStepRows = modelEvents.map((event) => {
     const runtime = (event.meta?.runtime as Record<string, unknown> | undefined) || {};
     const promptTemplate = (event.meta?.prompt_template as Record<string, unknown> | undefined) || {};
     const usage = (event.meta?.usage as Record<string, unknown> | undefined) || {};
@@ -4457,10 +4989,10 @@ function TraceTab({
     {
       key: "product_info",
       label: "商品理解",
-      hint: normMode === "title_only" ? "当前模式应跳过该步骤，不应调用商品理解 AI。" : "是否跑过商品理解 / 截图理解。",
+      hint: task.include_product_info ? "是否跑过商品理解 / 截图理解。" : "创建任务时已关闭商品理解。",
       done: aiEvents.some((event) => event.stage === "ai.product_info" && event.status === "success"),
       status:
-        normMode === "title_only"
+        !task.include_product_info || normMode === "task_only"
           ? "skipped"
           : task.main_status === "failed" && task.title_status === "failed"
             ? "failed"
@@ -4471,7 +5003,7 @@ function TraceTab({
     {
       key: "category_match",
       label: "类目处理",
-      hint: normMode === "title_only" ? "应由代码字典直接产出候选类目，不依赖商品理解 AI。" : "是否产出类目候选或人工采用类目。",
+      hint: "是否基于标题检索关键词和原始字段产出候选类目。",
       done: aiEvents.some((event) => event.stage === "ai.category_match" && event.status === "success") || Boolean(task.selected_category_id),
       status: task.category_status,
     },
@@ -4484,7 +5016,7 @@ function TraceTab({
     },
     {
       key: "image_prompt_package",
-      label: "图片提示词",
+      label: "图片提示词上下文",
       hint:
         normMode === "title_only"
           ? "当前模式应跳过该步骤。"
@@ -4547,6 +5079,287 @@ function TraceTab({
       status: task.export_status,
     },
   ];
+  const compactImageSummaries = getLatestImageJobSummaries(allEvents);
+  const compactTimelineEvents = timelineEventsForDisplay
+    .map((event) => displayTimelineEvent(event, allEvents));
+
+  if (isLogsRoute) {
+    return (
+      <div className="space-y-4">
+        <section className="rounded-[22px] border border-slate-200 bg-slate-950 p-5 text-white">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="text-xs text-slate-300">Task #{task.id} / Raw #{task.raw_product_id}</div>
+              <div className="mt-2 line-clamp-2 text-xl font-semibold">{task.title}</div>
+              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                <span className="rounded-full border border-white/20 bg-white/10 px-3 py-1">
+                  {getGenerationModeLabel(normMode)}
+                </span>
+                <span className="rounded-full border border-white/20 bg-white/10 px-3 py-1">
+                  当前：{timeline?.summary.current_step || statusText(task.main_status)}
+                </span>
+                <span className="rounded-full border border-white/20 bg-white/10 px-3 py-1">
+                  创建：{formatDateTime(task.created_at)}
+                </span>
+              </div>
+            </div>
+            <div className="grid min-w-[260px] gap-2 text-xs sm:grid-cols-2">
+              {[
+                ["主状态", statusText(task.main_status)],
+                ["类目", statusText(task.category_status)],
+                ["标题", statusText(task.title_status)],
+                ["图片", statusText(task.image_status)],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded-[14px] border border-white/10 bg-white/10 px-3 py-2">
+                  <div className="text-slate-300">{label}</div>
+                  <div className="mt-1 font-medium text-white">{value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          {task.last_error_message ? (
+            <div className="mt-4 rounded-[16px] border border-rose-300/30 bg-rose-500/15 p-3 text-sm text-rose-100">
+              最后报错：{task.last_error_message}
+            </div>
+          ) : null}
+        </section>
+
+        <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+          <div className="rounded-[22px] border border-slate-200 bg-white p-5">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">默认链路</div>
+                <div className="mt-1 text-xs text-slate-500">只看创建任务后默认会跑的步骤，按当前模式判断跳过项。</div>
+              </div>
+              <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600">
+                {normMode}
+              </span>
+            </div>
+            <div className="mt-4 space-y-3">
+              {defaultChainChecks.map((item, index) => (
+                <div key={item.key} className="grid grid-cols-[28px_1fr_auto] gap-3 rounded-[16px] border border-slate-200 bg-slate-50 p-3">
+                  <div className={["flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold", item.done ? "bg-emerald-100 text-emerald-700" : String(item.status) === "failed" ? "bg-rose-100 text-rose-700" : String(item.status) === "running" ? "bg-amber-100 text-amber-800" : "bg-slate-200 text-slate-500"].join(" ")}>
+                    {index + 1}
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium text-slate-900">{item.label}</div>
+                    <div className="mt-1 text-xs leading-5 text-slate-500">{item.hint}</div>
+                  </div>
+                  <span className={["h-fit rounded-full border px-2 py-0.5 text-[11px]", item.done ? "border-emerald-200 bg-white text-emerald-700" : logEventStatusColor(String(item.status))].join(" ")}>
+                    {String(item.status) === "skipped" ? "按模式跳过" : item.done ? "已完成" : statusText(String(item.status))}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-[22px] border border-slate-200 bg-white p-5">
+            <div className="text-sm font-semibold text-slate-900">主动触发项</div>
+            <div className="mt-1 text-xs text-slate-500">图片生成和导出草稿不是所有模式都会自动执行，优先按这里判断是否真的触发过。</div>
+            <div className="mt-4 space-y-3">
+              {followupChecks.map((item) => (
+                <div key={item.key} className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium text-slate-900">{item.label}</div>
+                    <span className={["rounded-full border px-2 py-0.5 text-[11px]", item.done ? "border-emerald-200 bg-white text-emerald-700" : logEventStatusColor(String(item.status))].join(" ")}>
+                      {item.done ? "已触发" : "未触发"}
+                    </span>
+                  </div>
+                  <div className="mt-2 text-xs leading-5 text-slate-600">{item.hint}</div>
+                </div>
+              ))}
+              <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+                <div className="text-sm font-medium text-slate-900">图片任务结果</div>
+                <div className="mt-3 space-y-2">
+                  {compactImageSummaries.length ? (
+                    compactImageSummaries.map((event, index) => (
+                      <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[14px] border border-slate-200 bg-white p-3 text-xs">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="font-medium text-slate-800">{event.title}</div>
+                            <div className="mt-1 line-clamp-1 text-slate-500">{event.message}</div>
+                            <div className="mt-1 text-slate-500">
+                              {String(event.meta?.provider || "-")} / {String(event.meta?.model_name || "-")}
+                              {event.meta?.estimated_cost != null
+                                ? ` · 预估 ${formatMoney(event.meta.estimated_cost, String(event.meta.currency || "USD"))}`
+                                : ""}
+                            </div>
+                          </div>
+                          <span className={["shrink-0 rounded-full border px-2 py-0.5 text-[11px]", logEventStatusColor(event.status)].join(" ")}>
+                            {event.status === "completed" ? "已完成" : statusText(event.status)}
+                          </span>
+                        </div>
+                        <details className="mt-2 rounded-[12px] border border-slate-200 bg-slate-50">
+                          <summary className="cursor-pointer list-none px-3 py-2 text-[11px] text-slate-600">
+                            查看四宫格返回 / Prompt
+                          </summary>
+                          <div className="border-t border-slate-200 p-3">
+                            <div className="text-[11px] font-medium text-slate-500">输出资产</div>
+                            <pre className="mt-1 max-h-[120px] overflow-auto rounded-[10px] bg-white p-2 text-[11px] text-slate-700">
+                              {formatJson({
+                                parent_asset_id: event.meta?.parent_asset_id,
+                                output_asset_ids: event.meta?.output_asset_ids,
+                                error_message: event.meta?.error_message,
+                              })}
+                            </pre>
+                            <div className="mt-3 text-[11px] font-medium text-slate-500">最终生图 Prompt</div>
+                            <pre className="mt-1 max-h-[220px] overflow-auto rounded-[10px] bg-white p-2 text-[11px] text-slate-700">
+                              {String(event.meta?.final_prompt || "-")}
+                            </pre>
+                          </div>
+                        </details>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-slate-500">暂无图片任务记录。</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <Section title="全流程时间线">
+          {compactTimelineEvents.length ? (
+            <div className="space-y-3">
+              {compactTimelineEvents.map((event, index) => (
+                <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[16px] border border-slate-200 bg-white p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-500">
+                          #{index + 1}
+                        </span>
+                        <span className="text-sm font-medium text-slate-900">{event.title}</span>
+                        <span className={["rounded-full border px-2 py-0.5 text-[11px]", logEventStatusColor(event.status)].join(" ")}>
+                          {event.status === "completed" ? "已完成" : statusText(event.status)}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        {formatDateTime(event.ts)} · {event.stage}
+                      </div>
+                      <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-700">{event.message}</div>
+                      {isModelCallEvent(event) ? (
+                        <div className="mt-2 rounded-[12px] border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+                          {modelCallSummary(event, costCurrency)}
+                        </div>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void copyTraceEvent(event)}
+                      className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                    >
+                      复制事件
+                    </button>
+                  </div>
+                  <details className="mt-3 rounded-[14px] border border-slate-200 bg-slate-50">
+                    <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                      查看元数据
+                    </summary>
+                    <pre className="overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                      {formatJson(event.meta)}
+                    </pre>
+                  </details>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-slate-600">暂无时间线事件</div>
+          )}
+        </Section>
+
+        <Section title="模型调用明细">
+          <div className="mb-3 grid gap-3 md:grid-cols-3">
+            <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+              <div className="text-xs text-slate-500">本次模型调用</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">{modelEvents.length} 次</div>
+            </div>
+            <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+              <div className="text-xs text-slate-500">Tokens</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {totalTokens ? `${formatInteger(totalTokens)}（in ${formatInteger(totalPromptTokens)} / out ${formatInteger(totalCompletionTokens)}）` : "-"}
+              </div>
+            </div>
+            <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+              <div className="text-xs text-slate-500">预估费用</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {totalEstimatedCost ? formatMoney(totalEstimatedCost, costCurrency) : "-"}
+              </div>
+            </div>
+          </div>
+          {modelEvents.length ? (
+            <div className="space-y-3">
+              {modelEvents.map((event, index) => (
+                <details key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[16px] border border-slate-200 bg-white">
+                  <summary className="cursor-pointer list-none px-4 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium text-slate-900">{event.title}</div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          {formatDateTime(event.ts)} · {event.stage} · {String(event.meta?.prompt_type || "-")}
+                        </div>
+                        <div className="mt-1 text-xs text-slate-700">
+                          {modelCallSummary(event, costCurrency)}
+                        </div>
+                      </div>
+                      <span className={["rounded-full border px-2 py-0.5 text-[11px]", logEventStatusColor(event.status)].join(" ")}>
+                        {statusText(event.status)}
+                      </span>
+                    </div>
+                  </summary>
+                  <div className="grid gap-3 border-t border-slate-200 p-4 xl:grid-cols-3">
+                    <pre className="max-h-[360px] overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                      {formatJson(event.meta?.input)}
+                    </pre>
+                    <pre className="max-h-[360px] overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                      {typeof event.meta?.prompt === "string" && event.meta.prompt ? event.meta.prompt : "-"}
+                    </pre>
+                    <pre className="max-h-[360px] overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                      {formatJson(event.meta?.output)}
+                    </pre>
+                  </div>
+                </details>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-slate-600">暂无真实模型调用记录。代码召回、动态图片提示词上下文不会计入这里。</div>
+          )}
+        </Section>
+
+        <Section title="代码处理步骤">
+          {codeStepEvents.length ? (
+            <div className="space-y-3">
+              {codeStepEvents.map((event, index) => (
+                <div key={`${event.stage}-${event.ts || "na"}-${index}`} className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium text-slate-900">{event.title}</div>
+                      <div className="mt-1 text-xs text-slate-500">{formatDateTime(event.ts)} · {event.stage}</div>
+                      <div className="mt-2 text-sm text-slate-700">{event.message}</div>
+                    </div>
+                    <span className={["rounded-full border px-2 py-0.5 text-[11px]", logEventStatusColor(event.status)].join(" ")}>
+                      {statusText(event.status)}
+                    </span>
+                  </div>
+                  <details className="mt-3 rounded-[14px] border border-slate-200 bg-white">
+                    <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600">
+                      查看代码步骤输出
+                    </summary>
+                    <pre className="max-h-[360px] overflow-auto border-t border-slate-200 p-3 text-xs text-slate-700">
+                      {formatJson(event.meta?.output)}
+                    </pre>
+                  </details>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-slate-600">暂无代码处理步骤。</div>
+          )}
+        </Section>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -4603,8 +5416,8 @@ function TraceTab({
             items={
               normMode === "title_only"
                 ? [
-                    { label: "模式定义", value: "1 次轻量标题 AI + 代码类目召回 + 原始素材回显" },
-                    { label: "默认 AI 次数", value: "1 次" },
+                    { label: "模式定义", value: task.include_product_info ? "商品理解 + 中英文标题 + 代码类目召回" : "中英文标题 + 代码类目召回" },
+                    { label: "默认 AI 次数", value: task.include_product_info ? "2 次" : "1 次" },
                     { label: "默认图片生成", value: "0 次" },
                     { label: "默认结果", value: "标题、类目检索字段、默认第 1 候选类目" },
                   ]
@@ -4656,9 +5469,7 @@ function TraceTab({
             title="AI 检索字段"
             tone="ai"
             items={[
-              { label: "搜索短语", value: categorySearchQuery || "-" },
               { label: "检索关键词", value: categoryKeywords.length ? categoryKeywords.join(" / ") : "-" },
-              { label: "路径关键词", value: categoryPathKeywords.length ? categoryPathKeywords.join(" / ") : "-" },
               { label: "类目置信度", value: categoryOutput.confidence != null ? String(categoryOutput.confidence) : "-" },
             ]}
           />
@@ -4751,7 +5562,7 @@ function TraceTab({
             title="当前排查重点"
             tone="raw"
             items={[
-              { label: "AI / 代码步骤", value: `${aiEvents.length} / ${expectedAiStages.length}` },
+              { label: "模型 / 代码步骤", value: `${modelEvents.length} / ${codeStepEvents.length}` },
               { label: "后端动作数", value: String(backendEvents.length) },
               { label: "预估费用", value: totalEstimatedCost ? formatMoney(totalEstimatedCost, costCurrency) : "-" },
               { label: "最后报错", value: task.last_error_message || "-" },
@@ -4962,10 +5773,10 @@ function TraceTab({
         )}
       </Section>
 
-      <Section title="AI 调用明细">
-        {aiEvents.length ? (
+      <Section title="模型调用明细">
+        {modelEvents.length ? (
           <div className="space-y-4">
-            {aiEvents.map((event, index) => {
+            {modelEvents.map((event, index) => {
               const runtime = (event.meta?.runtime as Record<string, unknown> | undefined) || {};
               const promptTemplate = (event.meta?.prompt_template as Record<string, unknown> | undefined) || {};
               const usage = (event.meta?.usage as Record<string, unknown> | undefined) || {};
@@ -5054,7 +5865,7 @@ function TraceTab({
                       tone="ai"
                       items={[
                         { label: "状态", value: statusText(event.status) },
-                        { label: "模式应执行", value: expectedAiStages.includes(event.stage) ? "是" : "否" },
+                        { label: "模式应执行", value: expectedModelStages.includes(event.stage) ? "是" : "否" },
                         { label: "时间", value: formatDateTime(event.ts) },
                         { label: "错误", value: event.meta?.error ? String(event.meta.error) : "-" },
                       ]}
@@ -5098,7 +5909,7 @@ function TraceTab({
             })}
           </div>
         ) : (
-          <div className="text-sm text-slate-600">暂无 AI 调用记录</div>
+          <div className="text-sm text-slate-600">暂无模型调用记录</div>
         )}
       </Section>
 
@@ -5219,9 +6030,9 @@ function InfoTab({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-title-en-only`, {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-titles`, {
         method: "POST",
-        headers: buildAiRequestHeaders(),
+        headers: buildAiRequestHeaders(false, ["title_package_lite", "title"]),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (err) {
@@ -5271,15 +6082,15 @@ function InfoTab({
     }
   }
 
-  const productInfoSummary = task.ai?.product_info as
+  const titlePackageSummary = task.ai?.title_package as
     | {
-        product_core?: Record<string, unknown>;
-        category_search?: Record<string, unknown>;
-        temu_category_search?: Record<string, unknown>;
-        image_basis?: Record<string, unknown>;
+        category_search_keywords?: unknown[];
       }
     | null
     | undefined;
+  const titleCategoryKeywords = ((titlePackageSummary?.category_search_keywords as unknown[]) || [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
   const categoryCandidates =
     task.ai?.category_candidates?.length ? task.ai.category_candidates : ((task.category_candidates_json as { path: string; score?: number | null }[]) || []);
   const preferredCategoryPaths = [
@@ -5318,8 +6129,7 @@ function InfoTab({
               {
                 label: "类目检索词",
                 value:
-                  String((productInfoSummary?.temu_category_search || {}).core_leaf_terms_cn || "") ||
-                  String((productInfoSummary?.category_search || {}).core_leaf_term || "") ||
+                  titleCategoryKeywords.join("\n") ||
                   categoryCandidates.map((item) => item.path).join("\n") ||
                   "-",
               },
@@ -5442,7 +6252,7 @@ function InfoTab({
                 disabled={loading}
                 className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
               >
-                重生英文标题
+                重生成标题
               </button>
             </div>
           </div>
@@ -5609,54 +6419,169 @@ function InfoTab({
   );
 }
 
-function DefaultsTab({ task }: { task: ProductTaskDetail }) {
+type DynamicPair = {
+  id: string;
+  key: string;
+  value: string;
+};
+
+type SkuDraftRow = {
+  id: string;
+  skuCode: string;
+  spec1: string;
+  spec2: string;
+  quantity: string;
+  unit: string;
+  price: string;
+  stock: string;
+  weight: string;
+  length: string;
+  width: string;
+  height: string;
+};
+
+type SensitiveDraftRow = {
+  id: string;
+  type: string;
+  value: string;
+  remark: string;
+};
+
+function makeDraftId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function buildSkuRowsFromRawSkuProps(task: ProductTaskDetail, raw: RawProductDetail | null): SkuDraftRow[] {
+  const items = normalizeRawSkuProps(raw?.sku_props)
+    .filter((item) => item.group_name || item.option_name || item.image_url)
+    .sort((left, right) => (left.group_index - right.group_index) || (left.option_index - right.option_index));
+  if (!items.length) return [];
+
+  const firstGroupName = items[0]?.group_name || "";
+  const rows = items
+    .filter((item) => item.group_name === firstGroupName)
+    .map((item, index) => {
+      const specValue = item.option_name || item.hint_text || `选项${index + 1}`;
+      const baseCode = String(raw?.platform_sku || task.platform_sku || raw?.source_id || task.source_id || "").trim();
+      return {
+        id: makeDraftId("sku"),
+        skuCode: [baseCode, specValue].filter(Boolean).join("-"),
+        spec1: specValue,
+        spec2: "",
+        quantity: "1",
+        unit: "件",
+        price: "",
+        stock: "",
+        weight: "",
+        length: "",
+        width: "",
+        height: "",
+      };
+    });
+  return rows;
+}
+
+function readJsonArrayField<T>(fields: Record<string, unknown>, key: string): T[] {
+  const raw = fields[key];
+  if (Array.isArray(raw)) return raw as T[];
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed as T[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function nonEmptyPairs(rows: DynamicPair[]): DynamicPair[] {
+  return rows
+    .map((row) => ({ ...row, key: row.key.trim(), value: row.value.trim() }))
+    .filter((row) => row.key || row.value);
+}
+
+function nonEmptySkuRows(rows: SkuDraftRow[]): SkuDraftRow[] {
+  return rows
+    .map((row) => ({
+      ...row,
+      skuCode: row.skuCode.trim(),
+      spec1: row.spec1.trim(),
+      spec2: row.spec2.trim(),
+      quantity: row.quantity.trim(),
+      unit: row.unit.trim(),
+      price: row.price.trim(),
+      stock: row.stock.trim(),
+      weight: row.weight.trim(),
+      length: row.length.trim(),
+      width: row.width.trim(),
+      height: row.height.trim(),
+    }))
+    .filter((row) => row.skuCode || row.spec1 || row.spec2 || row.quantity || row.price || row.stock || row.weight || row.length || row.width || row.height);
+}
+
+function nonEmptySensitiveRows(rows: SensitiveDraftRow[]): SensitiveDraftRow[] {
+  return rows
+    .map((row) => ({ ...row, type: row.type.trim(), value: row.value.trim(), remark: row.remark.trim() }))
+    .filter((row) => row.type || row.value || row.remark);
+}
+
+function DefaultSummaryCard({ label, value, hint }: { label: string; value: string | number; hint: string }) {
+  return (
+    <div className="rounded-[14px] border border-slate-200 bg-slate-50 p-3">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="mt-1 text-lg font-semibold text-slate-950">{value}</div>
+      <div className="mt-1 truncate text-[11px] text-slate-500">{hint}</div>
+    </div>
+  );
+}
+
+function DefaultsTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDetail | null }) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [draft, setDraft] = useState<ExportFieldDraft | null>(null);
-  const [editingField, setEditingField] = useState<string | null>(null);
-  const [editValue, setEditValue] = useState("");
-
-  // 表单状态 - 基础设置
-  const [jingYingZhanDian, setJingYingZhanDian] = useState("美国站");
-  const [faHuoCang, setFaHuoCang] = useState("美国-饰品");
-  const [chengNuoFaHuoShiXiao, setChengNuoFaHuoShiXiao] = useState("7个工作日内发货");
-  const [suCaiYuYan, setSuCaiYuYan] = useState("英语");
-  const [chanPinChanDi, setChanPinChanDi] = useState("中国");
-  const [chanDiShengFen, setChanDiShengFen] = useState("广东省");
-
-  // 表单状态 - SKU规格
-  const [moRenGuiGeLeiXing, setMoRenGuiGeLeiXing] = useState("款式/颜色");
-  const [skuFenLei, setSkuFenLei] = useState("单品");
-  const [skuShuLiang, setSkuShuLiang] = useState("1");
-  const [skuShuLiangDanWei, setSkuShuLiangDanWei] = useState("件");
-  const [shiFouDuLiBaoZhuang, setShiFouDuLiBaoZhuang] = useState("是");
-  const [guiGe1NeiRong, setGuiGe1NeiRong] = useState("");
-  const [guiGe2NeiRong, setGuiGe2NeiRong] = useState("");
-
-  // 表单状态 - 敏感属性
-  const [minGanShuXing1, setMinGanShuXing1] = useState("");
-  const [minGanShuXing2, setMinGanShuXing2] = useState("");
-  const [minGanShuXing3, setMinGanShuXing3] = useState("");
-  const [yeTiRongLiang, setYeTiRongLiang] = useState("");
-  const [daoJuChangDu, setDaoJuChangDu] = useState("");
-  const [daoJuJianDu, setDaoJuJianDu] = useState("");
-  const [chuDianRongLiang, setChuDianRongLiang] = useState("");
-
-  // 表单状态 - 体积重量
-  const [zuiChangBian, setZuiChangBian] = useState("10");
-  const [ciChangBian, setCiChangBian] = useState("8");
-  const [zuiDuanBian, setZuiDuanBian] = useState("2");
-  const [zhongLiang, setZhongLiang] = useState("30");
-
-  // 价格状态
-  const [shenBaoJia, setShenBaoJia] = useState("");
-  const [jianYiShouJia, setJianYiShouJia] = useState("");
+  const [site, setSite] = useState("美国站");
+  const [warehouse, setWarehouse] = useState("美国-饰品");
+  const [leadTime, setLeadTime] = useState("7个工作日内发货");
+  const [originCountry, setOriginCountry] = useState("中国");
+  const [originProvince, setOriginProvince] = useState("广东省");
+  const [declaredPrice, setDeclaredPrice] = useState("");
+  const [suggestedPrice, setSuggestedPrice] = useState("");
+  const [specType, setSpecType] = useState("款式/颜色");
+  const [skuClass, setSkuClass] = useState("单品");
+  const [independentPackage, setIndependentPackage] = useState("是");
+  const [packageLength, setPackageLength] = useState("10");
+  const [packageWidth, setPackageWidth] = useState("8");
+  const [packageHeight, setPackageHeight] = useState("2");
+  const [packageWeight, setPackageWeight] = useState("30");
+  const [attributes, setAttributes] = useState<DynamicPair[]>([
+    { id: makeDraftId("attr"), key: "主体材质", value: "" },
+    { id: makeDraftId("attr"), key: "颜色", value: "" },
+  ]);
+  const [skuRows, setSkuRows] = useState<SkuDraftRow[]>([
+    {
+      id: makeDraftId("sku"),
+      skuCode: "",
+      spec1: "",
+      spec2: "",
+      quantity: "1",
+      unit: "件",
+      price: "",
+      stock: "",
+      weight: "",
+      length: "",
+      width: "",
+      height: "",
+    },
+  ]);
+  const [sensitiveRows, setSensitiveRows] = useState<SensitiveDraftRow[]>([
+    { id: makeDraftId("sensitive"), type: "", value: "", remark: "" },
+  ]);
 
   async function loadDefaults(): Promise<void> {
     setLoading(true);
     setError(null);
+    setSuccess(null);
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/export-fields/preview`, { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -5664,33 +6589,101 @@ function DefaultsTab({ task }: { task: ProductTaskDetail }) {
       const fields = data.draft?.fields_json || {};
       setDraft(data.draft || null);
 
-      // 从已有字段加载值
-      if (fields["经营站点"]) setJingYingZhanDian(String(fields["经营站点"]));
-      if (fields["发货仓"]) setFaHuoCang(String(fields["发货仓"]));
-      if (fields["承诺发货时效"]) setChengNuoFaHuoShiXiao(String(fields["承诺发货时效"]));
-      if (fields["素材语言"]) setSuCaiYuYan(String(fields["素材语言"]));
-      if (fields["商品产地"]) setChanPinChanDi(String(fields["商品产地"]));
-      if (fields["产地省份"]) setChanDiShengFen(String(fields["产地省份"]));
-      if (fields["默认规格类型"]) setMoRenGuiGeLeiXing(String(fields["默认规格类型"]));
-      if (fields["SKU分类"]) setSkuFenLei(String(fields["SKU分类"]));
-      if (fields["SKU数量"]) setSkuShuLiang(String(fields["SKU数量"]));
-      if (fields["SKU数量单位"]) setSkuShuLiangDanWei(String(fields["SKU数量单位"]));
-      if (fields["是否独立包装"]) setShiFouDuLiBaoZhuang(String(fields["是否独立包装"]));
-      if (fields["规格1内容"]) setGuiGe1NeiRong(String(fields["规格1内容"]));
-      if (fields["规格2内容"]) setGuiGe2NeiRong(String(fields["规格2内容"]));
-      if (fields["敏感词属性1"]) setMinGanShuXing1(String(fields["敏感词属性1"]));
-      if (fields["敏感词属性2"]) setMinGanShuXing2(String(fields["敏感词属性2"]));
-      if (fields["敏感词属性3"]) setMinGanShuXing3(String(fields["敏感词属性3"]));
-      if (fields["液体容量（ml）"]) setYeTiRongLiang(String(fields["液体容量（ml）"]));
-      if (fields["刀具长度(cm)"]) setDaoJuChangDu(String(fields["刀具长度(cm)"]));
-      if (fields["刀尖角度(度)"]) setDaoJuJianDu(String(fields["刀尖角度(度)"]));
-      if (fields["储电容量（wh）"]) setChuDianRongLiang(String(fields["储电容量（wh）"]));
-      if (fields["最长边（cm）"]) setZuiChangBian(String(fields["最长边（cm）"]));
-      if (fields["次长边（cm）"]) setCiChangBian(String(fields["次长边（cm）"]));
-      if (fields["最短边（cm）"]) setZuiDuanBian(String(fields["最短边（cm）"]));
-      if (fields["重量（g）"]) setZhongLiang(String(fields["重量（g）"]));
-      if (fields["申报价CNY"]) setShenBaoJia(String(fields["申报价CNY"]));
-      if (fields["建议售价CNY"]) setJianYiShouJia(String(fields["建议售价CNY"]));
+      if (fields["经营站点"]) setSite(String(fields["经营站点"]));
+      if (fields["发货仓"]) setWarehouse(String(fields["发货仓"]));
+      if (fields["承诺发货时效"]) setLeadTime(String(fields["承诺发货时效"]));
+      if (fields["商品产地"]) setOriginCountry(String(fields["商品产地"]));
+      if (fields["产地省份"]) setOriginProvince(String(fields["产地省份"]));
+      if (fields["申报价CNY"]) setDeclaredPrice(String(fields["申报价CNY"]));
+      if (fields["建议售价CNY"]) setSuggestedPrice(String(fields["建议售价CNY"]));
+      if (fields["默认规格类型"]) setSpecType(String(fields["默认规格类型"]));
+      else {
+        const inferredSpecType = buildSpecTypeFromRawSkuProps(raw?.sku_props);
+        if (inferredSpecType) setSpecType(inferredSpecType);
+      }
+      if (fields["SKU分类"]) setSkuClass(String(fields["SKU分类"]));
+      if (fields["是否独立包装"]) setIndependentPackage(String(fields["是否独立包装"]));
+      if (fields["最长边（cm）"]) setPackageLength(String(fields["最长边（cm）"]));
+      if (fields["次长边（cm）"]) setPackageWidth(String(fields["次长边（cm）"]));
+      if (fields["最短边（cm）"]) setPackageHeight(String(fields["最短边（cm）"]));
+      if (fields["重量（g）"]) setPackageWeight(String(fields["重量（g）"]));
+
+      const savedAttributes = readJsonArrayField<DynamicPair>(fields, "商品属性明细");
+      if (savedAttributes.length) {
+        setAttributes(savedAttributes.map((row) => ({ id: row.id || makeDraftId("attr"), key: String(row.key || ""), value: String(row.value || "") })));
+      } else {
+        const seededAttributes = ["主体材质", "颜色", "适用场景", "风格"]
+          .filter((key) => fields[key] !== undefined && fields[key] !== null && String(fields[key]).trim())
+          .map((key) => ({ id: makeDraftId("attr"), key, value: String(fields[key] || "") }));
+        setAttributes(seededAttributes.length ? seededAttributes : [
+          { id: makeDraftId("attr"), key: "主体材质", value: String(fields["主体材质"] || "") },
+          { id: makeDraftId("attr"), key: "颜色", value: String(fields["颜色"] || "") },
+        ]);
+      }
+
+      const savedSkuRows = readJsonArrayField<SkuDraftRow>(fields, "SKU信息明细");
+      if (savedSkuRows.length) {
+        setSkuRows(savedSkuRows.map((row) => ({
+          id: row.id || makeDraftId("sku"),
+          skuCode: String(row.skuCode || ""),
+          spec1: String(row.spec1 || ""),
+          spec2: String(row.spec2 || ""),
+          quantity: String(row.quantity || ""),
+          unit: String(row.unit || "件"),
+          price: String(row.price || ""),
+          stock: String(row.stock || ""),
+          weight: String(row.weight || ""),
+          length: String(row.length || ""),
+          width: String(row.width || ""),
+          height: String(row.height || ""),
+        })));
+      } else {
+        const seededSkuRows = buildSkuRowsFromRawSkuProps(task, raw);
+        if (seededSkuRows.length) {
+          setSkuRows(seededSkuRows.map((row) => ({
+            ...row,
+            quantity: String(fields["SKU数量"] || row.quantity || "1"),
+            unit: String(fields["SKU数量单位"] || row.unit || "件"),
+            price: String(fields["建议售价CNY"] || row.price || ""),
+            stock: String(fields["库存"] || row.stock || ""),
+            weight: String(fields["重量（g）"] || row.weight || ""),
+            length: String(fields["最长边（cm）"] || row.length || ""),
+            width: String(fields["次长边（cm）"] || row.width || ""),
+            height: String(fields["最短边（cm）"] || row.height || ""),
+          })));
+        } else {
+          setSkuRows([{
+            id: makeDraftId("sku"),
+            skuCode: String(fields["SKU货号"] || task.platform_sku || task.source_id || ""),
+            spec1: String(fields["规格1内容"] || ""),
+            spec2: String(fields["规格2内容"] || ""),
+            quantity: String(fields["SKU数量"] || "1"),
+            unit: String(fields["SKU数量单位"] || "件"),
+            price: String(fields["建议售价CNY"] || ""),
+            stock: String(fields["库存"] || ""),
+            weight: String(fields["重量（g）"] || ""),
+            length: String(fields["最长边（cm）"] || ""),
+            width: String(fields["次长边（cm）"] || ""),
+            height: String(fields["最短边（cm）"] || ""),
+          }]);
+        }
+      }
+
+      const savedSensitiveRows = readJsonArrayField<SensitiveDraftRow>(fields, "敏感属性明细");
+      if (savedSensitiveRows.length) {
+        setSensitiveRows(savedSensitiveRows.map((row) => ({
+          id: row.id || makeDraftId("sensitive"),
+          type: String(row.type || ""),
+          value: String(row.value || ""),
+          remark: String(row.remark || ""),
+        })));
+      } else {
+        const rows = ["敏感词属性1", "敏感词属性2", "敏感词属性3"]
+          .map((key) => String(fields[key] || "").trim())
+          .filter(Boolean)
+          .map((type) => ({ id: makeDraftId("sensitive"), type, value: "", remark: "" }));
+        setSensitiveRows(rows.length ? rows : [{ id: makeDraftId("sensitive"), type: "", value: "", remark: "" }]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -5708,35 +6701,49 @@ function DefaultsTab({ task }: { task: ProductTaskDetail }) {
     setError(null);
     setSuccess(null);
     try {
+      const cleanAttributes = nonEmptyPairs(attributes);
+      const cleanSkuRows = nonEmptySkuRows(skuRows);
+      const cleanSensitiveRows = nonEmptySensitiveRows(sensitiveRows);
       const fields: Record<string, string> = {
-        "经营站点": jingYingZhanDian,
-        "发货仓": faHuoCang,
-        "承诺发货时效": chengNuoFaHuoShiXiao,
-        "素材语言": suCaiYuYan,
-        "商品产地": chanPinChanDi,
-        "产地省份": chanDiShengFen,
-        "默认规格类型": moRenGuiGeLeiXing,
-        "SKU分类": skuFenLei,
-        "SKU数量": skuShuLiang,
-        "SKU数量单位": skuShuLiangDanWei,
-        "是否独立包装": shiFouDuLiBaoZhuang,
-        "规格1内容": guiGe1NeiRong,
-        "规格2内容": guiGe2NeiRong,
-        "敏感词属性1": minGanShuXing1,
-        "敏感词属性2": minGanShuXing2,
-        "敏感词属性3": minGanShuXing3,
-        "最长边（cm）": zuiChangBian,
-        "次长边（cm）": ciChangBian,
-        "最短边（cm）": zuiDuanBian,
-        "重量（g）": zhongLiang,
+        "经营站点": site,
+        "发货仓": warehouse,
+        "承诺发货时效": leadTime,
+        "商品产地": originCountry,
+        "产地省份": originProvince,
+        "默认规格类型": specType,
+        "SKU分类": skuClass,
+        "是否独立包装": independentPackage,
+        "最长边（cm）": packageLength,
+        "次长边（cm）": packageWidth,
+        "最短边（cm）": packageHeight,
+        "重量（g）": packageWeight,
+        "商品属性明细": JSON.stringify(cleanAttributes),
+        "SKU信息明细": JSON.stringify(cleanSkuRows),
+        "敏感属性明细": JSON.stringify(cleanSensitiveRows),
       };
-      if (shenBaoJia) fields["申报价CNY"] = shenBaoJia;
-      if (jianYiShouJia) fields["建议售价CNY"] = jianYiShouJia;
-      // 条件字段
-      if (minGanShuXing1 === "液体" && yeTiRongLiang) fields["液体容量（ml）"] = yeTiRongLiang;
-      if (minGanShuXing1 === "刀具" && daoJuChangDu) fields["刀具长度(cm)"] = daoJuChangDu;
-      if (minGanShuXing1 === "刀具" && daoJuJianDu) fields["刀尖角度(度)"] = daoJuJianDu;
-      if ((minGanShuXing1 === "纯电" || minGanShuXing1 === "内电") && chuDianRongLiang) fields["储电容量（wh）"] = chuDianRongLiang;
+      if (declaredPrice) fields["申报价CNY"] = declaredPrice;
+      if (suggestedPrice) fields["建议售价CNY"] = suggestedPrice;
+
+      cleanAttributes.forEach((row) => {
+        fields[row.key] = row.value;
+      });
+
+      const firstSku = cleanSkuRows[0];
+      if (firstSku) {
+        fields["SKU货号"] = firstSku.skuCode;
+        fields["规格1内容"] = firstSku.spec1;
+        fields["规格2内容"] = firstSku.spec2;
+        fields["SKU数量"] = firstSku.quantity;
+        fields["SKU数量单位"] = firstSku.unit;
+        if (firstSku.price) fields["建议售价CNY"] = firstSku.price;
+        if (firstSku.stock) fields["库存"] = firstSku.stock;
+      }
+
+      cleanSensitiveRows.slice(0, 3).forEach((row, index) => {
+        fields[`敏感词属性${index + 1}`] = row.type;
+        if (row.value) fields[`敏感属性${index + 1}数值`] = row.value;
+        if (row.remark) fields[`敏感属性${index + 1}备注`] = row.remark;
+      });
 
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/export-fields`, {
         method: "PATCH",
@@ -5753,96 +6760,23 @@ function DefaultsTab({ task }: { task: ProductTaskDetail }) {
     }
   }
 
-  async function saveSingleField(fieldKey: string, value: string): Promise<void> {
-    try {
-      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/export-fields`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ fields: { [fieldKey]: value } }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setEditingField(null);
-      await loadDefaults();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "保存失败");
-    }
+  function patchAttribute(id: string, patch: Partial<DynamicPair>): void {
+    setAttributes((rows) => rows.map((row) => row.id === id ? { ...row, ...patch } : row));
   }
 
-  const minGanOptions = ["", "纯电", "内电", "液体", "粉末", "膏体", "刀具", "磁性", "气雾剂"];
-  const showLiquid = minGanShuXing1 === "液体" || minGanShuXing2 === "液体" || minGanShuXing3 === "液体";
-  const showKnife = minGanShuXing1 === "刀具" || minGanShuXing2 === "刀具" || minGanShuXing3 === "刀具";
-  const showBattery = minGanShuXing1 === "纯电" || minGanShuXing1 === "内电" || minGanShuXing2 === "纯电" || minGanShuXing2 === "内电" || minGanShuXing3 === "纯电" || minGanShuXing3 === "内电";
+  function patchSkuRow(id: string, patch: Partial<SkuDraftRow>): void {
+    setSkuRows((rows) => rows.map((row) => row.id === id ? { ...row, ...patch } : row));
+  }
 
-  // 从AI结果和草稿获取字段值
-  const aiTitleCn = String(task.ai?.title_cn || draft?.fields_json?.["商品名称"] || task.title || "");
-  const aiTitleEn = String(task.ai?.title_en || draft?.fields_json?.["英文名称"] || "");
-  const draftFields: Record<string, unknown> = draft?.fields_json || {};
+  function patchSensitiveRow(id: string, patch: Partial<SensitiveDraftRow>): void {
+    setSensitiveRows((rows) => rows.map((row) => row.id === id ? { ...row, ...patch } : row));
+  }
 
-  // 字段总览数据
-  const overviewFields: Array<{
-    group: string;
-    icon: string;
-    items: Array<{ key: string; value: string; source: string; editable: boolean; link?: string }>;
-  }> = [
-    {
-      group: "📝 标题",
-      icon: "📝",
-      items: [
-        { key: "商品标题", value: aiTitleCn, source: aiTitleCn ? "AI生成" : "待生成", editable: true },
-        { key: "英文标题", value: aiTitleEn, source: aiTitleEn ? "AI生成" : "待生成", editable: true },
-      ]
-    },
-    {
-      group: "💰 价格",
-      icon: "💰",
-      items: [
-        { key: "申报价(CNY)", value: String(draftFields["申报价CNY"] || shenBaoJia || ""), source: draftFields["申报价CNY"] ? "已填" : "待填写", editable: true },
-        { key: "建议售价(CNY)", value: String(draftFields["建议售价CNY"] || jianYiShouJia || ""), source: draftFields["建议售价CNY"] ? "已填" : "选填", editable: true },
-      ]
-    },
-    {
-      group: "📦 SKU规格",
-      icon: "📦",
-      items: [
-        { key: "规格1内容", value: String(guiGe1NeiRong || draftFields["规格1内容"] || ""), source: guiGe1NeiRong || draftFields["规格1内容"] ? "已填" : "待填写", editable: false },
-        { key: "规格2内容", value: String(guiGe2NeiRong || draftFields["规格2内容"] || ""), source: guiGe2NeiRong || draftFields["规格2内容"] ? "已填" : "-", editable: false },
-      ]
-    },
-    {
-      group: "🖼️ 图片",
-      icon: "🖼️",
-      items: [
-        { key: "轮播图1", value: draftFields["商品轮播图1-英语"] ? "[已生成]" : "待生成", source: draftFields["商品轮播图1-英语"] ? "已生成" : "待生成", editable: false, link: "图片处理" },
-        { key: "轮播图2-4", value: draftFields["商品轮播图2-英语"] ? "[已生成]" : "待生成", source: draftFields["商品轮播图2-英语"] ? "已生成" : "待生成", editable: false, link: "图片处理" },
-        { key: "SKU预览图", value: draftFields["SKU预览图-英语"] ? "[已生成]" : "待生成", source: draftFields["SKU预览图-英语"] ? "已生成" : "待生成", editable: false, link: "图片处理" },
-      ]
-    },
-    {
-      group: "🏷️ 类目属性",
-      icon: "🏷️",
-      items: [
-        { key: "镀层", value: String(draftFields["镀层"] || "无镀层"), source: draftFields["镀层"] ? "已填" : "系统默认", editable: false },
-        { key: "镶嵌材质", value: String(draftFields["镶嵌材质"] || "无镶嵌"), source: draftFields["镶嵌材质"] ? "已填" : "系统默认", editable: false },
-        { key: "主体材质", value: String(draftFields["主体材质"] || "合金"), source: draftFields["主体材质"] ? "已填" : "系统默认", editable: false },
-        { key: "风格", value: draftFields["风格1"] ? "已填" : "待填写", source: draftFields["风格1"] ? "已填" : "待填写", editable: false },
-      ]
-    },
-    {
-      group: "🎬 视频",
-      icon: "🎬",
-      items: [
-        { key: "主图视频", value: draftFields["SPU主图视频"] ? "[已上传]" : "未上传", source: draftFields["SPU主图视频"] ? "已填" : "未上传", editable: false },
-        { key: "详情视频", value: draftFields["SPU详情视频"] ? "[已上传]" : "未上传", source: draftFields["SPU详情视频"] ? "已填" : "未上传", editable: false },
-      ]
-    },
-    {
-      group: "📄 详情图文",
-      icon: "📄",
-      items: [
-        { key: "详情图文", value: draftFields["详情图文-英语"] ? "[已上传]" : "待上传", source: draftFields["详情图文-英语"] ? "已上传" : "待上传", editable: false, link: "图片处理" },
-      ]
-    },
-  ];
+  const draftFields = draft?.fields_json || {};
+  const filledAttributeCount = nonEmptyPairs(attributes).length;
+  const filledSkuCount = nonEmptySkuRows(skuRows).length;
+  const filledSensitiveCount = nonEmptySensitiveRows(sensitiveRows).length;
+  const sensitiveOptions = ["", "纯电", "内电", "液体", "粉末", "膏体", "刀具", "磁性", "气雾剂", "易碎", "其他"];
 
   return (
     <div className="space-y-4">
@@ -5853,161 +6787,160 @@ function DefaultsTab({ task }: { task: ProductTaskDetail }) {
         <div className="rounded-[18px] border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700">{success}</div>
       )}
 
-      {/* 导出字段总览 */}
-      <Section title="导出字段总览">
-        <div className="space-y-4">
-          {overviewFields.map((group) => (
-            <div key={group.group}>
-              <div className="mb-2 text-xs font-semibold text-slate-700">{group.group}</div>
-              <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                {group.items.map((item) => (
-                  <div key={item.key} className="flex items-center justify-between rounded-[12px] border border-slate-200 bg-slate-50 px-3 py-2">
-                    <div className="min-w-0 flex-1">
-                      <div className="text-xs text-slate-500">{item.key}</div>
-                      <div className={`mt-1 truncate text-sm font-medium ${item.value && item.value !== "待生成" && item.value !== "待填写" && item.value !== "未上传" ? "text-slate-900" : "text-amber-600"}`}>
-                        {item.value || "-"}
-                      </div>
-                    </div>
-                    <div className="ml-2 flex flex-col items-end gap-1">
-                      <span className={`rounded-full border px-2 py-0.5 text-[10px] ${item.source === "AI生成" || item.source === "已填" ? "border-emerald-200 bg-emerald-50 text-emerald-700" : item.source === "系统默认" ? "border-slate-200 bg-slate-100 text-slate-500" : "border-amber-200 bg-amber-50 text-amber-700"}`}>
-                        {item.source}
-                      </span>
-                      {item.editable && (
-                        <button
-                          type="button"
-                          onClick={() => { setEditingField(item.key); setEditValue(String(item.value || "")); }}
-                          className="text-[10px] text-slate-500 hover:text-slate-700"
-                        >
-                          编辑
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
+      <Section title="本商品上架补充">
+        <div className="grid gap-3 md:grid-cols-4">
+          <DefaultSummaryCard label="商品属性" value={filledAttributeCount} hint="动态字段" />
+          <DefaultSummaryCard label="SKU 行" value={filledSkuCount} hint="多规格" />
+          <DefaultSummaryCard label="敏感属性" value={filledSensitiveCount} hint="可多项" />
+          <DefaultSummaryCard label="导出草稿" value={draft ? "已生成" : "未生成"} hint={draft?.updated_at || "保存后写入草稿"} />
+        </div>
+        <div className="mt-4 rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600">
+          通用站点、仓库、币种、默认库存等仍由“上架默认值规则”统一控制；这里保存的是当前商品需要人工覆盖或补充的字段。
+        </div>
+      </Section>
+
+      <Section title="少量通用覆盖">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <FormSelect label="经营站点" value={site} onChange={setSite} options={["美国站", "英国站", "德国站", "法国站", "意大利站", "西班牙站", "日本站", "澳大利亚站"]} />
+          <FormSelect label="发货仓" value={warehouse} onChange={setWarehouse} options={["美国-饰品", "美国-普货", "英国-饰品", "英国-普货", "德国-饰品", "德国-普货"]} />
+          <FormSelect label="承诺发货时效" value={leadTime} onChange={setLeadTime} options={["2个工作日内发货", "3个工作日内发货", "5个工作日内发货", "7个工作日内发货"]} />
+          <FormSelect label="是否独立包装" value={independentPackage} onChange={setIndependentPackage} options={["是", "否"]} />
+          <FormInput label="商品产地" value={originCountry} onChange={setOriginCountry} placeholder="中国" />
+          <FormInput label="产地省份" value={originProvince} onChange={setOriginProvince} placeholder="广东省" />
+          <FormInput label="申报价 CNY" value={declaredPrice} onChange={setDeclaredPrice} type="number" placeholder="可留空" />
+          <FormInput label="建议售价 CNY" value={suggestedPrice} onChange={setSuggestedPrice} type="number" placeholder="可留空" />
+        </div>
+      </Section>
+
+      <Section title="商品属性">
+        <div className="space-y-2">
+          {attributes.map((row, index) => (
+            <div key={row.id} className="grid gap-2 md:grid-cols-[220px_1fr_auto]">
+              <FormInput label={index === 0 ? "属性名" : ""} value={row.key} onChange={(value) => patchAttribute(row.id, { key: value })} placeholder="如：主体材质 / 风格 / 适用人群" />
+              <FormInput label={index === 0 ? "属性值" : ""} value={row.value} onChange={(value) => patchAttribute(row.id, { value })} placeholder="如：合金 / 复古 / 女士" />
+              <button
+                type="button"
+                onClick={() => setAttributes((rows) => rows.length > 1 ? rows.filter((item) => item.id !== row.id) : rows)}
+                className="mt-auto h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                disabled={attributes.length <= 1}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={() => setAttributes((rows) => [...rows, { id: makeDraftId("attr"), key: "", value: "" }])}
+          className="mt-3 rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+        >
+          添加属性
+        </button>
+      </Section>
+
+      <Section title="商品规格与 SKU">
+        <div className="grid gap-4 md:grid-cols-3">
+          <FormSelect label="默认规格类型" value={specType} onChange={setSpecType} options={["款式/颜色", "颜色/尺寸", "尺寸/颜色", "款式", "颜色", "自定义"]} />
+          <FormSelect label="SKU分类" value={skuClass} onChange={setSkuClass} options={["单品", "同款多件装", "混合套装"]} />
+          <div className="rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600">
+            多 SKU 会保存为明细，同时第 1 行会同步到 Temu 常用的规格字段，便于现有导出逻辑继续使用。
+          </div>
+        </div>
+        <div className="mt-4 space-y-3">
+          {skuRows.map((row, index) => (
+            <div key={row.id} className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-slate-900">SKU {index + 1}</div>
+                <button
+                  type="button"
+                  onClick={() => setSkuRows((rows) => rows.length > 1 ? rows.filter((item) => item.id !== row.id) : rows)}
+                  className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                  disabled={skuRows.length <= 1}
+                >
+                  删除
+                </button>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                <FormInput label="SKU 编码" value={row.skuCode} onChange={(value) => patchSkuRow(row.id, { skuCode: value })} placeholder="平台 SKU / 货号" />
+                <FormInput label="规格 1" value={row.spec1} onChange={(value) => patchSkuRow(row.id, { spec1: value })} placeholder="如：黑色" />
+                <FormInput label="规格 2" value={row.spec2} onChange={(value) => patchSkuRow(row.id, { spec2: value })} placeholder="如：S / 1件装" />
+                <div className="grid grid-cols-2 gap-2">
+                  <FormInput label="数量" value={row.quantity} onChange={(value) => patchSkuRow(row.id, { quantity: value })} type="number" placeholder="1" />
+                  <FormSelect label="单位" value={row.unit} onChange={(value) => patchSkuRow(row.id, { unit: value })} options={["件", "套", "对", "个", "组", "盒", "袋"]} />
+                </div>
+                <FormInput label="售价 CNY" value={row.price} onChange={(value) => patchSkuRow(row.id, { price: value })} type="number" placeholder="可留空" />
+                <FormInput label="库存" value={row.stock} onChange={(value) => patchSkuRow(row.id, { stock: value })} type="number" placeholder="可留空" />
+                <FormInput label="SKU 重量(g)" value={row.weight} onChange={(value) => patchSkuRow(row.id, { weight: value })} type="number" placeholder="默认用包裹重量" />
+                <div className="grid grid-cols-3 gap-2">
+                  <FormInput label="长(cm)" value={row.length} onChange={(value) => patchSkuRow(row.id, { length: value })} type="number" />
+                  <FormInput label="宽(cm)" value={row.width} onChange={(value) => patchSkuRow(row.id, { width: value })} type="number" />
+                  <FormInput label="高(cm)" value={row.height} onChange={(value) => patchSkuRow(row.id, { height: value })} type="number" />
+                </div>
               </div>
             </div>
           ))}
         </div>
+        <button
+          type="button"
+          onClick={() => setSkuRows((rows) => [...rows, {
+            id: makeDraftId("sku"),
+            skuCode: "",
+            spec1: "",
+            spec2: "",
+            quantity: "1",
+            unit: "件",
+            price: "",
+            stock: "",
+            weight: "",
+            length: "",
+            width: "",
+            height: "",
+          }])}
+          className="mt-3 rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+        >
+          添加 SKU
+        </button>
       </Section>
 
-      {/* 单字段编辑弹窗 */}
-      {editingField && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="w-[360px] rounded-[20px] border border-slate-200 bg-white p-5 shadow-xl">
-            <div className="text-sm font-semibold text-slate-900">编辑 {editingField}</div>
-            <textarea
-              value={editValue}
-              onChange={(e) => setEditValue(e.target.value)}
-              className="mt-3 h-[100px] w-full resize-none rounded-[14px] border border-slate-200 bg-white p-3 text-sm outline-none focus:border-slate-400"
-              placeholder={`输入 ${editingField} 的值`}
-            />
-            <div className="mt-4 flex justify-end gap-2">
+      <Section title="敏感属性">
+        <div className="space-y-2">
+          {sensitiveRows.map((row, index) => (
+            <div key={row.id} className="grid gap-2 md:grid-cols-[180px_180px_1fr_auto]">
+              <FormSelect label={index === 0 ? "类型" : ""} value={row.type} onChange={(value) => patchSensitiveRow(row.id, { type: value })} options={sensitiveOptions} />
+              <FormInput label={index === 0 ? "数值" : ""} value={row.value} onChange={(value) => patchSensitiveRow(row.id, { value })} placeholder="容量/长度/Wh 等" />
+              <FormInput label={index === 0 ? "备注" : ""} value={row.remark} onChange={(value) => patchSensitiveRow(row.id, { remark: value })} placeholder="如：内置纽扣电池 / 液体 100ml" />
               <button
                 type="button"
-                onClick={() => setEditingField(null)}
-                className="h-10 rounded-full border border-slate-200 px-4 text-sm text-slate-700 hover:bg-slate-50"
+                onClick={() => setSensitiveRows((rows) => rows.length > 1 ? rows.filter((item) => item.id !== row.id) : rows)}
+                className="mt-auto h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                disabled={sensitiveRows.length <= 1}
               >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={() => void saveSingleField(editingField, editValue)}
-                className="h-10 rounded-full bg-slate-900 px-4 text-sm text-white hover:bg-slate-800"
-              >
-                保存
+                删除
               </button>
             </div>
-          </div>
+          ))}
         </div>
-      )}
-
-      {/* 分组1：基础设置 */}
-      <Section title="基础设置">
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <FormSelect label="经营站点" value={jingYingZhanDian} onChange={setJingYingZhanDian}
-            options={["美国站", "英国站", "德国站", "法国站", "意大利站", "西班牙站", "日本站", "澳大利亚站"]} />
-          <FormSelect label="发货仓" value={faHuoCang} onChange={setFaHuoCang}
-            options={["美国-饰品", "美国-普货", "英国-饰品", "英国-普货", "德国-饰品", "德国-普货"]} />
-          <FormSelect label="承诺发货时效" value={chengNuoFaHuoShiXiao} onChange={setChengNuoFaHuoShiXiao}
-            options={["2个工作日内发货", "3个工作日内发货", "5个工作日内发货", "7个工作日内发货"]} />
-          <FormSelect label="素材语言" value={suCaiYuYan} onChange={setSuCaiYuYan}
-            options={["英语", "英语+德语", "英语+法语", "英语+西班牙语", "多语言"]} />
-          <FormSelect label="商品产地" value={chanPinChanDi} onChange={setChanPinChanDi}
-            options={["中国", "美国", "日本", "韩国", "英国"]} />
-          <FormInput label="产地省份" value={chanDiShengFen} onChange={setChanDiShengFen}
-            placeholder="如：广东省" />
-        </div>
+        <button
+          type="button"
+          onClick={() => setSensitiveRows((rows) => [...rows, { id: makeDraftId("sensitive"), type: "", value: "", remark: "" }])}
+          className="mt-3 rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+        >
+          添加敏感属性
+        </button>
       </Section>
 
-      {/* 分组2：SKU规格 */}
-      <Section title="SKU规格">
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <FormSelect label="默认规格类型" value={moRenGuiGeLeiXing} onChange={setMoRenGuiGeLeiXing}
-            options={["款式/颜色", "颜色/尺寸", "尺寸/颜色", "款式", "颜色"]} />
-          <FormSelect label="SKU分类" value={skuFenLei} onChange={setSkuFenLei}
-            options={["单品", "同款多件装", "混合套装"]} />
-          <div className="grid grid-cols-2 gap-2">
-            <FormInput label="SKU数量" value={skuShuLiang} onChange={setSkuShuLiang} type="number" placeholder="1" />
-            <FormSelect label="单位" value={skuShuLiangDanWei} onChange={setSkuShuLiangDanWei}
-              options={["件", "套", "对", "个", "组", "盒", "袋"]} />
-          </div>
-          <FormSelect label="是否独立包装" value={shiFouDuLiBaoZhuang} onChange={setShiFouDuLiBaoZhuang}
-            options={["是", "否"]} />
-          <FormInput label="规格1内容" value={guiGe1NeiRong} onChange={setGuiGe1NeiRong}
-            placeholder="如：黑色、红色、蓝色" />
-          <FormInput label="规格2内容" value={guiGe2NeiRong} onChange={setGuiGe2NeiRong}
-            placeholder="如：S、M、L、XL" />
-        </div>
-      </Section>
-
-      {/* 分组3：敏感属性 */}
-      <Section title="敏感属性">
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <FormSelect label="敏感词属性1" value={minGanShuXing1} onChange={setMinGanShuXing1}
-            options={minGanOptions} />
-          <FormSelect label="敏感词属性2" value={minGanShuXing2} onChange={setMinGanShuXing2}
-            options={minGanOptions} />
-          <FormSelect label="敏感词属性3" value={minGanShuXing3} onChange={setMinGanShuXing3}
-            options={minGanOptions} />
-          {showLiquid && <FormInput label="液体容量（ml）" value={yeTiRongLiang} onChange={setYeTiRongLiang}
-            placeholder="如：100" type="number" />}
-          {showKnife && (
-            <>
-              <FormInput label="刀具长度(cm)" value={daoJuChangDu} onChange={setDaoJuChangDu}
-                placeholder="如：10" type="number" />
-              <FormInput label="刀尖角度(度)" value={daoJuJianDu} onChange={setDaoJuJianDu}
-                placeholder="如：30" type="number" />
-            </>
-          )}
-          {showBattery && <FormInput label="储电容量（wh）" value={chuDianRongLiang} onChange={setChuDianRongLiang}
-            placeholder="如：20" type="number" />}
-        </div>
-        {!showLiquid && !showKnife && !showBattery && (
-          <div className="mt-2 text-xs text-slate-500">无敏感属性则留空即可</div>
-        )}
-      </Section>
-
-      {/* 分组4：体积重量 */}
       <Section title="体积重量">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <FormInput label="最长边（cm）" value={zuiChangBian} onChange={setZuiChangBian}
-            placeholder="10" type="number" />
-          <FormInput label="次长边（cm）" value={ciChangBian} onChange={setCiChangBian}
-            placeholder="8" type="number" />
-          <FormInput label="最短边（cm）" value={zuiDuanBian} onChange={setZuiDuanBian}
-            placeholder="2" type="number" />
-          <FormInput label="重量（g）" value={zhongLiang} onChange={setZhongLiang}
-            placeholder="30" type="number" />
-        </div>
-        <div className="mt-2 text-xs text-slate-500">
-          提示：体积重量影响运费计算，默认值适合小件饰品。如商品较大请根据实际测量值填写。
+          <FormInput label="最长边（cm）" value={packageLength} onChange={setPackageLength} placeholder="10" type="number" />
+          <FormInput label="次长边（cm）" value={packageWidth} onChange={setPackageWidth} placeholder="8" type="number" />
+          <FormInput label="最短边（cm）" value={packageHeight} onChange={setPackageHeight} placeholder="2" type="number" />
+          <FormInput label="重量（g）" value={packageWeight} onChange={setPackageWeight} placeholder="30" type="number" />
         </div>
       </Section>
 
-      {/* 保存按钮 */}
       <div className="flex items-center justify-between">
         <div className="text-xs text-slate-500">
-          {draft ? `草稿状态: ${draft.status} · 更新于 ${draft.updated_at}` : "暂无草稿"}
+          {draft ? `草稿状态: ${draft.status} · 已有字段 ${Object.keys(draftFields).length} 个` : "暂无草稿"}
         </div>
         <div className="flex gap-2">
           <button

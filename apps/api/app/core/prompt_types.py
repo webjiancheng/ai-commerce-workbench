@@ -6,8 +6,6 @@ PROMPT_TYPES: tuple[str, ...] = (
     "title_en_only",
     "title_package_lite",
     "title_package",
-    "title_en_with_cn_translation",
-    "image_prompt_package",
     "image_prompt_main",
     "image_prompt_carousel_1",
     "image_prompt_carousel_2",

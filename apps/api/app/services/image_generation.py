@@ -21,6 +21,11 @@ from app.models.product_task import ProductTask
 from app.models.raw_product import RawProduct
 from app.services.image_providers.registry import get_image_provider
 from app.services.image_runtime import build_image_provider_snapshot, resolve_image_runtime
+from app.services.image_context import (
+    build_compact_four_grid_context,
+    build_four_grid_context,
+    build_product_info_context,
+)
 from app.services.prompt_templates import render_template_text, resolve_prompt
 from app.services.storage_provider import LocalStorageProvider
 from app.services.costing import record_image_cost
@@ -316,7 +321,6 @@ def _resolve_reference_images(*, raw: RawProduct | None, slot: str) -> list[byte
             raw.screenshot_url,
             raw.main_image,
             *(raw.carousel_images or [])[:3],
-            *(raw.detail_images or [])[:1],
         ],
         "main": [raw.screenshot_url, raw.main_image, *(raw.carousel_images or [])[:2]],
         "carousel_1": [raw.screenshot_url, raw.main_image, *(raw.carousel_images or [])[:2]],
@@ -512,8 +516,8 @@ def _ensure_prompt_upstream_outputs(session: Session, *, task_id: int) -> None:
     missing_steps: list[str] = []
     if not _has_ai_output((ai.title_package if isinstance(ai, ProductAIResult) else None) or {}):
         missing_steps.append("title_package")
-    # title_only 手动四宫格不允许补跑 product_info（产品口径）
-    if norm_mode == GenerationMode.title_and_4grid.value:
+    # 商品理解关闭时，四宫格使用原始采集字段构建轻量上下文。
+    if norm_mode == GenerationMode.title_and_4grid.value and bool(getattr(task, "include_product_info", True)):
         if not _has_ai_output((ai.product_info if isinstance(ai, ProductAIResult) else None) or {}):
             missing_steps.append("product_info_from_screenshot")
     if not missing_steps:
@@ -532,6 +536,7 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
     title_package = None
     title_en_package = None
     selling_points: list[str] = []
+    category_out: dict[str, Any] = {}
 
     if isinstance(ai, ProductAIResult):
         category_out = (ai.category_match or {}).get("output") if isinstance(ai.category_match, dict) else {}
@@ -542,8 +547,6 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
         if isinstance(title_package, dict) and title_package.get("title_en"):
             title_en_package = {
                 "title_en": title_package.get("title_en"),
-                "title_cn_translation": title_package.get("title_cn_translation"),
-                "title_en_short": title_package.get("title_en_short"),
             }
         else:
             title_en_package = ((ai.title_en or {}).get("output") or None)
@@ -553,30 +556,21 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
                 selling_points = [str(item).strip() for item in raw_points if str(item).strip()]
 
     product_info_obj = product_info if isinstance(product_info, dict) else {}
-    product_core_v2 = product_info_obj.get("product_core_v2") if isinstance(product_info_obj.get("product_core_v2"), dict) else {}
-    visual_facts = product_info_obj.get("visual_facts") if isinstance(product_info_obj.get("visual_facts"), dict) else {}
-    image_generation_basis = (
-        product_info_obj.get("image_generation_basis")
-        if isinstance(product_info_obj.get("image_generation_basis"), dict)
-        else {}
+    four_grid_context = build_four_grid_context(
+        raw=raw,
+        task=task,
+        title_package=title_package if isinstance(title_package, dict) else {},
+        product_info=product_info_obj,
     )
-    title_basis = product_info_obj.get("title_basis") if isinstance(product_info_obj.get("title_basis"), dict) else {}
-    product_info_context = {
-        "product_subject": str(product_core_v2.get("product_subject") or image_generation_basis.get("main_subject") or ""),
-        "product_type": str(product_core_v2.get("product_type") or ""),
-        "core_product_words": [str(x).strip() for x in (title_package or {}).get("core_product_words", []) if str(x).strip()] if isinstance(title_package, dict) else [],
-        "attribute_words": [str(x).strip() for x in (title_basis.get("must_include") or []) if str(x).strip()],
-        "structure_words": [str(x).strip() for x in (visual_facts.get("visible_structures") or []) if str(x).strip()],
-        "scene_words": [str(x).strip() for x in (product_core_v2.get("usage_scenarios") or []) if str(x).strip()],
-        "style_tags": [str(x).strip() for x in (product_core_v2.get("style_tags") or []) if str(x).strip()],
-        "visible_colors": [str(x).strip() for x in (visual_facts.get("visible_colors") or []) if str(x).strip()],
-        "visible_shapes": [str(x).strip() for x in (visual_facts.get("visible_shapes") or []) if str(x).strip()],
-        "must_keep_elements": [str(x).strip() for x in (image_generation_basis.get("must_keep_elements") or []) if str(x).strip()],
-        "must_avoid_elements": [str(x).strip() for x in (image_generation_basis.get("must_avoid_elements") or []) if str(x).strip()],
-        "selling_point_candidates": [str(x).strip() for x in (image_generation_basis.get("selling_point_candidates") or []) if str(x).strip()],
-        "sku_axes": [str(x).strip() for x in (image_generation_basis.get("sku_axes") or []) if str(x).strip()],
-        "dimension_candidates": [str(x).strip() for x in (image_generation_basis.get("dimension_candidates") or []) if str(x).strip()],
-    }
+    if slot == "carousel_4grid":
+        reference_images = dict(four_grid_context.get("reference_images") or {})
+        reference_images["detail_images"] = []
+        four_grid_context = {
+            **four_grid_context,
+            "reference_images": reference_images,
+        }
+    product_info_context = build_product_info_context(four_grid_context)
+    four_grid_prompt_context = build_compact_four_grid_context(four_grid_context)
 
     return {
         "raw_title": (raw.title if raw else task.title),
@@ -586,19 +580,19 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
         "category_path": category_path or "",
         "resolved_category_path": category_path or "",
         "category_match": category_out if isinstance(category_out, dict) else {},
-        "product_info": product_info_obj,
+        "product_info": product_info_context,
         "product_info_context": product_info_context,
+        "four_grid_context": four_grid_prompt_context,
+        "four_grid_full_context": four_grid_context,
+        "four_grid_prompt_context": four_grid_prompt_context,
         "title_package": title_package or {},
         "title_en_with_cn_translation": title_en_package or {},
         "selling_points": selling_points,
         "material": "",
         "target_user": "",
-        "scenes": (
-            product_core_v2.get("usage_scenarios", [])
-            if isinstance(product_core_v2, dict)
-            else []
-        ),
+        "scenes": product_info_context.get("scene_words") or [],
         "reference_image_notes": raw.screenshot_url if raw else "",
+        "reference_images": four_grid_context.get("reference_images") or {},
         "slot": slot or "",
         "slot_purpose": SLOT_PURPOSE.get(slot or "", ""),
     }

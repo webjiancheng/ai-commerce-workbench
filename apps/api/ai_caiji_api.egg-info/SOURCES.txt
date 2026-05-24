@@ -89,7 +89,9 @@ app/services/export_seed.py
 app/services/export_template_parser.py
 app/services/export_templates.py
 app/services/file_storage.py
+app/services/image_context.py
 app/services/image_generation.py
+app/services/image_runtime.py
 app/services/listing_default_fields.py
 app/services/listing_template_seed.py
 app/services/openai_client.py
@@ -105,5 +107,6 @@ app/services/task_exceptions.py
 app/services/usage_limits.py
 app/services/image_providers/__init__.py
 app/services/image_providers/base.py
+app/services/image_providers/openai_compatible_provider.py
 app/services/image_providers/registry.py
 app/services/image_providers/stub_provider.py

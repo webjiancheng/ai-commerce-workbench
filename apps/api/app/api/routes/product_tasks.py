@@ -415,7 +415,7 @@ def generate_titles_endpoint(
                     run_ai_pipeline_for_task(
                         bg_session,
                         task_id=task_id_to_run,
-                        prompt_types=["title_package"],
+                        prompt_types=["title_package_lite"],
                     )
         except Exception as exc:
             with SessionLocal() as bg_session:
@@ -427,7 +427,7 @@ def generate_titles_endpoint(
                 )
 
     background.add_task(_job, task_id, override)
-    return {"ok": True, "task_id": task_id, "queued": True, "prompt_types": ["title_package"]}
+    return {"ok": True, "task_id": task_id, "queued": True, "prompt_types": ["title_package_lite"]}
 
 
 @router.post("/api/product-tasks/{task_id}/generate-title-en-only")

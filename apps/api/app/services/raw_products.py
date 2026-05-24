@@ -17,6 +17,47 @@ def _dedupe_urls(items: list[str] | None) -> list[str]:
     return out
 
 
+def _normalize_sku_props(items: list[dict] | None) -> list[dict[str, object]]:
+    seen: set[tuple[str, str, str | None]] = set()
+    out: list[dict[str, object]] = []
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            continue
+        group_name = str(raw.get("group_name") or raw.get("groupName") or "").strip()
+        option_name = str(raw.get("option_name") or raw.get("optionName") or "").strip()
+        image_url_raw = str(raw.get("image_url") or raw.get("imageUrl") or "").strip()
+        image_url = image_url_raw or None
+        hint_text_raw = str(raw.get("hint_text") or raw.get("hintText") or "").strip()
+        hint_text = hint_text_raw or None
+        try:
+            group_index = int(raw.get("group_index") or raw.get("groupIndex") or 0)
+        except (TypeError, ValueError):
+            group_index = 0
+        try:
+            option_index = int(raw.get("option_index") or raw.get("optionIndex") or 0)
+        except (TypeError, ValueError):
+            option_index = 0
+        selected = bool(raw.get("selected"))
+        if not group_name and not option_name and not image_url:
+            continue
+        dedupe_key = (group_name, option_name, image_url)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(
+            {
+                "group_name": group_name or f"规格{group_index + 1}",
+                "option_name": option_name,
+                "image_url": image_url,
+                "hint_text": hint_text,
+                "group_index": group_index,
+                "option_index": option_index,
+                "selected": selected,
+            }
+        )
+    return out
+
+
 def _normalize_image_groups(
     *,
     main_image: str | None,
@@ -78,6 +119,7 @@ def create_raw_product(session: Session, payload: RawProductCreate) -> RawProduc
         shop_name=payload.shop_name,
         attributes_text=payload.attributes_text,
         sku_text=payload.sku_text,
+        sku_props_json=_normalize_sku_props(payload.sku_props),
         stock=payload.stock,
         collector=payload.collector,
         main_image=normalized["main_image"],
@@ -148,6 +190,9 @@ def update_raw_product(session: Session, product: RawProduct, payload: RawProduc
     ):
         if field in changes:
             setattr(product, field, changes[field])
+
+    if "sku_props" in changes:
+        product.sku_props_json = _normalize_sku_props(changes["sku_props"])
 
     product.main_image = normalized["main_image"]
     product.main_images = normalized["main_images"]

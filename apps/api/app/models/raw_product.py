@@ -28,6 +28,7 @@ class RawProduct(Base):
     shop_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     attributes_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     sku_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sku_props_json: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
     stock: Mapped[str | None] = mapped_column(Text, nullable=True)
     collector: Mapped[str | None] = mapped_column(String(128), nullable=True)
     main_image: Mapped[str | None] = mapped_column(Text, nullable=True)

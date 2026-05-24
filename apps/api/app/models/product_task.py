@@ -40,6 +40,7 @@ class ProductTask(Base):
     export_status: Mapped[str] = mapped_column(String(32), nullable=False)
     selected_category_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     category_candidates_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    export_image_settings_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Export / listing fields (added stage-8+)
