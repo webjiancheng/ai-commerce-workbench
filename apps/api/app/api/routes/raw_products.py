@@ -19,6 +19,7 @@ from app.schemas.raw_product import (
     ScreenshotUploadIn,
 )
 from app.services.file_storage import save_data_url_image
+from app.services.image_runtime import resolve_image_runtime
 from app.services.product_tasks import create_task_from_raw_product, list_tasks_by_raw_product_id
 from app.services.raw_products import create_raw_product, delete_raw_product, get_raw_product, list_raw_products
 from app.services.raw_products import update_raw_product
@@ -95,7 +96,10 @@ def get_raw_product_endpoint(
     product = get_raw_product(session, product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Raw product not found")
-    return RawProductDetail.model_validate(product)
+    tasks = list_tasks_by_raw_product_id(session, product.id)
+    task = tasks[0] if tasks else None
+    detail = RawProductDetail.model_validate(product)
+    return detail.model_copy(update={"task_id": task.id if task else None, "task_created": task is not None})
 
 
 @router.delete("/api/raw-products/{product_id}")
@@ -120,7 +124,10 @@ def update_raw_product_endpoint(
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Raw product not found")
     updated = update_raw_product(session, product, payload)
-    return RawProductDetail.model_validate(updated)
+    tasks = list_tasks_by_raw_product_id(session, updated.id)
+    task = tasks[0] if tasks else None
+    detail = RawProductDetail.model_validate(updated)
+    return detail.model_copy(update={"task_id": task.id if task else None, "task_created": task is not None})
 
 
 @router.post("/api/raw-products/batch/create-tasks")
@@ -130,6 +137,9 @@ def batch_create_tasks_from_raw_products_endpoint(
     x_ai_api_key: str | None = Header(default=None),
     x_ai_base_url: str | None = Header(default=None),
     x_ai_model: str | None = Header(default=None),
+    x_ai_image_api_key: str | None = Header(default=None),
+    x_ai_image_base_url: str | None = Header(default=None),
+    x_ai_image_model: str | None = Header(default=None),
     session: Session = Depends(get_db_session),
 ) -> dict[str, object]:
     if not payload.raw_product_ids:
@@ -138,12 +148,31 @@ def batch_create_tasks_from_raw_products_endpoint(
         "api_key": (x_ai_api_key or "").strip(),
         "base_url": (x_ai_base_url or "").strip(),
         "model": (x_ai_model or "").strip(),
+        "image_api_key": (x_ai_image_api_key or "").strip(),
+        "image_base_url": (x_ai_image_base_url or "").strip(),
+        "image_model": (x_ai_image_model or "").strip(),
     }
-    if payload.generation_mode != GenerationMode.no_ai and not is_openai_configured(session, override=override):
+    if payload.generation_mode not in {GenerationMode.task_only, GenerationMode.no_ai} and not is_openai_configured(session, override=override):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="AI 文本模型 API Key 未配置，当前生成模式不能继续。请先到 AI 设置页完成配置。",
         )
+
+    if payload.generation_mode in {
+        GenerationMode.title_and_4grid,
+        GenerationMode.title_and_image_prompts,
+        GenerationMode.full_later,
+    }:
+        image_runtime = resolve_image_runtime(session, override=override)
+        if (
+            not image_runtime.get("enabled")
+            or str(image_runtime.get("provider_name") or "") == "stub"
+            or not image_runtime.get("api_key")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="图片生成 Provider 未配置或未启用，当前模式（AI 标题+类目+自动四宫格）无法继续。请先到 AI 设置页配置图片生成模型。",
+            )
 
     batch_no = f"B{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     results: list[ProductTaskCreateResponse] = []
@@ -165,6 +194,7 @@ def batch_create_tasks_from_raw_products_endpoint(
                     raw_product_id=first_task.raw_product_id,
                     main_status=first_task.main_status,
                     generation_mode=first_task.generation_mode,
+                    include_product_info=first_task.include_product_info,
                     existed=True,
                     split_index=first_task.split_index,
                     split_total=target_count,
@@ -179,6 +209,7 @@ def batch_create_tasks_from_raw_products_endpoint(
                 split_index=split_index,
                 split_total=target_count,
                 generation_mode=payload.generation_mode.value,
+                include_product_info=payload.include_product_info,
             )
             created_task_ids.append(task.id)
             results.append(
@@ -188,6 +219,7 @@ def batch_create_tasks_from_raw_products_endpoint(
                     raw_product_id=task.raw_product_id,
                     main_status=task.main_status,
                     generation_mode=task.generation_mode,
+                    include_product_info=task.include_product_info,
                     existed=False,
                     split_index=task.split_index,
                     split_total=task.split_total,

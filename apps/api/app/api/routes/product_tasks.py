@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from app.services.ai_pipeline import run_ai_pipeline_for_task
 from app.services.category_dictionary import search_category_paths
 from app.services.export_fields import get_export_field_draft, patch_export_fields_manual
+from app.services.image_runtime import resolve_image_runtime
 from app.services.openai_client import is_openai_configured, runtime_override
 from app.services.product_tasks import (
     build_ai_summary,
@@ -64,7 +65,8 @@ class RunAiRequest(BaseModel):
 
 class CreateTaskFromRawIn(BaseModel):
     split_count: int = Field(default=1, ge=1, le=50)
-    generation_mode: GenerationMode = GenerationMode.title_and_image_prompts
+    generation_mode: GenerationMode = GenerationMode.title_and_4grid
+    include_product_info: bool = True
 
 
 class SelectCategoryRequest(BaseModel):
@@ -99,6 +101,9 @@ def create_task_from_raw_product_endpoint(
     x_ai_api_key: str | None = Header(default=None),
     x_ai_base_url: str | None = Header(default=None),
     x_ai_model: str | None = Header(default=None),
+    x_ai_image_api_key: str | None = Header(default=None),
+    x_ai_image_base_url: str | None = Header(default=None),
+    x_ai_image_model: str | None = Header(default=None),
     session: Session = Depends(get_db_session),
 ) -> ProductTaskCreateResponse:
     raw_product = get_raw_product(session, raw_product_id)
@@ -106,40 +111,49 @@ def create_task_from_raw_product_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Raw product not found")
 
     split_count = max(1, payload.split_count if payload else 1)
-    generation_mode = (payload.generation_mode if payload else GenerationMode.title_and_image_prompts).value
+    generation_mode = (payload.generation_mode if payload else GenerationMode.title_and_4grid).value
+    include_product_info = payload.include_product_info if payload else True
     override = {
         "api_key": (x_ai_api_key or "").strip(),
         "base_url": (x_ai_base_url or "").strip(),
         "model": (x_ai_model or "").strip(),
+        "image_api_key": (x_ai_image_api_key or "").strip(),
+        "image_base_url": (x_ai_image_base_url or "").strip(),
+        "image_model": (x_ai_image_model or "").strip(),
     }
-    if generation_mode != GenerationMode.no_ai.value and not is_openai_configured(session, override=override):
+    if generation_mode not in {GenerationMode.task_only.value, GenerationMode.no_ai.value} and not is_openai_configured(session, override=override):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="AI 文本模型 API Key 未配置，当前生成模式不能继续。请先到 AI 设置页完成配置。",
         )
-    existing_tasks = list_tasks_by_raw_product_id(session, raw_product_id)
-    if len(existing_tasks) >= split_count:
-        existing_task = existing_tasks[0]
-        return ProductTaskCreateResponse(
-            ok=True,
-            id=existing_task.id,
-            raw_product_id=existing_task.raw_product_id,
-            main_status=TaskMainStatus(existing_task.main_status),
-            generation_mode=GenerationMode(existing_task.generation_mode),
-            existed=True,
-            split_index=existing_task.split_index,
-            split_total=split_count,
-        )
 
-    task = existing_tasks[-1] if existing_tasks else None
+    if generation_mode in {"title_and_4grid", "title_and_image_prompts", "full_later"}:
+        image_runtime = resolve_image_runtime(session, override=override)
+        if (
+            not image_runtime.get("enabled")
+            or str(image_runtime.get("provider_name") or "") == "stub"
+            or not image_runtime.get("api_key")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="图片生成 Provider 未配置或未启用，当前模式（AI 标题+类目+自动四宫格）无法继续。请先到 AI 设置页配置图片生成模型。",
+            )
+
+    existing_tasks = list_tasks_by_raw_product_id(session, raw_product_id)
+    # 已有任务时继续追加创建，不阻止
     created_task_ids: list[int] = []
-    for split_index in range(len(existing_tasks) + 1, split_count + 1):
+    # 基于已有任务数量，从下一个 split_index 开始创建
+    start_index = len(existing_tasks) + 1
+    end_index = start_index + split_count - 1
+    task = None
+    for split_index in range(start_index, end_index + 1):
         task = create_task_from_raw_product(
             session,
             raw_product,
             split_index=split_index,
             split_total=split_count,
             generation_mode=generation_mode,
+            include_product_info=include_product_info,
         )
         created_task_ids.append(task.id)
 
@@ -150,6 +164,7 @@ def create_task_from_raw_product_endpoint(
             split_index=1,
             split_total=split_count,
             generation_mode=generation_mode,
+            include_product_info=include_product_info,
         )
         created_task_ids.append(task.id)
 
@@ -176,6 +191,7 @@ def create_task_from_raw_product_endpoint(
         raw_product_id=task.raw_product_id,
         main_status=TaskMainStatus(task.main_status),
         generation_mode=GenerationMode(task.generation_mode),
+        include_product_info=task.include_product_info,
         split_index=task.split_index,
         split_total=task.split_total,
     )
@@ -412,6 +428,47 @@ def generate_titles_endpoint(
 
     background.add_task(_job, task_id, override)
     return {"ok": True, "task_id": task_id, "queued": True, "prompt_types": ["title_package"]}
+
+
+@router.post("/api/product-tasks/{task_id}/generate-title-en-only")
+def generate_title_en_only_endpoint(
+    task_id: int,
+    background: BackgroundTasks,
+    x_ai_api_key: str | None = Header(default=None),
+    x_ai_base_url: str | None = Header(default=None),
+    x_ai_model: str | None = Header(default=None),
+    session: Session = Depends(get_db_session),
+) -> dict[str, object]:
+    task = get_product_task(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product task not found")
+
+    override = {
+        "api_key": (x_ai_api_key or "").strip(),
+        "base_url": (x_ai_base_url or "").strip(),
+        "model": (x_ai_model or "").strip(),
+    }
+
+    def _job(task_id_to_run: int, runtime: dict[str, str]) -> None:
+        try:
+            with runtime_override(runtime):
+                with SessionLocal() as bg_session:
+                    run_ai_pipeline_for_task(
+                        bg_session,
+                        task_id=task_id_to_run,
+                        prompt_types=["title_en_only"],
+                    )
+        except Exception as exc:
+            with SessionLocal() as bg_session:
+                _mark_background_failure(
+                    bg_session,
+                    task_id=task_id_to_run,
+                    exc=exc,
+                    status_code="generate_title_en_only_failed",
+                )
+
+    background.add_task(_job, task_id, override)
+    return {"ok": True, "task_id": task_id, "queued": True, "prompt_types": ["title_en_only"]}
 
 
 @router.get("/api/categories/search", response_model=CategorySearchResponse)

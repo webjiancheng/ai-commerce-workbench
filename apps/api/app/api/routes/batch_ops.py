@@ -12,6 +12,7 @@ from app.models.product_task import ProductTask
 from app.models.provider_config import ProviderConfig
 from app.services.costing import estimate_image_cost
 from app.services.image_generation import create_job, resolve_image_prompt, run_job
+from app.services.image_runtime import build_image_provider_snapshot
 from app.services.provider_configs import get_default_provider_config
 
 
@@ -112,9 +113,26 @@ def retry_failed_endpoint(
                     job_type=fj.job_type,
                     slot=fj.slot,
                     target_slots=fj.target_slots_json or [fj.slot],
-                    provider_config=provider,
+                    provider_name=provider.provider_name,
                     model_name=model_name,
                     size=size,
+                    provider_config_snapshot=build_image_provider_snapshot(
+                        {
+                            "provider_id": provider.id,
+                            "provider_name": provider.provider_name,
+                            "provider_display_name": provider.display_name,
+                            "api_key": None,
+                            "base_url": config.get("base_url"),
+                            "model": model_name,
+                            "size": size,
+                            "quality": config.get("quality") or "auto",
+                            "background": config.get("background") or "auto",
+                            "output_format": config.get("output_format") or "png",
+                            "supports_reference_image": bool((provider.capabilities_json or {}).get("supports_reference_image")),
+                            "pricing_json": provider.pricing_json or {},
+                        }
+                    )
+                    | {"secret_config_json": provider.secret_config_json},
                     prompt_template_id=template_id,
                     prompt_snapshot=prompt_snapshot,
                     final_prompt=final_prompt,
@@ -136,4 +154,3 @@ def retry_failed_endpoint(
     if job_ids:
         background.add_task(_bg, job_ids)
     return {"ok": True, "queued_job_ids": job_ids, "count": len(job_ids)}
-

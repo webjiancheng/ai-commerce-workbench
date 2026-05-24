@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db_session
 from app.core.task_status import GenerationMode
+from app.services.image_runtime import resolve_image_runtime
 from app.services.openai_client import is_openai_configured
 from app.services.cost_configs import get_cost_config
 from app.services.export_templates import get_default_export_template
@@ -97,31 +98,50 @@ def test_openai_compatible_endpoint(payload: AiCompatTestIn) -> dict[str, object
 
 @router.get("/api/settings/task-readiness")
 def task_readiness_endpoint(
-    generation_mode: GenerationMode = Query(default=GenerationMode.title_and_image_prompts),
+    generation_mode: GenerationMode = Query(default=GenerationMode.title_and_4grid),
     x_ai_api_key: str | None = Header(default=None),
     x_ai_base_url: str | None = Header(default=None),
     x_ai_model: str | None = Header(default=None),
+    x_ai_image_api_key: str | None = Header(default=None),
+    x_ai_image_base_url: str | None = Header(default=None),
+    x_ai_image_model: str | None = Header(default=None),
     session: Session = Depends(get_db_session),
 ) -> dict[str, object]:
-    needs_ai = generation_mode != GenerationMode.no_ai
+    needs_ai = generation_mode not in {GenerationMode.task_only, GenerationMode.no_ai}
     override = {
         "api_key": (x_ai_api_key or "").strip(),
         "base_url": (x_ai_base_url or "").strip(),
         "model": (x_ai_model or "").strip(),
+        "image_api_key": (x_ai_image_api_key or "").strip(),
+        "image_base_url": (x_ai_image_base_url or "").strip(),
+        "image_model": (x_ai_image_model or "").strip(),
     }
     ai_ready = is_openai_configured(session, override=override)
-    image_provider = get_default_provider_config(session, provider_type="image")
+    image_runtime = resolve_image_runtime(session, override=override)
+    image_ready = bool(
+        image_runtime.get("enabled")
+        and image_runtime.get("provider_name")
+        and str(image_runtime.get("provider_name")) != "stub"
+        and image_runtime.get("api_key")
+    )
+    needs_image = generation_mode in {
+        GenerationMode.title_and_4grid,
+        GenerationMode.title_and_image_prompts,
+        GenerationMode.full_later,
+    }
     return {
         "ok": True,
         "generation_mode": generation_mode.value,
         "checks": {
             "openai_configured": ai_ready,
-            "image_provider_configured": bool(image_provider and image_provider.enabled),
+            "image_provider_configured": image_ready,
         },
-        "can_create_task": (not needs_ai) or ai_ready,
+        "can_create_task": ((not needs_ai) or ai_ready) and ((not needs_image) or image_ready),
         "blocking_message": (
             "请先在 AI 配置中设置可用的文本模型 API Key（默认 text provider 或环境变量）后再生成任务。"
             if needs_ai and not ai_ready
+            else "请先配置可用的图片模型（默认后端 provider 或当前浏览器里的图片运行时）后再生成任务。"
+            if needs_image and not image_ready
             else None
         ),
     }

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { HoverZoomImage } from "@/components/hover-zoom-image";
 import { apiBaseUrl } from "@/lib/api";
-import { AiPurpose, resolveLocalTextRuntime } from "@/lib/local-settings";
+import { AiPurpose, resolveLocalImageRuntime, resolveLocalTextRuntime } from "@/lib/local-settings";
 
 type RawProductListItem = {
   id: number;
@@ -58,15 +58,57 @@ type RawProductDetail = {
   sku_images: string[];
   detail_images: string[];
   size_chart_images: string[];
+  task_id: number | null;
+  task_created: boolean;
   created_at: string;
 };
 
-type GenerationMode = "no_ai" | "title_only" | "title_and_image_prompts" | "full_later";
+type ProductAsset = {
+  id: number;
+  slot: string;
+  public_url: string | null;
+  selected_for_export: boolean;
+  version: number;
+  crop_index: number | null;
+  source_type: string;
+};
 
-type ImageGroupKey = "carousel_images" | "sku_images" | "detail_images" | "size_chart_images";
+type ProductAssetsResponse = Record<string, ProductAsset[]>;
+
+type GenerationMode = "task_only" | "title_only" | "title_and_4grid";
+
+type ImageGroupKey = "main_images" | "carousel_images" | "sku_images" | "detail_images" | "size_chart_images";
 type RawDragPayload =
   | { kind: "pool"; url: string }
   | { kind: "group"; url: string; group: ImageGroupKey; index: number };
+
+const IMAGE_GROUP_META: Record<ImageGroupKey, { title: string; shortTitle: string; description: string }> = {
+  main_images: {
+    title: "采集主图/轮播原始序列",
+    shortTitle: "原始序列",
+    description: "插件抓到的商品主视觉顺序，先在这里确认原始图有没有漏抓、错抓。",
+  },
+  carousel_images: {
+    title: "主图轮播图",
+    shortTitle: "轮播图",
+    description: "不管多少张都可以排序、换图；task_only 和 title_only 默认直接吃采集主图序列。",
+  },
+  sku_images: {
+    title: "SKU 图",
+    shortTitle: "SKU",
+    description: "放颜色、款式、规格差异图，供 SKU 图和商品理解参考。",
+  },
+  detail_images: {
+    title: "详情/卖点参考图",
+    shortTitle: "详情",
+    description: "放局部特写、细节和卖点参考图，影响细节图、卖点图、四宫格提示词。",
+  },
+  size_chart_images: {
+    title: "尺寸图",
+    shortTitle: "尺寸",
+    description: "只放尺寸表或尺寸示意图，供尺寸图提取和后续手动确认。",
+  },
+};
 
 function formatDate(value: string): string {
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
@@ -81,10 +123,69 @@ function normalizeInput(value: string): string | null {
   return next.length ? next : null;
 }
 
-function getCreateTaskPurposes(mode: GenerationMode): AiPurpose[] {
-  if (mode === "no_ai") return ["title"];
-  if (mode === "title_only") return ["title_package_lite", "title"];
-  return ["image_prompt_package", "title_package", "product_info", "title"];
+function uniqueImages(urls: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of urls) {
+    const url = (raw || "").trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+function appendUnique(images: string[], url: string, options?: { prepend?: boolean }): string[] {
+  const clean = url.trim();
+  if (!clean) return images;
+  const next = images.filter((item) => item !== clean);
+  if (options?.prepend) {
+    next.unshift(clean);
+  } else {
+    next.push(clean);
+  }
+  return next;
+}
+
+function usageLabels(detail: RawProductDetail, url: string): string[] {
+  const labels: string[] = [];
+  if (detail.main_image === url) labels.push("任务主图");
+  if (detail.main_images.includes(url)) labels.push("原始序列");
+  const carouselIndex = detail.carousel_images.indexOf(url);
+  if (carouselIndex >= 0) {
+    labels.push(`轮播#${carouselIndex + 1}`);
+  }
+  if (detail.sku_images.includes(url)) labels.push("SKU");
+  if (detail.detail_images.includes(url)) labels.push("详情");
+  if (detail.size_chart_images.includes(url)) labels.push("尺寸");
+  if (detail.screenshot_url === url) labels.push("页面截图");
+  return labels;
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("读取本地图片失败"));
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string" || !result.startsWith("data:")) {
+        reject(new Error("本地图片格式不支持"));
+        return;
+      }
+      resolve(result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function getCreateTaskPurposes(mode: GenerationMode, includeProductInfo: boolean): AiPurpose[] {
+  if (mode === "task_only") return ["title"];
+  if (mode === "title_only") {
+    return includeProductInfo ? ["title_package_lite", "product_info", "title"] : ["title_package_lite", "title"];
+  }
+  return includeProductInfo
+    ? ["image_prompt_package", "title_package", "product_info", "title"]
+    : ["image_prompt_package", "title_package", "title"];
 }
 
 export default function RawProductsPage() {
@@ -96,20 +197,25 @@ export default function RawProductsPage() {
   const [data, setData] = useState<RawProductListResponse>({ items: [], total: 0, limit: 50, offset: 0 });
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<RawProductDetail | null>(null);
+  const [taskAssets, setTaskAssets] = useState<ProductAssetsResponse>({});
+  const [assetsLoading, setAssetsLoading] = useState(false);
   const [splitCount, setSplitCount] = useState(1);
-  const [generationMode, setGenerationMode] = useState<GenerationMode>("title_and_image_prompts");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("title_and_4grid");
+  const [includeProductInfo, setIncludeProductInfo] = useState(true);
   const [dragging, setDragging] = useState<RawDragPayload | null>(null);
+  const [uploadingGroup, setUploadingGroup] = useState<ImageGroupKey | null>(null);
 
   const allImages = useMemo(() => {
     if (!detail) return [];
-    const merged = new Set<string>();
-    if (detail.main_image) merged.add(detail.main_image);
-    if (detail.screenshot_url) merged.add(detail.screenshot_url);
-    detail.carousel_images.forEach((url) => merged.add(url));
-    detail.sku_images.forEach((url) => merged.add(url));
-    detail.detail_images.forEach((url) => merged.add(url));
-    detail.size_chart_images.forEach((url) => merged.add(url));
-    return Array.from(merged);
+    return uniqueImages([
+      detail.main_image,
+      detail.screenshot_url,
+      ...detail.main_images,
+      ...detail.carousel_images,
+      ...detail.sku_images,
+      ...detail.detail_images,
+      ...detail.size_chart_images,
+    ]);
   }, [detail]);
 
   async function loadList(): Promise<void> {
@@ -151,24 +257,57 @@ export default function RawProductsPage() {
     if (selectedId) void loadDetail(selectedId);
   }, [selectedId]);
 
+  useEffect(() => {
+    if (!detail) return;
+    const shouldMirror = generationMode !== "title_and_4grid";
+    if (!shouldMirror) return;
+    if (detail.carousel_images.length || !detail.main_images.length) return;
+    setDetail((prev) => {
+      if (!prev || prev.carousel_images.length || !prev.main_images.length) return prev;
+      return {
+        ...prev,
+        main_image: prev.main_image || prev.main_images[0] || null,
+        carousel_images: [...prev.main_images],
+      };
+    });
+  }, [detail, generationMode]);
+
+  useEffect(() => {
+    if (!detail?.task_id) {
+      setTaskAssets({});
+      return;
+    }
+    let cancelled = false;
+    const loadAssets = async (): Promise<void> => {
+      setAssetsLoading(true);
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/product-tasks/${detail.task_id}/assets`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = (await response.json()) as ProductAssetsResponse;
+        if (!cancelled) setTaskAssets(result);
+      } catch {
+        if (!cancelled) setTaskAssets({});
+      } finally {
+        if (!cancelled) setAssetsLoading(false);
+      }
+    };
+    void loadAssets();
+    return () => {
+      cancelled = true;
+    };
+  }, [detail?.task_id]);
+
   function patchDetail(fields: Partial<RawProductDetail>): void {
     setDetail((prev) => (prev ? { ...prev, ...fields } : prev));
   }
 
-  function moveImage(url: string, target: ImageGroupKey): void {
+  function appendToGroup(url: string, target: ImageGroupKey, options?: { prepend?: boolean }): void {
     setDetail((prev) => {
       if (!prev) return prev;
-      const next = {
+      return {
         ...prev,
-        carousel_images: prev.carousel_images.filter((item) => item !== url),
-        sku_images: prev.sku_images.filter((item) => item !== url),
-        detail_images: prev.detail_images.filter((item) => item !== url),
-        size_chart_images: prev.size_chart_images.filter((item) => item !== url),
+        [target]: appendUnique(prev[target], url, { prepend: options?.prepend ?? false }),
       };
-      const list = [...next[target]];
-      if (!list.includes(url)) list.push(url);
-      next[target] = list;
-      return next;
     });
   }
 
@@ -189,6 +328,7 @@ export default function RawProductsPage() {
       return {
         ...prev,
         main_image: prev.main_image === url ? null : prev.main_image,
+        main_images: prev.main_images.filter((item) => item !== url),
         carousel_images: prev.carousel_images.filter((item) => item !== url),
         sku_images: prev.sku_images.filter((item) => item !== url),
         detail_images: prev.detail_images.filter((item) => item !== url),
@@ -197,12 +337,31 @@ export default function RawProductsPage() {
     });
   }
 
-  function pushToGroup(url: string, target: ImageGroupKey): void {
-    setDetail((prev) => {
-      if (!prev || !url) return prev;
-      if (prev[target].includes(url)) return prev;
-      return { ...prev, [target]: [...prev[target], url] };
-    });
+  function replaceGroup(group: ImageGroupKey, images: string[]): void {
+    setDetail((prev) => (prev ? { ...prev, [group]: uniqueImages(images) } : prev));
+  }
+
+  async function handleUploadToGroup(group: ImageGroupKey, file: File): Promise<void> {
+    if (!detail) return;
+    setUploadingGroup(group);
+    setError(null);
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      const response = await fetch(`${apiBaseUrl}/sync/screenshot`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ productId: `${detail.id}-${group}-${Date.now()}`, dataUrl }),
+      });
+      const result = (await response.json()) as { url?: string; detail?: string };
+      if (!response.ok || !result.url) throw new Error(result.detail || "上传失败");
+      appendToGroup(result.url, group, { prepend: group === "carousel_images" });
+      if (group === "main_images" && !detail.main_image) patchDetail({ main_image: result.url });
+      setNotice("图片已上传并加入当前分组。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "图片上传失败");
+    } finally {
+      setUploadingGroup(null);
+    }
   }
 
   async function saveDetail(): Promise<void> {
@@ -256,11 +415,15 @@ export default function RawProductsPage() {
     setNotice(null);
     setError(null);
     try {
-      const localTextRuntime = resolveLocalTextRuntime(getCreateTaskPurposes(generationMode));
+      const localTextRuntime = resolveLocalTextRuntime(getCreateTaskPurposes(generationMode, includeProductInfo));
+      const localImageRuntime = resolveLocalImageRuntime();
       const aiHeaders: Record<string, string> = {};
       if (localTextRuntime?.apiKey) aiHeaders["X-AI-API-Key"] = localTextRuntime.apiKey;
       if (localTextRuntime?.baseUrl) aiHeaders["X-AI-Base-URL"] = localTextRuntime.baseUrl;
       if (localTextRuntime?.model) aiHeaders["X-AI-Model"] = localTextRuntime.model;
+      if (localImageRuntime?.apiKey) aiHeaders["X-AI-Image-API-Key"] = localImageRuntime.apiKey;
+      if (localImageRuntime?.baseUrl) aiHeaders["X-AI-Image-Base-URL"] = localImageRuntime.baseUrl;
+      if (localImageRuntime?.model) aiHeaders["X-AI-Image-Model"] = localImageRuntime.model;
       const readiness = await fetch(
         `${apiBaseUrl}/api/settings/task-readiness?generation_mode=${generationMode}`,
         { cache: "no-store", headers: aiHeaders },
@@ -272,11 +435,15 @@ export default function RawProductsPage() {
       const response = await fetch(`${apiBaseUrl}/api/raw-products/${selectedId}/create-task`, {
         method: "POST",
         headers: { "content-type": "application/json", ...aiHeaders },
-        body: JSON.stringify({ split_count: splitCount, generation_mode: generationMode }),
+        body: JSON.stringify({
+          split_count: splitCount,
+          generation_mode: generationMode,
+          include_product_info: includeProductInfo,
+        }),
       });
-      const result = (await response.json()) as { existed?: boolean; detail?: string };
+      const result = (await response.json()) as { id?: number; detail?: string };
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
-      setNotice(result.existed ? "该商品已存在商品任务。" : "已生成商品任务。");
+      setNotice(`已生成商品任务 #${result.id}。`);
       await loadList();
     } catch (err) {
       setError(err instanceof Error ? err.message : "生成任务失败");
@@ -405,11 +572,33 @@ export default function RawProductsPage() {
                       onChange={(event) => setGenerationMode(event.target.value as GenerationMode)}
                       className="rounded border border-slate-300 px-2 py-0.5"
                     >
-                      <option value="no_ai">只建任务</option>
+                      <option value="task_only">只建任务</option>
                       <option value="title_only">只要 AI 标题</option>
-                      <option value="title_and_image_prompts">AI 标题+图片提示词</option>
-                      <option value="full_later">完整模式（预留）</option>
+                      <option value="title_and_4grid">标题+四宫格生成</option>
                     </select>
+                  </label>
+                  <label
+                    className={[
+                      "inline-flex items-center gap-2 rounded-lg border px-2 py-1 text-xs",
+                      generationMode === "task_only"
+                        ? "border-slate-200 bg-slate-50 text-slate-400"
+                        : "border-slate-300 text-slate-700",
+                    ].join(" ")}
+                  >
+                    商品理解
+                    <input
+                      type="checkbox"
+                      checked={includeProductInfo}
+                      disabled={generationMode === "task_only"}
+                      onChange={(event) => setIncludeProductInfo(event.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900 focus:ring-slate-400 disabled:cursor-not-allowed"
+                    />
+                    <span
+                      title="默认开启。开启后会先做页面截图和商品信息理解，给标题、类目和四宫格提示词补充上下文；关闭后会直接基于原标题、属性和图片继续生成，速度更快，但图片和标题上下文会更弱。"
+                      className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-semibold text-slate-500"
+                    >
+                      ?
+                    </span>
                   </label>
                   <label className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-2 py-1 text-xs">
                     裂变数
@@ -448,7 +637,34 @@ export default function RawProductsPage() {
               </div>
 
               <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                <div className="mb-2 text-sm font-medium text-slate-800">图片纠错工作区（支持拖拽设组、组内换位、设主图）</div>
+                <div className="mb-2 text-sm font-medium text-slate-800">图片纠错工作区</div>
+                <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs text-amber-900">
+                  <div className="font-medium">先看关系，再改图</div>
+                  <div className="mt-1">1. `task_only` 和 `title_only` 默认会把采集主图序列同步到主图轮播图，尽量减少手动搬图。</div>
+                  <div>2. 主图轮播图不限制张数，顺序就是后续导出和人工检查看到的顺序。</div>
+                  <div>3. SKU 图和尺寸图放在主图轮播图下面，支持换位、选现有图、本地上传。</div>
+                  <div>4. 已经生成过四宫格时，下面会直接显示母图和裁切出来的轮播图对比。</div>
+                </div>
+                <ImagePreparationBoard
+                  detail={detail}
+                  onSetMainImage={(url) => patchDetail({ main_image: url })}
+                  onReplaceGroup={replaceGroup}
+                  onAppendToGroup={appendToGroup}
+                  onUploadToGroup={(group, file) => void handleUploadToGroup(group, file)}
+                  uploadingGroup={uploadingGroup}
+                />
+                {detail.task_id ? (
+                  <TaskAssetCompareBoard
+                    taskId={detail.task_id}
+                    assets={taskAssets}
+                    loading={assetsLoading}
+                  />
+                ) : (
+                  <div className="mt-4 rounded-xl border border-dashed border-slate-300 bg-white px-3 py-4 text-xs text-slate-500">
+                    还没有商品任务。生成任务后，这里会显示四宫格母图、裁切轮播图和 AI 图入口。
+                  </div>
+                )}
+                <div className="mt-4 text-xs text-slate-500">下面的图片池用于选图；每张图上的标签会告诉你它当前已经被放到了哪些位置。</div>
                 <div className="grid grid-cols-3 gap-2 md:grid-cols-4 xl:grid-cols-5">
                   {allImages.map((url) => (
                     <div
@@ -468,11 +684,20 @@ export default function RawProductsPage() {
                         previewWidth={520}
                       />
                       <div className="mt-2 flex flex-wrap gap-1">
+                        {usageLabels(detail, url).map((label) => (
+                          <span key={label} className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
+                            {label}
+                          </span>
+                        ))}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1">
                         <button type="button" onClick={() => patchDetail({ main_image: url })} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">设主图</button>
-                        <button type="button" onClick={() => moveImage(url, "carousel_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">轮播</button>
-                        <button type="button" onClick={() => moveImage(url, "sku_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">SKU</button>
-                        <button type="button" onClick={() => moveImage(url, "detail_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">详情</button>
-                        <button type="button" onClick={() => moveImage(url, "size_chart_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">尺寸</button>
+                        <button type="button" onClick={() => appendToGroup(url, "main_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">原始序列</button>
+                        <button type="button" onClick={() => appendToGroup(url, "carousel_images", { prepend: true })} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">轮播首位</button>
+                        <button type="button" onClick={() => appendToGroup(url, "carousel_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">加入轮播</button>
+                        <button type="button" onClick={() => appendToGroup(url, "sku_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">SKU</button>
+                        <button type="button" onClick={() => appendToGroup(url, "detail_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">详情</button>
+                        <button type="button" onClick={() => appendToGroup(url, "size_chart_images")} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">尺寸</button>
                         <button type="button" onClick={() => removeImage(url)} className="rounded border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] text-rose-700">删除</button>
                       </div>
                     </div>
@@ -481,24 +706,17 @@ export default function RawProductsPage() {
               </div>
 
               <div className="mt-4 grid gap-3 md:grid-cols-2">
-                {(["carousel_images", "sku_images", "detail_images", "size_chart_images"] as ImageGroupKey[]).map((group) => (
+                {(["main_images", "detail_images"] as ImageGroupKey[]).map((group) => (
                   <ImageGroupEditor
                     key={group}
                     group={group}
-                    title={
-                      group === "carousel_images"
-                        ? "轮播图"
-                        : group === "sku_images"
-                          ? "SKU图"
-                          : group === "detail_images"
-                            ? "详情图"
-                            : "尺寸图"
-                    }
+                    title={IMAGE_GROUP_META[group].title}
+                    description={IMAGE_GROUP_META[group].description}
                     images={detail[group]}
                     sourceImages={allImages}
-                    onReorder={(images) => patchDetail({ [group]: images } as Partial<RawProductDetail>)}
-                    onAppend={(url) => pushToGroup(url, group)}
-                    onDropExternal={(url) => moveImage(url, group)}
+                    onReorder={(images) => replaceGroup(group, images)}
+                    onAppend={(url) => appendToGroup(url, group)}
+                    onDropExternal={(url) => appendToGroup(url, group)}
                     onDropReorder={(fromIndex, toIndex) => moveWithinGroup(group, fromIndex, toIndex)}
                     dragging={dragging}
                     onDragStateChange={setDragging}
@@ -516,6 +734,7 @@ export default function RawProductsPage() {
 function ImageGroupEditor({
   group,
   title,
+  description,
   images,
   sourceImages,
   onReorder,
@@ -527,6 +746,7 @@ function ImageGroupEditor({
 }: {
   group: ImageGroupKey;
   title: string;
+  description: string;
   images: string[];
   sourceImages: string[];
   onReorder: (images: string[]) => void;
@@ -561,7 +781,8 @@ function ImageGroupEditor({
         onDragStateChange(null);
       }}
     >
-      <div className="mb-2 text-sm font-medium text-slate-800">{title}</div>
+      <div className="mb-1 text-sm font-medium text-slate-800">{title}</div>
+      <div className="mb-2 text-xs text-slate-500">{description}</div>
       <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
         {images.map((url, idx) => (
           <div
@@ -617,6 +838,329 @@ function ImageGroupEditor({
         </select>
         <button type="button" onClick={() => selected && onAppend(selected)} className="rounded border border-slate-300 px-2 py-1 text-xs">追加</button>
       </div>
+    </div>
+  );
+}
+
+function ImagePreparationBoard({
+  detail,
+  onSetMainImage,
+  onReplaceGroup,
+  onAppendToGroup,
+  onUploadToGroup,
+  uploadingGroup,
+}: {
+  detail: RawProductDetail;
+  onSetMainImage: (url: string) => void;
+  onReplaceGroup: (group: ImageGroupKey, images: string[]) => void;
+  onAppendToGroup: (url: string, group: ImageGroupKey, options?: { prepend?: boolean }) => void;
+  onUploadToGroup: (group: ImageGroupKey, file: File) => void;
+  uploadingGroup: ImageGroupKey | null;
+}) {
+  return (
+    <div className="grid gap-3">
+      <div className="rounded-xl border border-slate-200 bg-white p-3">
+        <div className="text-sm font-medium text-slate-800">任务主图</div>
+        <div className="mt-1 text-xs text-slate-500">商品理解、主图参考和轮播首感知都会优先看这里，建议从轮播第 1 张里选。</div>
+        {detail.main_image ? (
+          <div className="mt-3">
+            <HoverZoomImage
+              src={detail.main_image}
+              alt="任务主图"
+              thumbClassName="h-36 w-full rounded-xl border border-slate-200 object-cover"
+              previewWidth={560}
+            />
+            <div className="mt-2 flex flex-wrap gap-1">
+              <button type="button" onClick={() => onAppendToGroup(detail.main_image!, "carousel_images", { prepend: true })} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                放到轮播首位
+              </button>
+              <button type="button" onClick={() => onAppendToGroup(detail.main_image!, "main_images", { prepend: true })} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                置顶原始序列
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-6 text-center text-xs text-slate-500">
+            还没指定任务主图，请从下方图池或原始序列里选一张。
+          </div>
+        )}
+      </div>
+
+      <SequencePreview
+        title="采集主图/轮播原始序列"
+        subtitle="这是插件抓回来的主视觉顺序。通常先在这里确认图有没有抓错，再同步到主图轮播图。"
+        images={detail.main_images}
+        emptyText="还没有原始主图序列，可从图池把正确图片补进来。"
+        onSetMainImage={onSetMainImage}
+        onPromote={(url) => onAppendToGroup(url, "carousel_images", { prepend: true })}
+        onMoveLeft={(idx) => {
+          if (idx <= 0) return;
+          const next = [...detail.main_images];
+          [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+          onReplaceGroup("main_images", next);
+        }}
+        onMoveRight={(idx) => {
+          if (idx >= detail.main_images.length - 1) return;
+          const next = [...detail.main_images];
+          [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+          onReplaceGroup("main_images", next);
+        }}
+      />
+
+      <ManagedGroupBoard
+        group="carousel_images"
+        title="主图轮播图"
+        description="默认从采集主图同步过来。不管多少张都可以换位置、换图；后续导出就按这里的顺序走。"
+        images={detail.carousel_images}
+        onSetMainImage={onSetMainImage}
+        onReplace={(images) => onReplaceGroup("carousel_images", images)}
+        onUpload={onUploadToGroup}
+        uploading={uploadingGroup === "carousel_images"}
+      />
+
+      <div className="grid gap-3 xl:grid-cols-2">
+        <ManagedGroupBoard
+          group="sku_images"
+          title="SKU 图"
+          description="放颜色、款式、规格差异图；可手调顺序、补图和替换。"
+          images={detail.sku_images}
+          onSetMainImage={onSetMainImage}
+          onReplace={(images) => onReplaceGroup("sku_images", images)}
+          onUpload={onUploadToGroup}
+          uploading={uploadingGroup === "sku_images"}
+          compact
+        />
+        <ManagedGroupBoard
+          group="size_chart_images"
+          title="尺寸图"
+          description="放尺寸表或尺寸示意图；可手调顺序、补图和替换。"
+          images={detail.size_chart_images}
+          onSetMainImage={onSetMainImage}
+          onReplace={(images) => onReplaceGroup("size_chart_images", images)}
+          onUpload={onUploadToGroup}
+          uploading={uploadingGroup === "size_chart_images"}
+          compact
+        />
+      </div>
+    </div>
+  );
+}
+
+function ManagedGroupBoard({
+  group,
+  title,
+  description,
+  images,
+  onSetMainImage,
+  onReplace,
+  onUpload,
+  uploading,
+  compact = false,
+}: {
+  group: ImageGroupKey;
+  title: string;
+  description: string;
+  images: string[];
+  onSetMainImage: (url: string) => void;
+  onReplace: (images: string[]) => void;
+  onUpload: (group: ImageGroupKey, file: File) => void;
+  uploading: boolean;
+  compact?: boolean;
+}) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-slate-800">{title}</div>
+          <div className="mt-1 text-xs text-slate-500">{description}</div>
+        </div>
+        <label className="inline-flex cursor-pointer items-center rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50">
+          {uploading ? "上传中…" : "本地上传"}
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) onUpload(group, file);
+              event.currentTarget.value = "";
+            }}
+          />
+        </label>
+      </div>
+      <SequencePreview
+        title=""
+        subtitle=""
+        images={images}
+        emptyText={`当前还没有${title}。可从下方图片池选图，或直接本地上传。`}
+        onSetMainImage={onSetMainImage}
+        onPromote={(url) => onReplace([url, ...images.filter((item) => item !== url)])}
+        onMoveLeft={(idx) => {
+          if (idx <= 0) return;
+          const next = [...images];
+          [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+          onReplace(next);
+        }}
+        onMoveRight={(idx) => {
+          if (idx >= images.length - 1) return;
+          const next = [...images];
+          [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+          onReplace(next);
+        }}
+        compact={compact}
+      />
+    </div>
+  );
+}
+
+function TaskAssetCompareBoard({
+  taskId,
+  assets,
+  loading,
+}: {
+  taskId: number;
+  assets: ProductAssetsResponse;
+  loading: boolean;
+}) {
+  const parent = (assets.carousel_4grid || [])[0] || null;
+  const crops = ["carousel_1", "carousel_2", "carousel_3", "carousel_4"]
+    .map((slot) => {
+      const items = assets[slot] || [];
+      return items.find((item) => item.selected_for_export) || items[0] || null;
+    })
+    .filter(Boolean) as ProductAsset[];
+
+  return (
+    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-slate-800">已有四宫格对比</div>
+          <div className="mt-1 text-xs text-slate-500">如果这个原始商品已经建过任务，这里会展示四宫格母图和裁切后的 4 张轮播图，方便比对。</div>
+        </div>
+        <a
+          href={`/product-tasks`}
+          className="rounded-full border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+        >
+          前往任务图工作台
+        </a>
+      </div>
+      {loading ? (
+        <div className="mt-3 text-xs text-slate-500">正在读取任务 #{taskId} 的图片资产…</div>
+      ) : !parent && !crops.length ? (
+        <div className="mt-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-5 text-center text-xs text-slate-500">
+          这个任务还没有四宫格母图或裁切图。
+        </div>
+      ) : (
+        <div className="mt-3 grid gap-3 lg:grid-cols-[1.1fr_1.6fr]">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs font-medium text-slate-700">四宫格母图</div>
+            {parent?.public_url ? (
+              <HoverZoomImage
+                src={parent.public_url}
+                alt="四宫格母图"
+                thumbClassName="mt-2 h-56 w-full rounded-xl bg-white object-contain"
+                previewWidth={640}
+              />
+            ) : (
+              <div className="mt-2 flex h-56 items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white text-xs text-slate-400">
+                暂无母图
+              </div>
+            )}
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs font-medium text-slate-700">裁切轮播图 1-4</div>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              {["carousel_1", "carousel_2", "carousel_3", "carousel_4"].map((slot, idx) => {
+                const asset = (assets[slot] || []).find((item) => item.selected_for_export) || (assets[slot] || [])[0] || null;
+                return (
+                  <div key={slot} className="rounded-lg border border-slate-200 bg-white p-2">
+                    <div className="text-[11px] font-medium text-slate-500">轮播 #{idx + 1}</div>
+                    {asset?.public_url ? (
+                      <HoverZoomImage
+                        src={asset.public_url}
+                        alt={slot}
+                        thumbClassName="mt-2 h-24 w-full rounded-lg bg-slate-50 object-contain"
+                        previewWidth={520}
+                      />
+                    ) : (
+                      <div className="mt-2 flex h-24 items-center justify-center rounded-lg border border-dashed border-slate-200 bg-slate-50 text-[11px] text-slate-400">
+                        暂无
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SequencePreview({
+  title,
+  subtitle,
+  images,
+  emptyText,
+  onSetMainImage,
+  onPromote,
+  onMoveLeft,
+  onMoveRight,
+  startIndex = 1,
+  compact = false,
+}: {
+  title: string;
+  subtitle: string;
+  images: string[];
+  emptyText: string;
+  onSetMainImage: (url: string) => void;
+  onPromote: (url: string) => void;
+  onMoveLeft: (idx: number) => void;
+  onMoveRight: (idx: number) => void;
+  startIndex?: number;
+  compact?: boolean;
+}) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+      {title ? <div className="text-sm font-medium text-slate-800">{title}</div> : null}
+      {subtitle ? <div className="mt-1 text-xs text-slate-500">{subtitle}</div> : null}
+      {images.length ? (
+        <div className={`mt-3 grid gap-2 ${compact ? "grid-cols-2 xl:grid-cols-4" : "grid-cols-2 xl:grid-cols-5"}`}>
+          {images.map((url, idx) => (
+            <div key={`${url}-${idx}`} className="rounded-lg border border-slate-200 bg-white p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[11px] font-medium text-slate-500">#{startIndex + idx}</div>
+                <div className="text-[10px] text-slate-400">{compact ? "关键位" : "可调顺序"}</div>
+              </div>
+              <HoverZoomImage
+                src={url}
+                alt={title || "sequence"}
+                thumbClassName={`mt-2 w-full rounded border border-slate-200 bg-white object-cover ${compact ? "h-20" : "h-24"}`}
+                previewWidth={520}
+              />
+              <div className="mt-2 flex flex-wrap gap-1">
+                <button type="button" onClick={() => onSetMainImage(url)} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                  设主图
+                </button>
+                <button type="button" onClick={() => onPromote(url)} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                  轮播首位
+                </button>
+                <button type="button" onClick={() => onMoveLeft(idx)} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                  前移
+                </button>
+                <button type="button" onClick={() => onMoveRight(idx)} className="rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                  后移
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-3 rounded-xl border border-dashed border-slate-300 bg-white px-3 py-5 text-center text-xs text-slate-500">
+          {emptyText}
+        </div>
+      )}
     </div>
   );
 }

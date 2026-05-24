@@ -64,8 +64,11 @@ IMAGE_PROMPT_STATUS_VALUES = tuple(status.value for status in ImagePromptStatus)
 
 
 class GenerationMode(StrEnum):
-    no_ai = "no_ai"
+    task_only = "task_only"
     title_only = "title_only"
+    title_and_4grid = "title_and_4grid"
+    # backward compatibility for historical records / clients
+    no_ai = "no_ai"
     title_and_image_prompts = "title_and_image_prompts"
     full_later = "full_later"
 

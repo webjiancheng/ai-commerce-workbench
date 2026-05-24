@@ -23,5 +23,5 @@ class ImageProvider(Protocol):
         size: str,
         model: str,
         extra_options: dict | None = None,
+        provider_options: dict | None = None,
     ) -> GeneratedImage: ...
-

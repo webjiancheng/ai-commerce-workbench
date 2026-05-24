@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,7 +15,6 @@ class ProductTask(Base):
         Index("ix_product_tasks_category_status", "category_status"),
         Index("ix_product_tasks_export_status", "export_status"),
         Index("ix_product_tasks_raw_product_id", "raw_product_id"),
-        Index("uq_product_tasks_raw_split", "raw_product_id", "split_index", unique=True),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -31,7 +30,8 @@ class ProductTask(Base):
     screenshot_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     split_index: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     split_total: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
-    generation_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="title_and_image_prompts", server_default="title_and_image_prompts")
+    generation_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="title_and_4grid", server_default="title_and_4grid")
+    include_product_info: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     main_status: Mapped[str] = mapped_column(String(32), nullable=False)
     category_status: Mapped[str] = mapped_column(String(32), nullable=False)
     title_status: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -41,6 +41,12 @@ class ProductTask(Base):
     selected_category_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     category_candidates_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Export / listing fields (added stage-8+)
+    task_no: Mapped[str | None] = mapped_column(String(64), nullable=True)  # SPU货号
+    title_package: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # {"title_cn": "", "title_en": ""}
+    category_path: Mapped[str | None] = mapped_column(Text, nullable=True)  # 分类路径
+    price_usd: Mapped[float | None] = mapped_column(Text, nullable=True)  # 申报价格(USD)
 
     # Stage-9 exception pool fields
     exception_status: Mapped[str | None] = mapped_column(String(32), nullable=True)

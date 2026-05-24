@@ -3,6 +3,7 @@ from __future__ import annotations
 PROMPT_TYPES: tuple[str, ...] = (
     "product_info_from_screenshot",
     "title_en",
+    "title_en_only",
     "title_package_lite",
     "title_package",
     "title_en_with_cn_translation",
@@ -33,6 +34,7 @@ PROMPT_VARIABLES: dict[str, dict[str, str]] = {
     "screenshot_notes": {"type": "string|null", "desc": "截图与原图备注信息"},
     "reference_images": {"type": "object", "desc": "参考图集合（主图/轮播图/详情图）"},
     "product_info": {"type": "object", "desc": "ProductInfo JSON"},
+    "product_info_context": {"type": "object", "desc": "统一商品理解上下文（供 SKU/尺寸/卖点图等手动触发链路复用）"},
     "title_package": {"type": "object", "desc": "标题包 JSON"},
     "title_en_with_cn_translation": {"type": "object", "desc": "英文标题及中文翻译 JSON"},
     "selected_category_path": {"type": "string", "desc": "当前采用类目路径"},

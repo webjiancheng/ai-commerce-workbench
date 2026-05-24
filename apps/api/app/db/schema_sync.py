@@ -49,7 +49,9 @@ def ensure_product_tasks_schema(engine: Engine) -> None:
     if "split_total" not in existing_columns:
         _add_column(engine, table="product_tasks", column_sql="split_total INTEGER NOT NULL DEFAULT 1")
     if "generation_mode" not in existing_columns:
-        _add_column(engine, table="product_tasks", column_sql="generation_mode VARCHAR(32) NOT NULL DEFAULT 'title_and_image_prompts'")
+        _add_column(engine, table="product_tasks", column_sql="generation_mode VARCHAR(32) NOT NULL DEFAULT 'title_and_4grid'")
+    if "include_product_info" not in existing_columns:
+        _add_column(engine, table="product_tasks", column_sql="include_product_info BOOLEAN NOT NULL DEFAULT true")
     if "image_prompt_status" not in existing_columns:
         _add_column(engine, table="product_tasks", column_sql="image_prompt_status VARCHAR(32) NOT NULL DEFAULT 'pending'")
     if "category_candidates_json" not in existing_columns:
@@ -219,6 +221,19 @@ def ensure_product_assets_schema(engine: Engine) -> None:
 def ensure_default_rules_schema(engine: Engine) -> None:
     inspector = inspect(engine)
     if "default_rules" in inspector.get_table_names():
+        existing_columns = {col["name"] for col in inspector.get_columns("default_rules")}
+        if "platform" not in existing_columns:
+            _add_column(engine, table="default_rules", column_sql="platform VARCHAR(32)")
+        if "site" not in existing_columns:
+            _add_column(engine, table="default_rules", column_sql="site VARCHAR(32)")
+        if "fulfillment_mode" not in existing_columns:
+            _add_column(engine, table="default_rules", column_sql="fulfillment_mode VARCHAR(32)")
+        if "category_path" not in existing_columns:
+            _add_column(engine, table="default_rules", column_sql="category_path TEXT")
+        if "conditions_json" not in existing_columns:
+            _add_column(engine, table="default_rules", column_sql="conditions_json JSONB NOT NULL DEFAULT '{}'::jsonb")
+        if "values_json" not in existing_columns:
+            _add_column(engine, table="default_rules", column_sql="values_json JSONB NOT NULL DEFAULT '{}'::jsonb")
         return
 
     ddl = """
@@ -227,8 +242,14 @@ def ensure_default_rules_schema(engine: Engine) -> None:
       name VARCHAR(128) NOT NULL,
       rule_type VARCHAR(32) NOT NULL,
       scope VARCHAR(32) NOT NULL,
+      platform VARCHAR(32) NULL,
+      site VARCHAR(32) NULL,
+      fulfillment_mode VARCHAR(32) NULL,
+      category_path TEXT NULL,
       match_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      conditions_json JSONB NOT NULL DEFAULT '{}'::jsonb,
       output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      values_json JSONB NOT NULL DEFAULT '{}'::jsonb,
       priority INTEGER NOT NULL DEFAULT 0,
       enabled BOOLEAN NOT NULL DEFAULT true,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -330,6 +351,17 @@ def ensure_export_field_mappings_schema(engine: Engine) -> None:
 def ensure_export_batches_schema(engine: Engine) -> None:
     inspector = inspect(engine)
     if "export_batches" in inspector.get_table_names():
+        existing_columns = {col["name"] for col in inspector.get_columns("export_batches")}
+        if "export_mode" not in existing_columns:
+            _add_column(engine, table="export_batches", column_sql="export_mode VARCHAR(32) NOT NULL DEFAULT 'default_rule'")
+        if "default_rule_id" not in existing_columns:
+            _add_column(engine, table="export_batches", column_sql="default_rule_id INTEGER NULL REFERENCES default_rules(id) ON DELETE SET NULL")
+        if "default_rule_name" not in existing_columns:
+            _add_column(engine, table="export_batches", column_sql="default_rule_name VARCHAR(128)")
+        if "original_filename" not in existing_columns:
+            _add_column(engine, table="export_batches", column_sql="original_filename VARCHAR(255)")
+        if "sku_row_count" not in existing_columns:
+            _add_column(engine, table="export_batches", column_sql="sku_row_count INTEGER NOT NULL DEFAULT 0")
         return
 
     ddl = """
@@ -338,7 +370,12 @@ def ensure_export_batches_schema(engine: Engine) -> None:
       batch_no VARCHAR(64) NOT NULL,
       template_id INTEGER NULL REFERENCES export_templates(id) ON DELETE SET NULL,
       template_version VARCHAR(64) NOT NULL,
+      export_mode VARCHAR(32) NOT NULL DEFAULT 'default_rule',
+      default_rule_id INTEGER NULL REFERENCES default_rules(id) ON DELETE SET NULL,
+      default_rule_name VARCHAR(128) NULL,
+      original_filename VARCHAR(255) NULL,
       total_count INTEGER NOT NULL DEFAULT 0,
+      sku_row_count INTEGER NOT NULL DEFAULT 0,
       success_count INTEGER NOT NULL DEFAULT 0,
       failed_count INTEGER NOT NULL DEFAULT 0,
       exported_file_path TEXT NULL,
@@ -349,6 +386,60 @@ def ensure_export_batches_schema(engine: Engine) -> None:
     CREATE UNIQUE INDEX uq_export_batches_batch_no ON export_batches (batch_no);
     CREATE INDEX ix_export_batches_status ON export_batches (status);
     CREATE INDEX ix_export_batches_created_at ON export_batches (created_at);
+    """
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
+def ensure_ai_import_batches_schema(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if "ai_import_batches" in inspector.get_table_names():
+        return
+
+    ddl = """
+    CREATE TABLE ai_import_batches (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(128) NOT NULL DEFAULT 'AI导入批次',
+      template_file_path TEXT NULL,
+      original_filename VARCHAR(255) NULL,
+      raw_json_text TEXT NOT NULL DEFAULT '',
+      sheet_name VARCHAR(128) NULL,
+      parsed_common_fields_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      parsed_headers_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      parsed_rows_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      parsed_warnings_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      validation_result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status VARCHAR(32) NOT NULL DEFAULT 'uploaded',
+      error_message TEXT NULL,
+      export_file_path TEXT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX ix_ai_import_batches_status ON ai_import_batches (status);
+    CREATE INDEX ix_ai_import_batches_created_at ON ai_import_batches (created_at);
+    """
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
+def ensure_ai_import_drafts_schema(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if "ai_import_drafts" in inspector.get_table_names():
+        return
+
+    ddl = """
+    CREATE TABLE ai_import_drafts (
+      id SERIAL PRIMARY KEY,
+      batch_id INTEGER NOT NULL REFERENCES ai_import_batches(id) ON DELETE CASCADE,
+      common_fields_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      headers_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      rows_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      field_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      validation_result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX ix_ai_import_drafts_batch_id ON ai_import_drafts (batch_id);
     """
     with engine.begin() as conn:
         conn.execute(text(ddl))
@@ -479,3 +570,20 @@ def ensure_cost_configs_schema(engine: Engine) -> None:
     """
     with engine.begin() as conn:
         conn.execute(text(ddl))
+
+
+def ensure_listing_templates_schema(engine: Engine) -> None:
+    """Handle listing_templates indexes that may have been created by Base.metadata.create_all."""
+    inspector = inspect(engine)
+    if "listing_templates" not in inspector.get_table_names():
+        return
+
+    existing_indexes = {idx["name"] for idx in inspector.get_indexes("listing_templates")}
+    # Drop all listing_templates indexes to avoid DuplicateIndex errors on restart
+    for idx_name in existing_indexes:
+        if idx_name.startswith("ix_listing_templates_"):
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"DROP INDEX IF EXISTS {idx_name}"))
+            except Exception:
+                pass

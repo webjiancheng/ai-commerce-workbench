@@ -5,6 +5,9 @@ __pycache__/
 .mypy_cache/
 *.pyc
 
+apps/api/ai_caiji_api.egg-info/
+apps/web/tsconfig.tsbuildinfo
+
 node_modules/
 .next/
 out/

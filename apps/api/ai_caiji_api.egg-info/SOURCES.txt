@@ -1,4 +1,3 @@
-README.md
 pyproject.toml
 ai_caiji_api.egg-info/PKG-INFO
 ai_caiji_api.egg-info/SOURCES.txt
@@ -21,6 +20,7 @@ app/api/routes/export_templates.py
 app/api/routes/exports.py
 app/api/routes/health.py
 app/api/routes/image_jobs.py
+app/api/routes/listing_templates.py
 app/api/routes/product_tasks.py
 app/api/routes/prompt_templates.py
 app/api/routes/provider_configs.py
@@ -38,6 +38,8 @@ app/db/init_db.py
 app/db/schema_sync.py
 app/db/session.py
 app/models/__init__.py
+app/models/ai_import_batch.py
+app/models/ai_import_draft.py
 app/models/batch_edit_queue.py
 app/models/cost_config.py
 app/models/cost_record.py
@@ -48,6 +50,7 @@ app/models/export_field_mapping.py
 app/models/export_record.py
 app/models/export_template.py
 app/models/image_generation_job.py
+app/models/listing_template.py
 app/models/product_ai_result.py
 app/models/product_asset.py
 app/models/product_task.py
@@ -56,6 +59,7 @@ app/models/provider_config.py
 app/models/raw_product.py
 app/models/usage_limit.py
 app/schemas/__init__.py
+app/schemas/ai_import.py
 app/schemas/default_rule.py
 app/schemas/export_batch.py
 app/schemas/export_field_draft.py
@@ -63,12 +67,14 @@ app/schemas/export_field_mapping.py
 app/schemas/export_record.py
 app/schemas/export_template.py
 app/schemas/image_generation_job.py
+app/schemas/listing_template.py
 app/schemas/product_asset.py
 app/schemas/product_task.py
 app/schemas/prompt_template.py
 app/schemas/provider_config.py
 app/schemas/raw_product.py
 app/services/__init__.py
+app/services/ai_imports.py
 app/services/ai_pipeline.py
 app/services/category_dictionary.py
 app/services/cost_configs.py
@@ -84,6 +90,8 @@ app/services/export_template_parser.py
 app/services/export_templates.py
 app/services/file_storage.py
 app/services/image_generation.py
+app/services/listing_default_fields.py
+app/services/listing_template_seed.py
 app/services/openai_client.py
 app/services/product_tasks.py
 app/services/prompt_seed.py
@@ -92,6 +100,8 @@ app/services/provider_configs.py
 app/services/provider_seed.py
 app/services/raw_products.py
 app/services/storage_provider.py
+app/services/task_bootstrap.py
+app/services/task_exceptions.py
 app/services/usage_limits.py
 app/services/image_providers/__init__.py
 app/services/image_providers/base.py

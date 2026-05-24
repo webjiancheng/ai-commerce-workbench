@@ -35,6 +35,11 @@ def set_runtime_override(override: dict[str, Any] | None) -> None:
     _runtime_override_ctx.set(override or None)
 
 
+def get_runtime_override() -> dict[str, Any] | None:
+    current = _runtime_override_ctx.get()
+    return current if isinstance(current, dict) else None
+
+
 @contextmanager
 def runtime_override(override: dict[str, Any] | None):
     token = _runtime_override_ctx.set(override or None)

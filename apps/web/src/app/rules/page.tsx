@@ -1,198 +1,247 @@
 "use client";
 
 import { apiBaseUrl } from "@/lib/api";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
+/* ───────────────── types ───────────────── */
 type DefaultRule = {
   id: number;
   name: string;
   rule_type: string;
   scope: string;
-  match_json: Record<string, unknown>;
-  output_json: Record<string, unknown>;
+  platform: string | null;
+  site: string | null;
+  fulfillment_mode: string | null;
+  category_path: string | null;
+  conditions_json: Record<string, unknown>;
+  values_json: Record<string, unknown>;
   priority: number;
   enabled: boolean;
-  created_at: string;
   updated_at: string;
 };
 
-type ListResponse = {
-  items: DefaultRule[];
-  total: number;
-  limit: number;
-  offset: number;
-};
+type CategorySearchItem = { path: string; leaf: string };
 
-type FieldDraft = {
-  fieldKey: string;
-  value: string;
-};
-
-type TemplateFieldsResponse = {
-  ok: boolean;
-  template_id: number;
-  fields: Array<{ field_key: string; field_name: string; required?: boolean }>;
-};
-
-type ExportFieldMapping = {
-  id: number;
-  template_id: number;
-  field_key: string;
-  field_name: string;
-  source_type: string | null;
-  source_path: string | null;
-  required: boolean;
-};
-
-type FieldTemplate = {
+type QuickTemplate = {
   id: string;
   name: string;
-  rows: FieldDraft[];
+  platform: string;
+  category_path: string;
+  category_keywords: string;
+  values: Record<string, string>;
 };
 
-const RULE_TYPE_LABEL: Record<string, string> = {
-  fixed_default: "全局默认值（所有商品都补）",
-  category_default: "类目默认值（指定类目补）",
-  keyword_rule: "关键词规则（标题含关键词时补）",
-  sensitive_rule: "敏感词规则（命中敏感词时处理）",
-  sku_flatten_rule: "SKU 处理规则（SKU 字段整理）",
+type FieldEntry = { key: string; value: string; layer: "uniform" | "category" | "manual"; status: "filled" | "empty" };
+
+/* ───────────────── field groups (高密度版) ───────────────── */
+type FieldDef = {
+  key: string;
+  label: string;
+  type?: "text" | "select" | "number" | "textarea";
+  options?: string[];
+  hint?: string;
+  layer: "uniform" | "category" | "manual";
+  group: string;
 };
 
-const SCOPE_LABEL: Record<string, string> = {
-  global: "全局（对全部商品生效）",
-  category: "类目（只对某类目生效）",
-  keyword: "关键词（命中关键词才生效）",
-  product: "单商品（只对指定商品生效）",
+const ALL_FIELD_DEFS: Record<string, FieldDef> = {
+  // ── 站点与物流 (Layer-2) ──
+  经营站点: { key: "经营站点", label: "经营站点", type: "select", options: ["美国站", "英国站", "德国站", "法国站", "意大利站", "西班牙站", "日本站", "澳大利亚站"], layer: "uniform", group: "经营配置" },
+  发货仓: { key: "发货仓", label: "发货仓", type: "select", options: ["美国-饰品", "美国-普货", "英国-饰品", "英国-普货", "德国-饰品", "德国-普货"], layer: "uniform", group: "经营配置" },
+  运费模版: { key: "运费模版", label: "运费模版", type: "text", hint: "按站点自动切换", layer: "uniform", group: "经营配置" },
+  承诺发货时效: { key: "承诺发货时效", label: "承诺发货时效", type: "select", options: ["2个工作日内发货", "3个工作日内发货", "5个工作日内发货", "7个工作日内发货"], layer: "uniform", group: "经营配置" },
+  素材语言: { key: "素材语言", label: "素材语言", type: "select", options: ["英语", "英语+德语", "英语+法语", "英语+西班牙语", "多语言"], layer: "uniform", group: "经营配置" },
+  // ── 商品基础 (Layer-2) ──
+  商品产地: { key: "商品产地", label: "商品产地", type: "select", options: ["中国", "美国", "日本", "韩国", "英国"], layer: "uniform", group: "商品与SKU默认" },
+  产地省份: { key: "产地省份", label: "产地省份", type: "text", hint: "默认广东省", layer: "uniform", group: "商品与SKU默认" },
+  商品层级: { key: "商品层级", label: "商品层级", type: "select", options: ["根据 SKU 自动判断", "单SKU商品", "多SKU商品"], layer: "uniform", group: "商品与SKU默认" },
+  SPU货号规则: { key: "SPU货号规则", label: "SPU货号规则", type: "select", options: ["自动生成", "手动填写"], layer: "uniform", group: "商品与SKU默认" },
+  SKU货号规则: { key: "SKU货号规则", label: "SKU货号规则", type: "select", options: ["自动生成", "手动填写"], layer: "uniform", group: "商品与SKU默认" },
+  // ── SKU 规格 (Layer-2) ──
+  默认规格类型: { key: "默认规格类型", label: "默认规格类型", type: "text", hint: "例如：款式/颜色", layer: "uniform", group: "商品与SKU默认" },
+  币种: { key: "币种", label: "币种", type: "select", options: ["CNY", "USD", "EUR", "GBP"], layer: "uniform", group: "商品与SKU默认" },
+  发货仓1: { key: "发货仓1", label: "发货仓1", type: "text", hint: "默认同顶部发货仓", layer: "uniform", group: "商品与SKU默认" },
+  默认库存: { key: "默认库存", label: "默认库存", type: "number", hint: "每个SKU默认数量", layer: "uniform", group: "商品与SKU默认" },
+  SKU分类: { key: "SKU分类", label: "SKU分类", type: "select", options: ["单品", "同款多件装", "混合套装"], layer: "uniform", group: "商品与SKU默认" },
+  SKU数量: { key: "SKU数量", label: "SKU数量", type: "number", layer: "uniform", group: "商品与SKU默认" },
+  SKU数量单位: { key: "SKU数量单位", label: "SKU数量单位", type: "select", options: ["件", "套", "对", "个", "组", "盒", "袋"], layer: "uniform", group: "商品与SKU默认" },
+  是否独立包装: { key: "是否独立包装", label: "是否独立包装", type: "select", options: ["是", "否"], layer: "uniform", group: "商品与SKU默认" },
+  商品编码类型: { key: "商品编码类型", label: "商品编码类型", type: "select", options: ["", "UPC", "EAN", "GTIN", "ASIN", "ISBN"], hint: "选填", layer: "uniform", group: "商品与SKU默认" },
+  商品编码: { key: "商品编码", label: "商品编码", type: "text", hint: "选填", layer: "uniform", group: "商品与SKU默认" },
+  制造商建议零售价USD: { key: "制造商建议零售价(USD)", label: "建议零售价(USD)", type: "text", hint: "非必填", layer: "uniform", group: "商品与SKU默认" },
+  参考链接: { key: "参考链接", label: "参考链接", type: "text", hint: "选填，获取申报参考价", layer: "uniform", group: "商品与SKU默认" },
+  // ── 尺寸重量 (Layer-2) ──
+  最长边cm: { key: "最长边（cm）", label: "最长边(cm)", type: "number", hint: "cm", layer: "uniform", group: "尺寸与重量" },
+  次长边cm: { key: "次长边（cm）", label: "次长边(cm)", type: "number", hint: "cm", layer: "uniform", group: "尺寸与重量" },
+  最短边cm: { key: "最短边（cm）", label: "最短边(cm)", type: "number", hint: "cm", layer: "uniform", group: "尺寸与重量" },
+  重量g: { key: "重量（g）", label: "重量(g)", type: "number", hint: "克", layer: "uniform", group: "尺寸与重量" },
+  // ── 敏感属性 (Layer-2) ──
+  敏感词属性1: { key: "敏感词属性1", label: "敏感词属性1", type: "select", options: ["", "纯电", "内电", "液体", "粉末", "膏体", "刀具", "磁性", "气雾剂"], hint: "无敏感则空", layer: "uniform", group: "敏感属性" },
+  敏感词属性2: { key: "敏感词属性2", label: "敏感词属性2", type: "select", options: ["", "纯电", "内电", "液体", "粉末", "膏体", "刀具", "磁性", "气雾剂"], layer: "uniform", group: "敏感属性" },
+  敏感词属性3: { key: "敏感词属性3", label: "敏感词属性3", type: "select", options: ["", "纯电", "内电", "液体", "粉末", "膏体", "刀具", "磁性", "气雾剂"], layer: "uniform", group: "敏感属性" },
+  液体容量ml: { key: "液体容量（ml）", label: "液体容量(ml)", type: "text", hint: "选择液体时填", layer: "uniform", group: "敏感属性" },
+  刀具长度cm: { key: "刀具长度(cm)", label: "刀具长度(cm)", type: "text", hint: "选择刀具时填", layer: "uniform", group: "敏感属性" },
+  刀尖角度度: { key: "刀尖角度(度)", label: "刀尖角度(度)", type: "text", hint: "选择刀具时填", layer: "uniform", group: "敏感属性" },
+  储电容量wh: { key: "储电容量（wh）", label: "储电容量(wh)", type: "text", hint: "选择纯电/内电时填", layer: "uniform", group: "敏感属性" },
+  // ── 类目属性 (Layer-3) ──
+  镀层: { key: "镀层", label: "镀层", type: "select", options: ["无镀层", "镀金", "镀银", "镀铜", "镀玫瑰金", "镀白金"], layer: "category", group: "类目属性" },
+  镶嵌材质: { key: "镶嵌材质", label: "镶嵌材质", type: "select", options: ["无镶嵌", "锆石", "珍珠", "宝石", "水钻", "翡翠", "珊瑚"], layer: "category", group: "类目属性" },
+  主体材质: { key: "主体材质", label: "主体材质", type: "select", options: ["合金", "纯银", "925银", "不锈钢", "钛钢", "铜", "木头", "树脂"], layer: "category", group: "类目属性" },
+  银材料净克重: { key: "银材料净克重(g）", label: "银材料净克重(g）", type: "text", hint: "银材质时必填", layer: "category", group: "类目属性" },
+  银材料净克重单位: { key: "银材料净克重(g）单位", label: "银材料净克重单位", type: "select", options: ["g", "mg"], layer: "category", group: "类目属性" },
+  耳针材质: { key: "耳针材质", label: "耳针材质", type: "select", options: ["合金", "纯银", "925银", "不锈钢", "钛钢"], layer: "category", group: "类目属性" },
+  是否为羽毛: { key: "是否为羽毛", label: "是否为羽毛", type: "select", options: ["否", "是"], layer: "category", group: "类目属性" },
+  适配季节: { key: "适配季节", label: "适配季节", type: "select", options: ["四季", "春季", "夏季", "秋季", "冬季", "春夏", "秋冬"], layer: "category", group: "类目属性" },
+  是否含金属部件: { key: "是否含金属部件", label: "是否含金属部件", type: "select", options: ["是", "否"], layer: "category", group: "类目属性" },
+  金属部件材质类型1: { key: "金属部件材质类型1", label: "金属部件材质类型1", type: "select", options: ["合金", "纯银", "925银", "不锈钢", "钛钢", "铜"], layer: "category", group: "类目属性" },
+  金属部件材质类型2: { key: "金属部件材质类型2", label: "金属部件材质类型2", type: "select", options: ["", "合金", "纯银", "925银", "不锈钢", "钛钢", "铜"], layer: "category", group: "类目属性" },
+  金属部件材质类型3: { key: "金属部件材质类型3", label: "金属部件材质类型3", type: "select", options: ["", "合金", "纯银", "925银", "不锈钢", "钛钢", "铜"], layer: "category", group: "类目属性" },
+  木材类型: { key: "木材类型", label: "木材类型", type: "text", hint: "木质饰品填写", layer: "category", group: "类目属性" },
+  木种: { key: "木种", label: "木种", type: "text", hint: "例如：红木、松木", layer: "category", group: "类目属性" },
+  羽毛材质: { key: "羽毛材质", label: "羽毛材质", type: "text", hint: "羽毛饰品填写", layer: "category", group: "类目属性" },
+  // ── 风格/场合 (Layer-3 多选) ──
+  风格1: { key: "风格1", label: "风格1（可选）", type: "textarea", hint: "例如：时尚、简约、复古", layer: "category", group: "风格与场合" },
+  风格2: { key: "风格2", label: "风格2（可选）", type: "textarea", layer: "category", group: "风格与场合" },
+  风格3: { key: "风格3", label: "风格3（可选）", type: "textarea", layer: "category", group: "风格与场合" },
+  佩戴场合1: { key: "佩戴场合1", label: "佩戴场合1（可选）", type: "textarea", hint: "例如：日常、派对", layer: "category", group: "风格与场合" },
+  佩戴场合2: { key: "佩戴场合2", label: "佩戴场合2（可选）", type: "textarea", layer: "category", group: "风格与场合" },
+  营销节日1: { key: "营销节日1", label: "营销节日1（可选）", type: "textarea", hint: "例如：情人节、圣诞节", layer: "category", group: "风格与场合" },
+  主题1: { key: "主题1", label: "主题1（可选）", type: "textarea", hint: "例如：几何、花朵、爱心", layer: "category", group: "风格与场合" },
+  诞生石1: { key: "诞生石1", label: "诞生石1（可选）", type: "textarea", layer: "category", group: "风格与场合" },
+  系列线1: { key: "系列线1", label: "系列线1（可选）", type: "textarea", layer: "category", group: "风格与场合" },
+  // ── 人工必填 (Layer-4) ──
+  申报价格美国站: { key: "申报价格-美国站", label: "申报价格（美国站）", type: "text", hint: "必填，需参考同类商品价格", layer: "manual", group: "人工必填" },
 };
 
-const TRIGGER_FIELD_OPTIONS = [
-  { value: "always", label: "不过滤（所有商品）", hint: "不需要填触发值" },
-  { value: "category_path", label: "类目路径 category_path", hint: "示例：手机配件>手机壳" },
-  { value: "title", label: "商品标题 title（包含）", hint: "示例：磁吸" },
-  { value: "source_id", label: "来源ID/平台SKU", hint: "示例：1234567890" },
-  { value: "platform", label: "平台 platform", hint: "示例：temu" },
-];
+/* 字段分组顺序 */
+const FIELD_GROUPS_ORDER = ["经营配置", "商品与SKU默认", "尺寸与重量", "敏感属性", "类目属性", "风格与场合", "人工必填"];
 
-const OUTPUT_FIELD_OPTIONS: Array<{ value: string; label: string; hint: string; required?: boolean }> = [
-  { value: "is_sensitive", label: "是否敏感商品", hint: "填 true 或 false", required: true },
-  { value: "declared_price_cny", label: "申报价（CNY）", hint: "填数字，如 8.9", required: true },
-  { value: "suggested_price_cny", label: "建议售价（CNY）", hint: "填数字，如 19.9" },
-  { value: "category_path", label: "默认类目路径", hint: "示例：家居>收纳" },
-  { value: "material", label: "默认材质", hint: "示例：硅胶" },
-  { value: "target_user", label: "默认适用人群", hint: "示例：成人女性" },
-  { value: "usage_scene", label: "默认使用场景", hint: "示例：居家日用" },
-  { value: "package_hint", label: "默认包装说明", hint: "示例：标准包装" },
-  { value: "master_no", label: "主编号", hint: "示例：M-001", required: true },
-  { value: "master_item_no", label: "主货号", hint: "示例：SKU-MAIN-01" },
-  { value: "stock_qty", label: "库存", hint: "填数字，如 9999" },
-  { value: "origin_country", label: "产地", hint: "示例：中国", required: true },
-  { value: "is_custom", label: "定制品", hint: "示例：否", required: true },
-  { value: "sku_spec1_name", label: "规格名称1", hint: "示例：颜色", required: true },
-  { value: "sku_spec1_value", label: "规格属性值1", hint: "示例：黑色", required: true },
-  { value: "sku_spec2_name", label: "规格名称2", hint: "示例：尺寸", required: true },
-  { value: "sku_spec2_value", label: "规格属性值2", hint: "示例：M", required: true },
-  { value: "length_cm", label: "长（cm）", hint: "示例：25", required: true },
-  { value: "width_cm", label: "宽（cm）", hint: "示例：10", required: true },
-  { value: "height_cm", label: "高（cm）", hint: "示例：6", required: true },
-  { value: "weight_g", label: "重量（g）", hint: "示例：320", required: true },
-  { value: "sensitive_type", label: "敏感属性值", hint: "示例：带电池" },
-  { value: "battery_capacity", label: "储电容量", hint: "示例：5000mAh" },
-  { value: "blade_length", label: "刀具长度", hint: "示例：8cm" },
-  { value: "blade_tip_sharpness", label: "刀具尖度", hint: "示例：圆头" },
-  { value: "liquid_capacity", label: "液体容量", hint: "示例：500ml" },
-  { value: "product_code_type", label: "产品编码类型", hint: "示例：EAN" },
-  { value: "product_code", label: "产品编码", hint: "示例：1234567890123" },
-  { value: "sku_class_type", label: "SKU分类类型", hint: "示例：件" },
-  { value: "sku_class_count", label: "SKU分类数量", hint: "示例：12" },
-  { value: "sku_class_unit", label: "SKU分类单位", hint: "示例：个" },
-  { value: "is_independent_packaging", label: "是否独立包装", hint: "示例：是" },
-  { value: "packing_list", label: "包装清单", hint: "示例：主品*1，配件*2" },
-  { value: "packing_list_count", label: "包装清单数量", hint: "示例：3" },
-  { value: "main_video_url", label: "主图视频", hint: "示例：https://..." },
-  { value: "manual_url", label: "产品说明书", hint: "示例：https://..." },
-  { value: "supplier_url", label: "货源链接", hint: "示例：https://..." },
-];
-
-const FIELD_TEMPLATES: FieldTemplate[] = [
+const QUICK_TEMPLATES: QuickTemplate[] = [
   {
-    id: "temu_basic",
-    name: "Temu 常用基础字段（含必填）",
-    rows: [
-      { fieldKey: "master_no", value: "" },
-      { fieldKey: "origin_country", value: "中国" },
-      { fieldKey: "is_custom", value: "否" },
-      { fieldKey: "sku_spec1_name", value: "" },
-      { fieldKey: "sku_spec1_value", value: "" },
-      { fieldKey: "sku_spec2_name", value: "" },
-      { fieldKey: "sku_spec2_value", value: "" },
-      { fieldKey: "length_cm", value: "" },
-      { fieldKey: "width_cm", value: "" },
-      { fieldKey: "height_cm", value: "" },
-      { fieldKey: "weight_g", value: "" },
-      { fieldKey: "is_sensitive", value: "false" },
-      { fieldKey: "declared_price_cny", value: "8.9" },
-      { fieldKey: "material", value: "塑料" },
-      { fieldKey: "target_user", value: "成人通用" },
-      { fieldKey: "usage_scene", value: "居家日用" },
-      ],
+    id: "earrings-us-half",
+    name: "女士耳饰（半托）",
+    platform: "Temu",
+    category_path: "服装、鞋靴和珠宝饰品>女士时尚>女士饰品>女士耳饰>女士时尚耳廓环和全耳式耳环",
+    category_keywords: "女士耳饰,女童耳饰,女士时尚耳廓环",
+    values: {
+      "经营站点": "美国站",
+      "发货仓": "美国-饰品",
+      "运费模版": "美国运费模版",
+      "承诺发货时效": "7个工作日内发货",
+      "素材语言": "英语",
+      "商品产地": "中国",
+      "产地省份": "广东省",
+      "币种": "CNY",
+      "默认库存": "100",
+      "SKU分类": "单品",
+      "SKU数量": "1",
+      "SKU数量单位": "件",
+      "是否独立包装": "是",
+      "最长边（cm）": "10",
+      "次长边（cm）": "8",
+      "最短边（cm）": "2",
+      "重量（g）": "30",
+      "镀层": "无镀层",
+      "镶嵌材质": "无镶嵌",
+      "主体材质": "合金",
+      "耳针材质": "合金",
+      "适配季节": "四季",
+      "是否含金属部件": "是",
+      "金属部件材质类型1": "合金",
+      "风格1": "时尚",
+      "风格2": "简约",
+      "风格3": "复古",
+      "佩戴场合1": "日常",
+      "佩戴场合2": "派对",
+      "营销节日1": "情人节、圣诞节、母亲节",
+      "主题1": "几何、花朵、爱心",
+    },
   },
   {
-    id: "safe_fallback",
-      name: "通用兜底字段",
-      rows: [
-      { fieldKey: "is_sensitive", value: "false" },
-      { fieldKey: "package_hint", value: "标准包装" },
-      { fieldKey: "usage_scene", value: "居家日用" },
-      ],
+    id: "blank",
+    name: "空白规则",
+    platform: "Temu",
+    category_path: "",
+    category_keywords: "自定义",
+    values: {},
   },
 ];
 
-function safeJsonParse(text: string): Record<string, unknown> | null {
-  try {
-    const obj = JSON.parse(text);
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
-    return obj as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+function getGroupFields(group: string): FieldDef[] {
+  return Object.values(ALL_FIELD_DEFS).filter((f) => f.group === group);
 }
 
+/* ───────────────── utils ───────────────── */
+function toTextMap(input: Record<string, unknown> | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input || {})) {
+    out[key] = value == null ? "" : String(value);
+  }
+  return out;
+}
+
+function formatDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function getLayerBadgeClass(layer: string): string {
+  if (layer === "manual") return "bg-rose-100 text-rose-700";
+  if (layer === "category") return "bg-blue-100 text-blue-700";
+  return "bg-slate-100 text-slate-600";
+}
+
+function getStatusBadgeClass(status: string): string {
+  if (status === "filled") return "bg-emerald-100 text-emerald-700";
+  return "bg-amber-100 text-amber-700";
+}
+
+/* ───────────────── component ───────────────── */
 export default function RulesPage() {
+  const [items, setItems] = useState<DefaultRule[]>([]);
+  const [templates] = useState<QuickTemplate[]>(QUICK_TEMPLATES);
   const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [data, setData] = useState<ListResponse>({ items: [], total: 0, limit: 200, offset: 0 });
+  const [notice, setNotice] = useState<string | null>(null);
 
-  const [name, setName] = useState("");
-  const [ruleType, setRuleType] = useState("fixed_default");
-  const [scope, setScope] = useState("global");
-  const [priority, setPriority] = useState(0);
+  // Edit state
+  const [editingRuleId, setEditingRuleId] = useState<number | null>(null);
+  const [name, setName] = useState("新建默认值规则");
+  const [platform, setPlatform] = useState("Temu");
+  const [site, setSite] = useState("美国站");
+  const [fulfillmentMode, setFulfillmentMode] = useState("半托");
+  const [categoryPath, setCategoryPath] = useState("");
+  const [ruleType] = useState("category_default");
+  const [scope] = useState("category");
+  const [priority, setPriority] = useState(100);
   const [enabled, setEnabled] = useState(true);
-  const [matchJsonText, setMatchJsonText] = useState("{}");
-  const [outputJsonText, setOutputJsonText] = useState("{\n  \"is_sensitive\": false\n}");
-  const [simpleTriggerField, setSimpleTriggerField] = useState("always");
-  const [simpleTriggerValue, setSimpleTriggerValue] = useState("");
-  const [fieldDrawerOpen, setFieldDrawerOpen] = useState(false);
-  const [requiredDraftKeys, setRequiredDraftKeys] = useState<Set<string>>(new Set());
-  const [selectedTemplateId, setSelectedTemplateId] = useState(FIELD_TEMPLATES[0]?.id || "");
-  const [fieldDrafts, setFieldDrafts] = useState<FieldDraft[]>([
-    { fieldKey: "is_sensitive", value: "false" },
-    { fieldKey: "declared_price_cny", value: "" },
-    { fieldKey: "material", value: "" },
-  ]);
+  const [values, setValues] = useState<Record<string, string>>({});
 
-  const matchJsonErr = useMemo(() => (safeJsonParse(matchJsonText) ? null : "条件 JSON 格式不正确"), [
-    matchJsonText,
-  ]);
-  const outputJsonErr = useMemo(() => (safeJsonParse(outputJsonText) ? null : "结果 JSON 格式不正确"), [outputJsonText]);
+  // Category search
+  const [categoryQuery, setCategoryQuery] = useState("");
+  const [categorySuggestions, setCategorySuggestions] = useState<CategorySearchItem[]>([]);
+  const [categorySearching, setCategorySearching] = useState(false);
+  const [showCategoryDropdown, setShowCategoryDropdown] = useState(false);
 
-  async function load(): Promise<void> {
+  // Collapsed groups - 默认只展开"经营配置"和"商品与SKU默认"
+  const [activeGroups, setActiveGroups] = useState<Set<string>>(
+    new Set(["经营配置", "商品与SKU默认"])
+  );
+
+  // Template selection
+  const [selectedTemplate, setSelectedTemplate] = useState<string>("");
+
+  /* ─────────── load rules ─────────── */
+  async function loadRules(): Promise<void> {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/default-rules?enabled=true&limit=200&offset=0`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = (await res.json()) as ListResponse;
-      setData(json);
+      const rulesRes = await fetch(`${apiBaseUrl}/api/default-rules?limit=200&offset=0`, { cache: "no-store" });
+      if (!rulesRes.ok) throw new Error(`HTTP ${rulesRes.status}`);
+      const rulesData = (await rulesRes.json()) as { items: DefaultRule[] };
+      setItems(rulesData.items || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载规则失败");
     } finally {
@@ -201,503 +250,626 @@ export default function RulesPage() {
   }
 
   useEffect(() => {
-    void load();
+    void loadRules();
   }, []);
 
+  /* ─────────── category search ─────────── */
   useEffect(() => {
-    async function loadRequiredKeys(): Promise<void> {
-      try {
-        const templateRes = await fetch(`${apiBaseUrl}/api/export-template/fields`, { cache: "no-store" });
-        if (!templateRes.ok) return;
-        const templateJson = (await templateRes.json()) as TemplateFieldsResponse;
-        if (!templateJson?.template_id) return;
-
-        const mappingRes = await fetch(
-          `${apiBaseUrl}/api/export-field-mappings?template_id=${templateJson.template_id}`,
-          { cache: "no-store" },
-        );
-        if (!mappingRes.ok) return;
-        const mappings = (await mappingRes.json()) as ExportFieldMapping[];
-        const requiredKeys = new Set<string>();
-        for (const m of mappings) {
-          if (!m.required || m.source_type !== "draft" || !m.source_path) continue;
-          const path = m.source_path.trim().replace(/^export_field_drafts\./, "").replace(/^fields\./, "");
-          if (path) requiredKeys.add(path);
-        }
-        setRequiredDraftKeys(requiredKeys);
-      } catch {
-        // ignore and keep fallback required labels
-      }
-    }
-    void loadRequiredKeys();
-  }, []);
-
-  function applySimpleBuilder(): void {
-    const triggerValue = simpleTriggerValue.trim();
-    const match: Record<string, unknown> = {};
-    if (simpleTriggerField === "category_path" && triggerValue) {
-      match.category_path_contains = triggerValue;
-    } else if (simpleTriggerField === "title" && triggerValue) {
-      match.keywords = [triggerValue];
-    } else if (simpleTriggerField === "source_id" && triggerValue) {
-      match.field_equals = { platform_sku: triggerValue };
-    } else if (simpleTriggerField === "platform" && triggerValue) {
-      match.field_equals = { platform: triggerValue };
-    }
-
-    setMatchJsonText(JSON.stringify(match, null, 2));
-  }
-
-  function parseFieldValue(text: string): unknown {
-    const v = text.trim();
-    if (v === "true") return true;
-    if (v === "false") return false;
-    if (v !== "" && !Number.isNaN(Number(v))) return Number(v);
-    return text;
-  }
-
-  function syncFieldDraftsFromOutput(): void {
-    const parsed = safeJsonParse(outputJsonText);
-    if (!parsed) return;
-    const next = Object.entries(parsed).map(([key, value]) => ({
-      fieldKey: key,
-      value: typeof value === "string" ? value : JSON.stringify(value),
-    }));
-    if (next.length) setFieldDrafts(next);
-  }
-
-  function applyFieldDraftsToOutput(): void {
-    const output: Record<string, unknown> = {};
-    for (const row of fieldDrafts) {
-      const key = row.fieldKey.trim();
-      if (!key) continue;
-      output[key] = parseFieldValue(row.value);
-    }
-    setOutputJsonText(JSON.stringify(output, null, 2));
-    setFieldDrawerOpen(false);
-  }
-
-  function applyTemplate(append: boolean): void {
-    const tpl = FIELD_TEMPLATES.find((t) => t.id === selectedTemplateId);
-    if (!tpl) return;
-    if (!append) {
-      setFieldDrafts(tpl.rows.map((r) => ({ ...r })));
+    if (!categoryQuery.trim()) {
+      setCategorySuggestions([]);
+      setShowCategoryDropdown(false);
       return;
     }
-    setFieldDrafts((prev) => {
-      const merged = [...prev];
-      for (const row of tpl.rows) {
-        if (!merged.find((x) => x.fieldKey.trim() === row.fieldKey.trim())) merged.push({ ...row });
-      }
-      for (const req of requiredDraftKeys) {
-        if (!merged.find((x) => x.fieldKey.trim() === req.trim())) {
-          merged.push({ fieldKey: req, value: "" });
+    const timer = setTimeout(async () => {
+      setCategorySearching(true);
+      try {
+        const res = await fetch(`${apiBaseUrl}/api/categories/search?q=${encodeURIComponent(categoryQuery)}&limit=50`, { cache: "no-store" });
+        if (res.ok) {
+          const data = (await res.json()) as { items: CategorySearchItem[] };
+          setCategorySuggestions(data.items || []);
+          setShowCategoryDropdown(true);
         }
+      } catch {
+        setCategorySuggestions([]);
+      } finally {
+        setCategorySearching(false);
       }
-      return merged;
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [categoryQuery]);
+
+  /* ─────────── apply listing template ─────────── */
+  function applyTemplateItem(templateId: string): void {
+    const tmpl = templates.find((t) => t.id === templateId);
+    if (!tmpl) return;
+    setSelectedTemplate(`tmpl-${templateId}`);
+    setName(tmpl.name);
+    setPlatform(tmpl.platform || "Temu");
+    if (tmpl.category_path) {
+      setCategoryPath(tmpl.category_path);
+      setCategoryQuery(tmpl.category_path);
+    }
+    setValues({ ...tmpl.values });
+    setNotice(`已加载模板「${tmpl.name}」`);
+  }
+
+  /* ─────────── toggle group ─────────── */
+  function toggleGroup(title: string): void {
+    setActiveGroups((current) => {
+      const next = new Set(current);
+      if (next.has(title)) next.delete(title);
+      else next.add(title);
+      return next;
     });
   }
 
-  async function createRule(): Promise<void> {
-    setError(null);
-    const match = safeJsonParse(matchJsonText);
-    const output = safeJsonParse(outputJsonText);
-    if (!match) return setError("命中条件 JSON 格式不正确");
-    if (!output) return setError("补齐结果 JSON 格式不正确");
-    if (!name.trim()) return setError("规则名称必填");
+  /* ─────────── update value ─────────── */
+  function updateValue(key: string, value: string): void {
+    setValues((current) => ({ ...current, [key]: value }));
+  }
 
+  /* ─────────── fill form from rule ─────────── */
+  function fillFormFromRule(rule: DefaultRule, copyMode: boolean): void {
+    setEditingRuleId(copyMode ? null : rule.id);
+    setName(copyMode ? `${rule.name}-副本` : rule.name);
+    setPlatform(rule.platform || "Temu");
+    setSite(rule.site || "美国站");
+    setFulfillmentMode(rule.fulfillment_mode || "半托");
+    setCategoryPath(rule.category_path || "");
+    setCategoryQuery(rule.category_path || "");
+    setPriority(rule.priority);
+    setEnabled(rule.enabled);
+    setValues(toTextMap(rule.values_json));
+    setSelectedTemplate("");
+    setNotice(copyMode ? "已复制规则到编辑区" : "已载入规则到编辑区");
+    // 滚动到顶部
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  /* ─────────── reset form ─────────── */
+  function resetForm(): void {
+    setEditingRuleId(null);
+    setName("新建默认值规则");
+    setPlatform("Temu");
+    setSite("美国站");
+    setFulfillmentMode("半托");
+    setCategoryPath("");
+    setCategoryQuery("");
+    setPriority(100);
+    setEnabled(true);
+    setValues({});
+    setSelectedTemplate("");
+    setNotice(null);
+  }
+
+  /* ─────────── submit rule ─────────── */
+  async function submitRule(): Promise<void> {
+    if (!name.trim()) return setError("规则名称必填");
+    setSaving(true);
+    setError(null);
+    setNotice(null);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/default-rules`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: name.trim(),
-          rule_type: ruleType,
-          scope,
-          priority: Number(priority) || 0,
-          enabled,
-          match_json: match,
-          output_json: output,
-        }),
-      });
+      const cleanValues: Record<string, string> = {};
+      for (const [k, v] of Object.entries(values)) {
+        if (v !== undefined && v !== null && String(v).trim() !== "") {
+          cleanValues[k] = String(v).trim();
+        }
+      }
+      const payload = {
+        name: name.trim(),
+        rule_type: ruleType,
+        scope,
+        platform,
+        site,
+        fulfillment_mode: fulfillmentMode,
+        category_path: categoryPath.trim() || null,
+        priority: Number(priority) || 0,
+        enabled,
+        conditions_json: {},
+        match_json: {},
+        values_json: cleanValues,
+        output_json: cleanValues,
+      };
+      const url = editingRuleId
+        ? `${apiBaseUrl}/api/default-rules/${editingRuleId}`
+        : `${apiBaseUrl}/api/default-rules`;
+      const method = editingRuleId ? "PATCH" : "POST";
+      const res = await fetch(url, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setName("");
-      await load();
+      setNotice(editingRuleId ? "规则已更新" : "规则已创建");
+      await loadRules();
+      if (!editingRuleId) resetForm();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "创建失败");
+      setError(err instanceof Error ? err.message : "保存规则失败");
+    } finally {
+      setSaving(false);
     }
   }
 
-  async function toggleEnabled(rule: DefaultRule): Promise<void> {
+  /* ─────────── patch / delete ─────────── */
+  async function patchRule(ruleId: number, patch: Record<string, unknown>): Promise<void> {
     setError(null);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/default-rules/${rule.id}`, {
+      const res = await fetch(`${apiBaseUrl}/api/default-rules/${ruleId}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled: !rule.enabled }),
+        body: JSON.stringify(patch),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await load();
+      await loadRules();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "更新失败");
+      setError(err instanceof Error ? err.message : "更新规则失败");
     }
   }
 
-  async function disable(rule: DefaultRule): Promise<void> {
+  async function deleteRule(ruleId: number): Promise<void> {
     setError(null);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/default-rules/${rule.id}`, { method: "DELETE" });
+      const res = await fetch(`${apiBaseUrl}/api/default-rules/${ruleId}`, { method: "DELETE" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setData((prev) => ({ ...prev, items: prev.items.filter((item) => item.id !== rule.id) }));
+      await loadRules();
+      setNotice("规则已删除");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "禁用失败");
+      setError(err instanceof Error ? err.message : "删除规则失败");
     }
   }
 
+  /* ─────────── preview data ─────────── */
+  const allFieldEntries: FieldEntry[] = Object.values(ALL_FIELD_DEFS).map((def) => ({
+    key: def.key,
+    value: values[def.key] || "",
+    layer: def.layer,
+    status: values[def.key] ? "filled" : "empty",
+  }));
+
+  const filledCount = allFieldEntries.filter((e) => e.status === "filled").length;
+  const emptyCount = allFieldEntries.length - filledCount;
+  const manualCount = allFieldEntries.filter((e) => e.layer === "manual").length;
+  const manualEmptyCount = allFieldEntries.filter((e) => e.layer === "manual" && e.status === "empty").length;
+
+  const previewFilled = allFieldEntries.filter((e) => e.status === "filled").slice(0, 20);
+
+  /* ─────────── render ─────────── */
   return (
-    <div className="min-h-screen px-4 py-6 md:px-6">
-      <section className="mx-auto max-w-6xl space-y-6">
-        <header className="rounded-[28px] border border-[var(--card-border)] bg-[var(--card)] p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
-          <div className="text-sm text-slate-500">采集后自动帮你把字段补完整</div>
-          <h1 className="mt-1 text-3xl font-semibold">上架默认值</h1>
-          <div className="mt-2 text-sm text-slate-600">
-            这里相当于“自动填写规则”。你先设好规则，后面系统会按条件自动填字段，减少手工复制粘贴。
-          </div>
-        </header>
+    <div className="flex h-screen flex-col overflow-hidden bg-slate-50">
 
-        {error ? (
-          <div className="rounded-[18px] border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
-            {error}
-          </div>
-        ) : null}
-
-        <div className="rounded-[24px] border border-slate-200 bg-white p-6">
-          <div className="text-sm font-semibold text-slate-900">新增自动填写规则</div>
-          <div className="mt-3 rounded-[16px] border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800">
-            小白模式：先填“触发条件”，再到“默认字段抽屉”配置要自动补的内容。命中这条规则的商品都会应用，不是只针对单个商品。
-          </div>
-          <div className="mt-3 rounded-[16px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
-            可选触发字段：类目路径、标题包含词、来源ID、平台。字段填写请在“默认字段抽屉”里按中文名称配置。
-          </div>
-          <div className="mt-3 grid gap-3 md:grid-cols-4">
-            <label className="space-y-1">
-              <div className="text-xs text-slate-500">触发字段</div>
-              <select
-                value={simpleTriggerField}
-                onChange={(e) => setSimpleTriggerField(e.target.value)}
-                className="h-11 w-full rounded-[16px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-              >
-                {TRIGGER_FIELD_OPTIONS.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-              <div className="text-[11px] text-slate-500">
-                {TRIGGER_FIELD_OPTIONS.find((x) => x.value === simpleTriggerField)?.hint}
-              </div>
-            </label>
-            <label className="space-y-1">
-              <div className="text-xs text-slate-500">触发值</div>
-              <input
-                value={simpleTriggerValue}
-                onChange={(e) => setSimpleTriggerValue(e.target.value)}
-                placeholder="例如 手机壳 / Women Dresses / 123456"
-                className="h-11 w-full rounded-[16px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
-              />
-            </label>
-            <div className="rounded-[16px] border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600 md:col-span-2">
-              这里先确定“触发条件”。要补哪些字段，请点下面“打开默认字段抽屉”统一配置。
-            </div>
-          </div>
-          <div className="mt-3">
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={applySimpleBuilder}
-                className="h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
-              >
-                生成触发条件
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  syncFieldDraftsFromOutput();
-                  setFieldDrawerOpen(true);
-                }}
-                className="h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
-              >
-                打开默认字段抽屉
-              </button>
-            </div>
-          </div>
-          <div className="mt-4 grid gap-3 md:grid-cols-2">
-            <label className="space-y-1">
-              <div className="text-xs text-slate-500">规则名称（给自己看的备注名）</div>
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="h-11 w-full rounded-[16px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
-                placeholder="例如：全局默认-非敏感商品"
-              />
-            </label>
-            <div className="grid grid-cols-3 gap-3">
-              <label className="space-y-1">
-                <div className="text-xs text-slate-500">规则类型（这条规则是按什么方式触发）</div>
-                <select
-                  value={ruleType}
-                  onChange={(e) => setRuleType(e.target.value)}
-                  className="h-11 w-full rounded-[16px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                >
-                  <option value="fixed_default">全局默认值（所有商品都补）</option>
-                  <option value="category_default">类目默认值（指定类目补）</option>
-                  <option value="keyword_rule">关键词规则（标题含关键词时补）</option>
-                  <option value="sensitive_rule">敏感词规则（命中敏感词时处理）</option>
-                  <option value="sku_flatten_rule">SKU 处理规则（SKU 字段整理）</option>
-                </select>
-              </label>
-              <label className="space-y-1">
-                <div className="text-xs text-slate-500">作用范围（这条规则影响哪些商品）</div>
-                <select
-                  value={scope}
-                  onChange={(e) => setScope(e.target.value)}
-                  className="h-11 w-full rounded-[16px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                >
-                  <option value="global">全局（对全部商品生效）</option>
-                  <option value="category">类目（只对某类目生效）</option>
-                  <option value="keyword">关键词（命中关键词才生效）</option>
-                  <option value="product">单商品（只对指定商品生效）</option>
-                </select>
-              </label>
-              <label className="space-y-1">
-                <div className="text-xs text-slate-500">优先级（数字越大越先执行）</div>
-                <input
-                  value={String(priority)}
-                  onChange={(e) => setPriority(Number(e.target.value))}
-                  className="h-11 w-full rounded-[16px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
-                  type="number"
-                />
-              </label>
-            </div>
-          </div>
-
-          <div className="mt-4 grid gap-3 md:grid-cols-2">
-            <label className="space-y-1">
-              <div className="flex items-center justify-between text-xs text-slate-500">
-                <span>什么时候触发（命中条件）</span>
-                {matchJsonErr ? <span className="text-rose-600">{matchJsonErr}</span> : null}
-              </div>
-              <textarea
-                value={matchJsonText}
-                onChange={(e) => setMatchJsonText(e.target.value)}
-                className="h-[160px] w-full resize-none rounded-[18px] border border-slate-200 bg-white p-3 text-xs font-mono outline-none focus:border-slate-400"
-              />
-              <div className="text-[11px] text-slate-500">
-                这里写“什么情况下触发”。支持按类目、关键词、字段值等条件匹配。
-              </div>
-            </label>
-
-            <label className="space-y-1">
-              <div className="flex items-center justify-between text-xs text-slate-500">
-                <span>触发后要自动填写什么（补齐结果）</span>
-                {outputJsonErr ? <span className="text-rose-600">{outputJsonErr}</span> : null}
-              </div>
-              <textarea
-                value={outputJsonText}
-                onChange={(e) => setOutputJsonText(e.target.value)}
-                className="h-[160px] w-full resize-none rounded-[18px] border border-slate-200 bg-white p-3 text-xs font-mono outline-none focus:border-slate-400"
-              />
-              <div className="text-[11px] text-slate-500">这里写触发后要填入的字段和值。</div>
-            </label>
-          </div>
-
-          <div className="mt-4 flex items-center justify-between">
-            <label className="flex items-center gap-2 text-sm text-slate-700">
-              <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-              启用此规则
-            </label>
-            <button
-              type="button"
-              onClick={() => void createRule()}
-              className="h-11 rounded-full bg-slate-900 px-5 text-sm font-medium text-white hover:bg-slate-800"
-              disabled={!!matchJsonErr || !!outputJsonErr || loading}
-            >
-              保存规则
-            </button>
+      {/* ── Top Toolbar ── */}
+      <header className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5 py-3 shadow-sm">
+        <div className="flex items-center gap-4">
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-widest text-orange-500">Listing Center</div>
+            <div className="text-base font-bold text-slate-950">上架默认值规则</div>
           </div>
         </div>
-
-        <div className="rounded-[24px] border border-slate-200 bg-white p-6">
-          <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold text-slate-900">已保存规则列表</div>
-            <button
-              type="button"
-              onClick={() => void load()}
-              className="h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
-            >
-              刷新
-            </button>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-4 text-xs text-slate-500">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-2 w-2 rounded-full bg-emerald-400" />
+              启用 <strong className="text-slate-800">{items.filter((i) => i.enabled).length}</strong>
+            </span>
+            <span className="flex items-center gap-1.5">
+              总计 <strong className="text-slate-800">{items.length}</strong>
+            </span>
           </div>
-          <div className="mt-4 space-y-3">
-            {data.items.map((rule) => (
-              <div key={rule.id} className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold text-slate-900">
-                      #{rule.id} · {rule.name}
-                    </div>
-                    <div className="mt-1 text-xs text-slate-600">
-                      {RULE_TYPE_LABEL[rule.rule_type] || rule.rule_type} · {SCOPE_LABEL[rule.scope] || rule.scope} ·
-                      优先级 {rule.priority}
-                      {rule.enabled ? " · 已启用" : " · 已停用"}
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void toggleEnabled(rule)}
-                      className="h-9 rounded-full border border-slate-200 bg-white px-4 text-xs text-slate-700 hover:bg-slate-50"
-                    >
-                      {rule.enabled ? "停用" : "启用"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void disable(rule)}
-                      className="h-9 rounded-full border border-rose-200 bg-rose-50 px-4 text-xs text-rose-700 hover:bg-rose-100"
-                    >
-                      删除
-                    </button>
-                  </div>
-                </div>
-                <div className="mt-3 grid gap-3 md:grid-cols-2">
-                  <pre className="max-h-[220px] overflow-auto rounded-[14px] border border-slate-200 bg-white p-3 text-xs text-slate-700">
-                    {JSON.stringify(rule.match_json || {}, null, 2)}
-                  </pre>
-                  <pre className="max-h-[220px] overflow-auto rounded-[14px] border border-slate-200 bg-white p-3 text-xs text-slate-700">
-                    {JSON.stringify(rule.output_json || {}, null, 2)}
-                  </pre>
-                </div>
+          <button
+            type="button"
+            onClick={resetForm}
+            className="h-9 rounded-full border border-slate-200 bg-white px-4 text-sm font-medium text-slate-600 hover:bg-slate-50"
+          >
+            新建
+          </button>
+          <button
+            type="button"
+            onClick={() => void submitRule()}
+            disabled={saving}
+            className="h-9 rounded-full bg-slate-950 px-5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+          >
+            {saving ? "保存中..." : editingRuleId ? "更新规则" : "保存规则"}
+          </button>
+        </div>
+      </header>
+
+      {/* ── Error / Notice ── */}
+      {error && (
+        <div className="mx-5 mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-700">
+          <span className="text-rose-400">⚠️</span> {error}
+        </div>
+      )}
+      {notice && (
+        <div className="mx-5 mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-700">
+          <span className="text-emerald-400">✓</span> {notice}
+        </div>
+      )}
+
+      {/* ── Main Body: 三栏 ── */}
+      <div className="flex min-h-0 flex-1">
+
+        {/* ── 左栏：260px 固定宽度 ── */}
+        <aside className="flex w-[260px] shrink-0 flex-col overflow-y-auto border-r border-slate-200 bg-white">
+          {/* 快速模板区 */}
+          <div className="border-b border-slate-100 px-4 py-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+              <span>🚀</span> 快速模板
+            </div>
+            {templates.length > 0 ? (
+              <div className="space-y-1">
+                {templates.map((tmpl) => (
+                  <button
+                    key={tmpl.id}
+                    type="button"
+                    onClick={() => applyTemplateItem(tmpl.id)}
+                    className={`w-full rounded-lg px-3 py-2 text-left text-xs transition-all ${
+                      selectedTemplate === `tmpl-${tmpl.id}`
+                        ? "bg-orange-50 text-orange-700 ring-1 ring-orange-200"
+                        : "text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    <div className="truncate font-medium">{tmpl.name}</div>
+                    {tmpl.category_keywords && <div className="mt-0.5 truncate text-[10px] text-slate-400">{tmpl.category_keywords}</div>}
+                  </button>
+                ))}
               </div>
-            ))}
-            {data.items.length ? null : (
-              <div className="rounded-[18px] border border-slate-200 bg-white p-4 text-sm text-slate-600">
-                暂无规则
-              </div>
+            ) : (
+              <div className="py-3 text-center text-[10px] text-slate-400">暂无模板，请先保存规则</div>
             )}
           </div>
-        </div>
-      </section>
-      {fieldDrawerOpen ? (
-        <div className="fixed inset-0 z-40 flex justify-end bg-slate-900/30">
-          <div className="h-full w-full max-w-[520px] overflow-auto bg-white p-5 shadow-2xl">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm font-semibold text-slate-900">默认字段配置抽屉</div>
-                <div className="mt-1 text-xs text-slate-500">用于配置“未生成或未填写时”要补的默认字段。</div>
+
+          {/* 规则列表 */}
+          <div className="flex-1 px-4 py-3">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+                <span>📋</span> 规则列表
               </div>
               <button
                 type="button"
-                onClick={() => setFieldDrawerOpen(false)}
-                className="h-9 rounded-full border border-slate-200 px-3 text-xs text-slate-600 hover:bg-slate-50"
+                onClick={() => void loadRules()}
+                className="text-[10px] text-slate-400 hover:text-slate-600"
               >
-                关闭
+                {loading ? "..." : "刷新"}
               </button>
             </div>
-
-            <div className="mt-4 space-y-2">
-              <div className="rounded-[14px] border border-slate-200 bg-slate-50 p-3">
-                <div className="text-xs font-semibold text-slate-700">常用字段模板</div>
-                <div className="mt-1 text-[11px] text-slate-500">字段后面标注“必填”的，建议优先配置默认值。</div>
-                <div className="mt-2 grid grid-cols-[1fr_auto_auto] gap-2">
-                  <select
-                    value={selectedTemplateId}
-                    onChange={(e) => setSelectedTemplateId(e.target.value)}
-                    className="h-10 rounded-[12px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                  >
-                    {FIELD_TEMPLATES.map((tpl) => (
-                      <option key={tpl.id} value={tpl.id}>
-                        {tpl.name}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => applyTemplate(false)}
-                    className="h-10 rounded-[12px] border border-slate-200 bg-white px-3 text-xs text-slate-700 hover:bg-slate-100"
-                  >
-                    覆盖导入
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyTemplate(true)}
-                    className="h-10 rounded-[12px] border border-slate-200 bg-white px-3 text-xs text-slate-700 hover:bg-slate-100"
-                  >
-                    追加导入
-                  </button>
-                </div>
-              </div>
-              {fieldDrafts.map((row, idx) => (
-                <div key={`${idx}-${row.fieldKey}`} className="grid grid-cols-[1fr_1fr_auto] gap-2">
-                  <select
-                    value={row.fieldKey}
-                    onChange={(e) =>
-                      setFieldDrafts((prev) =>
-                        prev.map((x, i) => (i === idx ? { ...x, fieldKey: e.target.value } : x)),
-                      )
-                    }
-                    className="h-10 rounded-[12px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                  >
-                    {OUTPUT_FIELD_OPTIONS.map((item) => (
-                      <option key={item.value} value={item.value}>
-                        {item.label}
-                        {item.required || requiredDraftKeys.has(item.value) ? "（必填）" : ""}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    value={row.value}
-                    onChange={(e) =>
-                      setFieldDrafts((prev) => prev.map((x, i) => (i === idx ? { ...x, value: e.target.value } : x)))
-                    }
-                    placeholder="默认值，例如 false / 9.9 / 普货"
-                    className="h-10 rounded-[12px] border border-slate-200 px-3 text-sm outline-none focus:border-slate-400"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setFieldDrafts((prev) => prev.filter((_, i) => i !== idx))}
-                    className="h-10 rounded-[12px] border border-rose-200 bg-rose-50 px-3 text-xs text-rose-700 hover:bg-rose-100"
-                  >
-                    删除
-                  </button>
+            <div className="space-y-1">
+              {items.length === 0 && (
+                <div className="py-6 text-center text-xs text-slate-400">暂无规则</div>
+              )}
+              {items.map((rule) => (
+                <div
+                  key={rule.id}
+                  className={`group cursor-pointer rounded-lg px-3 py-2.5 transition-all ${
+                    editingRuleId === rule.id
+                      ? "bg-orange-50 ring-1 ring-orange-200"
+                      : "hover:bg-slate-50"
+                  } ${rule.enabled ? "" : "opacity-50"}`}
+                  onClick={() => fillFormFromRule(rule, false)}
+                >
+                  <div className="flex items-start justify-between gap-1">
+                    <div className="min-w-0 flex-1">
+                      <div className={`truncate text-xs font-semibold ${editingRuleId === rule.id ? "text-orange-700" : "text-slate-800"}`}>
+                        {rule.name}
+                      </div>
+                      <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-400">
+                        <span>{rule.platform || ""}</span>
+                        {rule.site && <><span>·</span><span>{rule.site}</span></>}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100">
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); fillFormFromRule(rule, true); }}
+                        className="rounded px-1.5 py-0.5 text-[10px] text-slate-400 hover:bg-slate-200"
+                        title="复制"
+                      >
+                        ⧉
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); void patchRule(rule.id, { enabled: !rule.enabled }); }}
+                        className="rounded px-1.5 py-0.5 text-[10px] text-slate-400 hover:bg-slate-200"
+                        title={rule.enabled ? "停用" : "启用"}
+                      >
+                        {rule.enabled ? "○" : "●"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); void deleteRule(rule.id); }}
+                        className="rounded px-1.5 py-0.5 text-[10px] text-rose-400 hover:bg-rose-100"
+                        title="删除"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>
+          </div>
+        </aside>
 
-            <div className="mt-3 flex flex-wrap gap-2">
+        {/* ── 中栏：编辑区（自适应） ── */}
+        <main className="flex-1 overflow-y-auto px-5 py-4">
+          <div className="mx-auto max-w-5xl space-y-2">
+
+            {/* 基础信息区 - 高密度单行 */}
+            <div className="rounded-xl border border-slate-200 bg-white">
+              <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-2.5">
+                <span className="text-sm font-semibold text-slate-800">规则基础信息</span>
+                {editingRuleId && (
+                  <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700">编辑中 #{editingRuleId}</span>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-3 px-4 py-3">
+                <label className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs font-medium text-slate-500">规则名称</span>
+                  <input
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    className="h-8 w-52 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                  />
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="w-12 shrink-0 text-xs font-medium text-slate-500">平台</span>
+                  <select
+                    value={platform}
+                    onChange={(e) => setPlatform(e.target.value)}
+                    className="h-8 rounded-lg border border-slate-200 px-2 text-sm outline-none focus:border-orange-400"
+                  >
+                    <option value="Temu">Temu</option>
+                    <option value="Shein">Shein</option>
+                    <option value="Amazon">Amazon</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="w-12 shrink-0 text-xs font-medium text-slate-500">站点</span>
+                  <select
+                    value={site}
+                    onChange={(e) => setSite(e.target.value)}
+                    className="h-8 rounded-lg border border-slate-200 px-2 text-sm outline-none focus:border-orange-400"
+                  >
+                    <option value="美国站">美国站</option>
+                    <option value="英国站">英国站</option>
+                    <option value="德国站">德国站</option>
+                    <option value="法国站">法国站</option>
+                    <option value="意大利站">意大利站</option>
+                    <option value="西班牙站">西班牙站</option>
+                    <option value="日本站">日本站</option>
+                    <option value="澳大利亚站">澳大利亚站</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs font-medium text-slate-500">履约模式</span>
+                  <select
+                    value={fulfillmentMode}
+                    onChange={(e) => setFulfillmentMode(e.target.value)}
+                    className="h-8 rounded-lg border border-slate-200 px-2 text-sm outline-none focus:border-orange-400"
+                  >
+                    <option value="半托">半托</option>
+                    <option value="全托">全托</option>
+                    <option value="本地直发">本地直发</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="w-12 shrink-0 text-xs font-medium text-slate-500">优先级</span>
+                  <input
+                    type="number"
+                    value={priority}
+                    onChange={(e) => setPriority(Number(e.target.value))}
+                    className="h-8 w-16 rounded-lg border border-slate-200 px-2 text-sm outline-none focus:border-orange-400"
+                  />
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="enabled-check"
+                    checked={enabled}
+                    onChange={(e) => setEnabled(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300"
+                  />
+                  <label htmlFor="enabled-check" className="text-xs font-medium text-slate-700">启用</label>
+                </label>
+              </div>
+              {/* 类目选择 */}
+              <div className="border-t border-slate-100 px-4 py-2.5">
+                <label className="flex items-center gap-3">
+                  <span className="w-16 shrink-0 text-xs font-medium text-slate-500">适用类目</span>
+                  <div className="relative flex-1">
+                    <input
+                      value={categoryQuery}
+                      onChange={(e) => setCategoryQuery(e.target.value)}
+                      onFocus={() => categorySuggestions.length > 0 && setShowCategoryDropdown(true)}
+                      placeholder="搜索类目关键词"
+                      className="h-8 w-full rounded-lg border border-slate-200 px-3 pr-8 text-sm outline-none focus:border-orange-400"
+                    />
+                    {categorySearching && (
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-slate-400">...</span>
+                    )}
+                    {showCategoryDropdown && categorySuggestions.length > 0 && (
+                      <div className="absolute z-50 mt-1 max-h-48 w-full overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl">
+                        {categorySuggestions.map((item, i) => (
+                          <div
+                            key={i}
+                            className="cursor-pointer px-3 py-2 text-xs hover:bg-orange-50"
+                            onClick={() => {
+                              setCategoryPath(item.path);
+                              setCategoryQuery(item.path);
+                              setShowCategoryDropdown(false);
+                            }}
+                          >
+                            <div className="truncate text-slate-800">{item.path}</div>
+                            <div className="text-[10px] text-slate-400">{item.leaf}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {categoryPath && (
+                    <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">✅ 已设置</span>
+                  )}
+                </label>
+              </div>
+            </div>
+
+            {/* 字段分组（可折叠） */}
+            {FIELD_GROUPS_ORDER.map((groupName) => {
+              const groupFields = getGroupFields(groupName);
+              if (groupFields.length === 0) return null;
+              const isActive = activeGroups.has(groupName);
+              const filledInGroup = groupFields.filter((f) => values[f.key]).length;
+              const groupBg = groupName === "人工必填" ? "border-rose-200" : groupName === "类目属性" || groupName === "风格与场合" ? "border-blue-200" : "";
+              const groupHeaderBg = groupName === "人工必填" ? "bg-rose-50" : groupName === "类目属性" || groupName === "风格与场合" ? "bg-blue-50" : "bg-slate-50";
+
+              return (
+                <div key={groupName} className={`rounded-xl border border-slate-200 bg-white ${groupBg}`}>
                   <button
                     type="button"
-                    onClick={() =>
-                      setFieldDrafts((prev) => [...prev, { fieldKey: OUTPUT_FIELD_OPTIONS[0].value, value: "" }])
-                    }
-                    className="h-10 rounded-full border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
+                    onClick={() => toggleGroup(groupName)}
+                    className={`flex w-full items-center justify-between px-4 py-2.5 text-left ${groupHeaderBg}`}
                   >
-                    新增一行字段
-              </button>
-              <button
-                type="button"
-                onClick={applyFieldDraftsToOutput}
-                className="h-10 rounded-full bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-800"
-              >
-                应用到补齐结果
-              </button>
-            </div>
+                    <div className="flex items-center gap-2">
+                      <div className={`h-5 w-5 shrink-0 rounded-full flex items-center justify-center text-[10px] font-bold ${filledInGroup === groupFields.length ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-500"}`}>
+                        {filledInGroup}/{groupFields.length}
+                      </div>
+                      <span className="text-sm font-semibold text-slate-800">{groupName}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {groupName === "人工必填" && manualEmptyCount > 0 && (
+                        <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700">{manualEmptyCount} 必填未填</span>
+                      )}
+                      <span className="text-xs text-slate-400">{isActive ? "▲" : "▼"}</span>
+                    </div>
+                  </button>
 
-            <div className="mt-4 rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs leading-6 text-slate-600">
-              值类型规则：`true/false` 会按布尔值写入，纯数字会按数字写入，其它按文本写入。这里配置的是命中规则后的默认补齐值。
+                  {isActive && (
+                    <div className="border-t border-slate-100 p-3">
+                      <div className="grid gap-x-4 gap-y-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                        {groupFields.map((field) => (
+                          <label key={field.key} className="flex items-center gap-2">
+                            <div className="w-24 shrink-0 text-xs font-medium text-slate-500">{field.label}</div>
+                            {field.type === "select" && field.options ? (
+                              <select
+                                value={values[field.key] || ""}
+                                onChange={(e) => updateValue(field.key, e.target.value)}
+                                className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                              >
+                                <option value="">--</option>
+                                {field.options.filter((o) => o).map((opt) => (
+                                  <option key={opt} value={opt}>{opt}</option>
+                                ))}
+                              </select>
+                            ) : field.type === "number" ? (
+                              <input
+                                type="number"
+                                value={values[field.key] || ""}
+                                onChange={(e) => updateValue(field.key, e.target.value)}
+                                className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                              />
+                            ) : field.type === "textarea" ? (
+                              <textarea
+                                value={values[field.key] || ""}
+                                onChange={(e) => updateValue(field.key, e.target.value)}
+                                rows={1}
+                                className="flex-1 resize-none rounded-lg border border-slate-200 px-2 py-1.5 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                              />
+                            ) : (
+                              <input
+                                value={values[field.key] || ""}
+                                onChange={(e) => updateValue(field.key, e.target.value)}
+                                className="h-8 flex-1 rounded-lg border border-slate-200 px-2 text-xs outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-100"
+                              />
+                            )}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* 底部空间 */}
+            <div className="h-20" />
+          </div>
+        </main>
+
+        {/* ── 右栏：320px 固定宽度 校验预览 ── */}
+        <aside className="flex w-[320px] shrink-0 flex-col overflow-y-auto border-l border-slate-200 bg-white px-4 py-4">
+          {/* 覆盖率 */}
+          <div className="mb-3">
+            <div className="mb-2 text-xs font-semibold text-slate-700">规则覆盖</div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-center">
+                <div className="text-xl font-bold text-emerald-600">{filledCount}</div>
+                <div className="text-[10px] text-emerald-600">已配置</div>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-center">
+                <div className="text-xl font-bold text-slate-400">{emptyCount}</div>
+                <div className="text-[10px] text-slate-400">未填写</div>
+              </div>
+              <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-center">
+                <div className="text-xl font-bold text-rose-600">{manualEmptyCount}</div>
+                <div className="text-[10px] text-rose-600">人工必填缺失</div>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-center">
+                <div className="text-xl font-bold text-slate-400">{allFieldEntries.length}</div>
+                <div className="text-[10px] text-slate-400">字段总数</div>
+              </div>
             </div>
           </div>
-        </div>
-      ) : null}
+
+          {/* 导出时将自动补齐 */}
+          <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="mb-2 text-xs font-semibold text-slate-700">导出时自动补齐</div>
+            <div className="space-y-1 text-[11px] text-slate-500">
+              <div className="flex items-center gap-1.5">
+                <span className="text-emerald-500">✓</span>
+                <span>站点、仓库、币种、库存、尺寸重量</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-emerald-500">✓</span>
+                <span>镀层、主体材质、风格、场合</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-blue-500">✓</span>
+                <span>图片、视频（从商品资产）</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-blue-500">✓</span>
+                <span>商品名称、英文名称、货号（AI生成）</span>
+              </div>
+            </div>
+          </div>
+
+          {/* 已配置字段预览 */}
+          <div className="flex-1">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-xs font-semibold text-slate-700">已配置字段</div>
+              <span className="text-[10px] text-slate-400">{previewFilled.length}/{filledCount}</span>
+            </div>
+            <div className="space-y-1">
+              {previewFilled.map((entry) => {
+                const def = Object.values(ALL_FIELD_DEFS).find((d) => d.key === entry.key);
+                return (
+                  <div key={entry.key} className="flex items-start justify-between gap-2 rounded-lg border border-slate-100 bg-slate-50 px-2.5 py-1.5">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[11px] font-medium text-slate-700">{entry.key}</div>
+                      <div className="truncate text-[10px] text-slate-400">{entry.value}</div>
+                    </div>
+                    <div className="flex shrink-0 flex-col items-end gap-0.5">
+                      <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${getLayerBadgeClass(entry.layer)}`}>
+                        {entry.layer === "uniform" ? "L2" : entry.layer === "category" ? "L3" : "L4"}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+              {filledCount > 20 && (
+                <div className="py-2 text-center text-[10px] text-slate-400">
+                  ...还有 {filledCount - 20} 个字段未显示
+                </div>
+              )}
+            </div>
+          </div>
+        </aside>
+      </div>
     </div>
   );
 }

@@ -50,7 +50,7 @@ export default function SettingsPage() {
 
   return (
     <div className="min-h-screen px-4 py-6 md:px-6">
-      <section className="mx-auto max-w-6xl space-y-6">
+      <section className=" space-y-6">
         <header className="rounded-[28px] border border-[var(--card-border)] bg-[var(--card)] p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
           <div className="text-sm text-slate-500">运营配置总览</div>
           <h1 className="mt-1 text-3xl font-semibold">系统设置</h1>

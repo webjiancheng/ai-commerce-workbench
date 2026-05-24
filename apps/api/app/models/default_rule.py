@@ -22,8 +22,14 @@ class DefaultRule(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     rule_type: Mapped[str] = mapped_column(String(32), nullable=False)
     scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    platform: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    site: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    fulfillment_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    category_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     match_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    conditions_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     output_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    values_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
@@ -36,4 +42,3 @@ class DefaultRule(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
-

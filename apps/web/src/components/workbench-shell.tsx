@@ -16,9 +16,9 @@ type NavItem = {
 
 const mainNavItems: NavItem[] = [
   { href: "/", label: "工作台", shortLabel: "台" },
-  { href: "/product-tasks", label: "上架加工工作台", shortLabel: "工" },
   { href: "/logs", label: "任务日志", shortLabel: "志" },
   { href: "/raw-products", label: "原始采集数据", shortLabel: "采" },
+  { href: "/product-tasks", label: "上架加工工作台", shortLabel: "工" },
 ];
 
 const settingsBaseItems: NavItem[] = [

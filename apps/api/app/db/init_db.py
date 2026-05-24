@@ -1,6 +1,8 @@
 from app.db.base import Base
 from app.db.session import engine
 from app.db.schema_sync import (
+    ensure_ai_import_batches_schema,
+    ensure_ai_import_drafts_schema,
     ensure_default_rules_schema,
     ensure_image_generation_jobs_schema,
     ensure_product_ai_results_schema,
@@ -18,6 +20,8 @@ from app.db.schema_sync import (
     ensure_cost_configs_schema,
 )
 from app.models.default_rule import DefaultRule
+from app.models.ai_import_batch import AiImportBatch
+from app.models.ai_import_draft import AiImportDraft
 from app.models.export_field_draft import ExportFieldDraft
 from app.models.image_generation_job import ImageGenerationJob
 from app.models.product_ai_result import ProductAIResult
@@ -43,6 +47,8 @@ def init_db() -> None:
     ensure_image_generation_jobs_schema(engine)
     ensure_product_assets_schema(engine)
     ensure_default_rules_schema(engine)
+    ensure_ai_import_batches_schema(engine)
+    ensure_ai_import_drafts_schema(engine)
     ensure_export_field_drafts_schema(engine)
     ensure_export_templates_schema(engine)
     ensure_export_field_mappings_schema(engine)

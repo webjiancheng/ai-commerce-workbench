@@ -7,9 +7,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from PIL import Image
 
@@ -21,6 +21,7 @@ from app.models.product_task import ProductTask
 from app.schemas.image_generation_job import ImageGenerationJobOut
 from app.schemas.product_asset import ProductAssetOut
 from app.services.image_generation import create_job, resolve_image_prompt, run_job
+from app.services.image_runtime import build_image_provider_snapshot, resolve_image_runtime
 from app.services.provider_configs import get_default_provider_config, get_provider_config
 from app.services.dimension_extract import run_dimension_extract
 from app.services.storage_provider import LocalStorageProvider
@@ -99,6 +100,26 @@ def _resolve_image_prompt_or_400(
         ) from exc
 
 
+def _provider_snapshot(provider_config) -> dict[str, object]:
+    config = provider_config.config_json or {}
+    return build_image_provider_snapshot(
+        {
+            "provider_id": provider_config.id,
+            "provider_name": provider_config.provider_name,
+            "provider_display_name": provider_config.display_name,
+            "api_key": None,
+            "base_url": config.get("base_url"),
+            "model": config.get("default_model") or "stub-v1",
+            "size": config.get("default_size") or "1024x1024",
+            "quality": config.get("quality") or "auto",
+            "background": config.get("background") or "auto",
+            "output_format": config.get("output_format") or "png",
+            "supports_reference_image": bool((provider_config.capabilities_json or {}).get("supports_reference_image")),
+            "pricing_json": provider_config.pricing_json or {},
+        }
+    ) | {"secret_config_json": provider_config.secret_config_json}
+
+
 class GenerateImagesRequest(BaseModel):
     job_type: str = Field(default="single_slot", description="single_slot | carousel_4grid")
     slots: list[str] | None = Field(default=None, description="For single_slot: list of slots")
@@ -113,28 +134,42 @@ def generate_images_endpoint(
     task_id: int,
     background: BackgroundTasks,
     payload: GenerateImagesRequest = Body(...),
+    x_ai_image_api_key: str | None = Header(default=None),
+    x_ai_image_base_url: str | None = Header(default=None),
+    x_ai_image_model: str | None = Header(default=None),
     session: Session = Depends(get_db_session),
 ) -> dict[str, object]:
     task = session.get(ProductTask, task_id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product task not found")
 
-    provider_config = (
-        get_provider_config(session, payload.provider_config_id)
-        if payload.provider_config_id
-        else get_default_provider_config(session, provider_type="image")
-    )
-    if provider_config is None or not provider_config.enabled:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image provider not configured/enabled")
-
-    config = provider_config.config_json or {}
-    model_name = payload.model_name or str(config.get("default_model") or "stub-v1")
-    size = payload.size or str(config.get("default_size") or "1024x1024")
+    override = {
+        "image_api_key": (x_ai_image_api_key or "").strip(),
+        "image_base_url": (x_ai_image_base_url or "").strip(),
+        "image_model": (x_ai_image_model or "").strip(),
+    }
+    if payload.provider_config_id:
+        provider_config = get_provider_config(session, payload.provider_config_id)
+        if provider_config is None or not provider_config.enabled:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image provider not configured/enabled")
+        config = provider_config.config_json or {}
+        provider_name = provider_config.provider_name
+        provider_snapshot = _provider_snapshot(provider_config)
+        model_name = payload.model_name or str(config.get("default_model") or "stub-v1")
+        size = payload.size or str(config.get("default_size") or "1024x1024")
+    else:
+        runtime = resolve_image_runtime(session, override=override)
+        if not runtime.get("enabled"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image provider not configured/enabled")
+        provider_name = str(runtime.get("provider_name") or "stub")
+        provider_snapshot = build_image_provider_snapshot(runtime)
+        model_name = payload.model_name or str(runtime.get("model") or "stub-v1")
+        size = payload.size or str(runtime.get("size") or "1024x1024")
 
     job_ids: list[int] = []
     if payload.job_type == "carousel_4grid":
         ok, msg, exceeded = check_and_consume_image_generation(
-            session, task_id=task.id, slot="carousel_4grid", provider=provider_config.provider_name, count=1
+            session, task_id=task.id, slot="carousel_4grid", provider=provider_name, count=1
         )
         if not ok:
             raise HTTPException(
@@ -153,9 +188,10 @@ def generate_images_endpoint(
             job_type="carousel_4grid",
             slot="carousel_4grid",
             target_slots=["carousel_1", "carousel_2", "carousel_3", "carousel_4"],
-            provider_config=provider_config,
+            provider_name=provider_name,
             model_name=model_name,
             size=size,
+            provider_config_snapshot=provider_snapshot,
             prompt_template_id=template_id,
             prompt_snapshot=prompt_snapshot,
             final_prompt=final_prompt,
@@ -167,7 +203,7 @@ def generate_images_endpoint(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="slots is required for single_slot")
         for slot in slots:
             ok, msg, exceeded = check_and_consume_image_generation(
-                session, task_id=task.id, slot=slot, provider=provider_config.provider_name, count=1
+                session, task_id=task.id, slot=slot, provider=provider_name, count=1
             )
             if not ok:
                 raise HTTPException(
@@ -186,9 +222,10 @@ def generate_images_endpoint(
                 job_type="single_slot",
                 slot=slot,
                 target_slots=[slot],
-                provider_config=provider_config,
+                provider_name=provider_name,
                 model_name=model_name,
                 size=size,
+                provider_config_snapshot=provider_snapshot,
                 prompt_template_id=template_id,
                 prompt_snapshot=prompt_snapshot,
                 final_prompt=final_prompt,
@@ -206,7 +243,7 @@ def generate_images_endpoint(
             return
 
     background.add_task(_bg_run, job_ids)
-    limits = get_limits_snapshot(session, task_id=task.id, slot=(payload.slot or payload.job_type), provider=provider_config.provider_name)
+    limits = get_limits_snapshot(session, task_id=task.id, slot=(payload.slot or payload.job_type), provider=provider_name)
     return {"ok": True, "task_id": task_id, "job_ids": job_ids, "limits": limits}
 
 
@@ -225,6 +262,67 @@ def generate_image_endpoint(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="slot is required")
     result = generate_images_endpoint(task_id, background, payload, session)
     return {"ok": True, "task_id": task_id, "job_id": (result.get("job_ids") or [None])[0]}
+
+
+class GenerateSellingImagesRequest(BaseModel):
+    slots: list[str] = Field(default_factory=lambda: ["carousel_1", "carousel_2", "carousel_3", "carousel_4"])
+    provider_config_id: int | None = None
+    model_name: str | None = None
+    size: str | None = None
+
+
+@router.post("/api/product-tasks/{task_id}/generate-sku-image")
+def generate_sku_image_endpoint(
+    task_id: int,
+    background: BackgroundTasks,
+    payload: GenerateImagesRequest = Body(default=GenerateImagesRequest(slot="sku_image")),
+    session: Session = Depends(get_db_session),
+) -> dict[str, object]:
+    payload.job_type = "single_slot"
+    payload.slot = "sku_image"
+    payload.slots = None
+    result = generate_images_endpoint(task_id, background, payload, session)
+    return {"ok": True, "task_id": task_id, "job_id": (result.get("job_ids") or [None])[0], "slot": "sku_image"}
+
+
+@router.post("/api/product-tasks/{task_id}/generate-size-image")
+def generate_size_image_endpoint(
+    task_id: int,
+    background: BackgroundTasks,
+    payload: GenerateImagesRequest = Body(default=GenerateImagesRequest(slot="size_chart")),
+    session: Session = Depends(get_db_session),
+) -> dict[str, object]:
+    payload.job_type = "single_slot"
+    payload.slot = "size_chart"
+    payload.slots = None
+    result = generate_images_endpoint(task_id, background, payload, session)
+    return {"ok": True, "task_id": task_id, "job_id": (result.get("job_ids") or [None])[0], "slot": "size_chart"}
+
+
+@router.post("/api/product-tasks/{task_id}/generate-selling-images")
+def generate_selling_images_endpoint(
+    task_id: int,
+    background: BackgroundTasks,
+    payload: GenerateSellingImagesRequest = Body(default=GenerateSellingImagesRequest()),
+    session: Session = Depends(get_db_session),
+) -> dict[str, object]:
+    slots = payload.slots or ["carousel_1", "carousel_2", "carousel_3", "carousel_4"]
+    normalized = [str(slot).strip() for slot in slots if str(slot).strip()]
+    if not normalized:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="slots required")
+    for slot in normalized:
+        if slot not in {"carousel_1", "carousel_2", "carousel_3", "carousel_4"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"unsupported slot: {slot}")
+
+    request = GenerateImagesRequest(
+        job_type="single_slot",
+        slots=normalized,
+        provider_config_id=payload.provider_config_id,
+        model_name=payload.model_name,
+        size=payload.size,
+    )
+    result = generate_images_endpoint(task_id, background, request, session)
+    return {"ok": True, "task_id": task_id, "job_ids": result.get("job_ids") or [], "slots": normalized}
 
 
 @router.get("/api/jobs/{job_id}", response_model=ImageGenerationJobOut)
@@ -281,6 +379,9 @@ def regenerate_asset_endpoint(
     asset_id: int,
     background: BackgroundTasks,
     payload: RegenerateRequest = Body(default=RegenerateRequest()),
+    x_ai_image_api_key: str | None = Header(default=None),
+    x_ai_image_base_url: str | None = Header(default=None),
+    x_ai_image_model: str | None = Header(default=None),
     session: Session = Depends(get_db_session),
 ) -> dict[str, object]:
     asset = session.get(ProductAsset, asset_id)
@@ -290,17 +391,28 @@ def regenerate_asset_endpoint(
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product task not found")
 
-    provider_config = (
-        get_provider_config(session, payload.provider_config_id)
-        if payload.provider_config_id
-        else get_default_provider_config(session, provider_type="image")
-    )
-    if provider_config is None or not provider_config.enabled:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image provider not configured/enabled")
-
-    config = provider_config.config_json or {}
-    model_name = payload.model_name or str(config.get("default_model") or "stub-v1")
-    size = payload.size or str(config.get("default_size") or "1024x1024")
+    override = {
+        "image_api_key": (x_ai_image_api_key or "").strip(),
+        "image_base_url": (x_ai_image_base_url or "").strip(),
+        "image_model": (x_ai_image_model or "").strip(),
+    }
+    if payload.provider_config_id:
+        provider_config = get_provider_config(session, payload.provider_config_id)
+        if provider_config is None or not provider_config.enabled:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image provider not configured/enabled")
+        config = provider_config.config_json or {}
+        provider_name = provider_config.provider_name
+        provider_snapshot = _provider_snapshot(provider_config)
+        model_name = payload.model_name or str(config.get("default_model") or "stub-v1")
+        size = payload.size or str(config.get("default_size") or "1024x1024")
+    else:
+        runtime = resolve_image_runtime(session, override=override)
+        if not runtime.get("enabled"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image provider not configured/enabled")
+        provider_name = str(runtime.get("provider_name") or "stub")
+        provider_snapshot = build_image_provider_snapshot(runtime)
+        model_name = payload.model_name or str(runtime.get("model") or "stub-v1")
+        size = payload.size or str(runtime.get("size") or "1024x1024")
 
     # use slot-specific single slot prompt
     template_id, prompt_snapshot, final_prompt = _resolve_image_prompt_or_400(
@@ -319,9 +431,10 @@ def regenerate_asset_endpoint(
         job_type="single_slot",
         slot=asset.slot,
         target_slots=[asset.slot],
-        provider_config=provider_config,
+        provider_name=provider_name,
         model_name=model_name,
         size=size,
+        provider_config_snapshot=provider_snapshot,
         prompt_template_id=template_id,
         prompt_snapshot=prompt_snapshot,
         final_prompt=final_prompt,
@@ -355,6 +468,11 @@ class AssignImageRequest(BaseModel):
 class ReorderSlotRequest(BaseModel):
     source_slot: str = Field(min_length=1, max_length=32)
     target_slot: str = Field(min_length=1, max_length=32)
+
+
+class RemoveSlotImageRequest(BaseModel):
+    slot: str = Field(min_length=1, max_length=32)
+    compact_following: bool = True
 
 
 @router.post("/api/product-tasks/{task_id}/dimension-extract")
@@ -497,10 +615,124 @@ def assign_image_to_slot_endpoint(
 def _preferred_slot_asset(session: Session, *, task_id: int, slot: str) -> ProductAsset | None:
     return session.scalars(
         select(ProductAsset)
-        .where(ProductAsset.product_task_id == task_id, ProductAsset.slot == slot)
+        .where(
+            ProductAsset.product_task_id == task_id,
+            ProductAsset.slot == slot,
+            ProductAsset.status != "removed",
+            ProductAsset.public_url.is_not(None),
+        )
         .order_by(ProductAsset.selected_for_export.desc(), ProductAsset.created_at.desc(), ProductAsset.id.desc())
         .limit(1)
     ).first()
+
+
+def _mark_slot_removed(session: Session, *, task_id: int, slot: str) -> None:
+    existing_asset_count = session.scalar(
+        select(func.count(ProductAsset.id)).where(
+            ProductAsset.product_task_id == task_id,
+            ProductAsset.slot == slot,
+            ProductAsset.status != "removed",
+            ProductAsset.public_url.is_not(None),
+        )
+    )
+    if int(existing_asset_count or 0) > 0:
+        return
+
+    session.execute(
+        update(ProductAsset)
+        .where(ProductAsset.product_task_id == task_id, ProductAsset.slot == slot)
+        .values(selected_for_export=False)
+    )
+    current_max = session.scalar(
+        select(ProductAsset.version)
+        .where(ProductAsset.product_task_id == task_id, ProductAsset.slot == slot)
+        .order_by(ProductAsset.version.desc())
+        .limit(1)
+    )
+    marker = ProductAsset(
+        product_task_id=task_id,
+        sku_id=None,
+        slot=slot,
+        asset_type="manual_removed",
+        source_type="manual_removed",
+        version=int(current_max or 0) + 1,
+        parent_asset_id=None,
+        generation_job_id=None,
+        storage_key=None,
+        public_url=None,
+        mime_type=None,
+        width=None,
+        height=None,
+        prompt_template_id=None,
+        prompt_snapshot={"removed_at": "manual"},
+        image_strategy_snapshot={},
+        provider=None,
+        model_name=None,
+        selected_for_export=True,
+        status="removed",
+        crop_group_id=None,
+        crop_index=None,
+        crop_box_json={},
+    )
+    session.add(marker)
+
+
+@router.post("/api/product-tasks/{task_id}/remove-slot-image")
+def remove_slot_image_endpoint(
+    task_id: int,
+    payload: RemoveSlotImageRequest = Body(...),
+    session: Session = Depends(get_db_session),
+) -> dict[str, object]:
+    task = session.get(ProductTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product task not found")
+
+    target_assets = session.scalars(
+        select(ProductAsset).where(ProductAsset.product_task_id == task_id, ProductAsset.slot == payload.slot)
+    ).all()
+
+    deleted_count = len(target_assets)
+    for asset in target_assets:
+        session.delete(asset)
+
+    compacted: list[dict[str, str]] = []
+    carousel_slots = [f"carousel_{index}" for index in range(1, 9)]
+    if payload.compact_following and payload.slot in carousel_slots:
+        source_index = carousel_slots.index(payload.slot)
+        for index in range(source_index + 1, len(carousel_slots)):
+            from_slot = carousel_slots[index]
+            to_slot = carousel_slots[index - 1]
+            moved_count = session.scalar(
+                select(func.count(ProductAsset.id)).where(
+                    ProductAsset.product_task_id == task_id,
+                    ProductAsset.slot == from_slot,
+                    ProductAsset.status != "removed",
+                    ProductAsset.public_url.is_not(None),
+                )
+            )
+            if int(moved_count or 0) <= 0:
+                continue
+            session.execute(
+                update(ProductAsset)
+                .where(
+                    ProductAsset.product_task_id == task_id,
+                    ProductAsset.slot == from_slot,
+                    ProductAsset.status != "removed",
+                    ProductAsset.public_url.is_not(None),
+                )
+                .values(slot=to_slot)
+            )
+            compacted.append({"from_slot": from_slot, "to_slot": to_slot, "moved_count": str(moved_count)})
+
+    _mark_slot_removed(session, task_id=task_id, slot=payload.slot)
+    session.commit()
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "slot": payload.slot,
+        "deleted_count": deleted_count,
+        "compacted": compacted,
+    }
 
 
 @router.post("/api/product-tasks/{task_id}/reorder-slots")
@@ -517,7 +749,14 @@ def reorder_slots_endpoint(
 
     source_asset = _preferred_slot_asset(session, task_id=task_id, slot=payload.source_slot)
     if source_asset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source slot has no asset")
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "source_slot": payload.source_slot,
+            "target_slot": payload.target_slot,
+            "noop": True,
+            "reason": "source_slot_has_no_asset",
+        }
 
     target_asset = _preferred_slot_asset(session, task_id=task_id, slot=payload.target_slot)
     if target_asset is None:

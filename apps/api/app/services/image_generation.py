@@ -12,14 +12,15 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.crypto import decrypt_secret
 from app.core.task_status import ImageStatus, TaskMainStatus
 from app.models.image_generation_job import ImageGenerationJob
 from app.models.product_ai_result import ProductAIResult
 from app.models.product_asset import ProductAsset
 from app.models.product_task import ProductTask
 from app.models.raw_product import RawProduct
-from app.models.provider_config import ProviderConfig
 from app.services.image_providers.registry import get_image_provider
+from app.services.image_runtime import build_image_provider_snapshot, resolve_image_runtime
 from app.services.prompt_templates import render_template_text, resolve_prompt
 from app.services.storage_provider import LocalStorageProvider
 from app.services.costing import record_image_cost
@@ -32,15 +33,34 @@ SLOT_PURPOSE: dict[str, str] = {
     "carousel_2": "carousel detail close-up image",
     "carousel_3": "carousel usage scene image",
     "carousel_4": "carousel selling point image",
+    "sku_image": "sku hero image",
     "preview_1": "preview image 1",
     "preview_2": "preview image 2",
     "preview_3": "preview image 3",
     "carousel_4grid": "2x2 four-panel image for cropping into carousel_1~4",
+    "size_chart": "dimension size chart image",
+}
+
+PROMPT_TYPE_ALIASES: dict[str, str] = {
+    "image_prompt_sku_image": "image_prompt_main",
+    "image_prompt_size_chart": "image_prompt_dimension",
 }
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _decrypt_job_api_key(secret_config: dict[str, Any] | None) -> str | None:
+    if not isinstance(secret_config, dict):
+        return None
+    encrypted = secret_config.get("api_key_enc")
+    if not isinstance(encrypted, str) or not encrypted.strip():
+        return None
+    try:
+        return decrypt_secret(encrypted.strip())
+    except Exception:
+        return None
 
 
 def create_job(
@@ -50,9 +70,10 @@ def create_job(
     job_type: str,
     slot: str,
     target_slots: list[str],
-    provider_config: ProviderConfig,
+    provider_name: str,
     model_name: str,
     size: str,
+    provider_config_snapshot: dict[str, Any],
     prompt_template_id: int | None,
     prompt_snapshot: dict[str, Any],
     final_prompt: str,
@@ -69,18 +90,10 @@ def create_job(
         prompt_template_id=prompt_template_id,
         prompt_snapshot=prompt_snapshot or {},
         final_prompt=final_prompt,
-        provider=provider_config.provider_name,
+        provider=provider_name,
         model_name=model_name,
         size=size,
-        provider_config_snapshot={
-            "id": provider_config.id,
-            "provider_type": provider_config.provider_type,
-            "provider_name": provider_config.provider_name,
-            "display_name": provider_config.display_name,
-            "config_json": provider_config.config_json,
-            "capabilities_json": provider_config.capabilities_json,
-            "pricing_json": provider_config.pricing_json,
-        },
+        provider_config_snapshot=provider_config_snapshot or {},
         status="queued",
         progress=0,
     )
@@ -112,18 +125,18 @@ def run_job(session: Session, *, job_id: int) -> None:
         storage = LocalStorageProvider(base_dir="assets")
         capabilities = (job.provider_config_snapshot or {}).get("capabilities_json") or {}
 
-        if job.provider == "stub" or not capabilities.get("api_key_configured", False):
+        if job.provider != "stub" and not capabilities.get("api_key_configured", False):
             record_task_exception(
                 task,
                 code="image_provider_stub",
                 level="warning",
                 status="needs_config",
-                message="当前图片 provider 为 stub 占位生成，四宫格底图不是真实 AI 生图结果。",
+                message="当前默认图片 provider 缺少可用配置，四宫格无法按真实 AI 生图链路执行。",
             )
         else:
             clear_task_exception(task, code="image_provider_stub")
 
-        if not capabilities.get("supports_reference_image", False):
+        if job.provider != "stub" and not capabilities.get("supports_reference_image", False):
             record_task_exception(
                 task,
                 code="reference_image_ignored",
@@ -163,6 +176,15 @@ def run_job(session: Session, *, job_id: int) -> None:
 
         raw = session.get(RawProduct, task.raw_product_id)
         reference_images = _resolve_reference_images(raw=raw, slot=job.slot)
+        config = (job.provider_config_snapshot or {}).get("config_json") or {}
+        secret = (job.provider_config_snapshot or {}).get("secret_config_json") or {}
+        provider_options = {
+            "base_url": config.get("base_url"),
+            "quality": config.get("quality") or "auto",
+            "background": config.get("background") or "auto",
+            "output_format": config.get("output_format") or "png",
+            "api_key": _decrypt_job_api_key(secret),
+        }
         generated = provider.generate_image(
             prompt=job.final_prompt,
             reference_images=reference_images or None,
@@ -173,6 +195,7 @@ def run_job(session: Session, *, job_id: int) -> None:
                 "slot": job.slot,
                 "reference_image_count": len(reference_images),
             },
+            provider_options=provider_options,
         )
         job.progress = 60
         session.add(job)
@@ -483,15 +506,19 @@ def _has_ai_output(payload: Any) -> bool:
 
 def _ensure_prompt_upstream_outputs(session: Session, *, task_id: int) -> None:
     ai = session.scalar(select(ProductAIResult).where(ProductAIResult.task_id == task_id))
+    task = session.get(ProductTask, task_id)
+    from app.services.ai_pipeline import _normalize_generation_mode, GenerationMode
+    norm_mode = _normalize_generation_mode(task.generation_mode) if task else ""
     missing_steps: list[str] = []
-    if not _has_ai_output((ai.product_info if isinstance(ai, ProductAIResult) else None) or {}):
-        missing_steps.append("product_info_from_screenshot")
     if not _has_ai_output((ai.title_package if isinstance(ai, ProductAIResult) else None) or {}):
         missing_steps.append("title_package")
+    # title_only 手动四宫格不允许补跑 product_info（产品口径）
+    if norm_mode == GenerationMode.title_and_4grid.value:
+        if not _has_ai_output((ai.product_info if isinstance(ai, ProductAIResult) else None) or {}):
+            missing_steps.append("product_info_from_screenshot")
     if not missing_steps:
         return
     from app.services.ai_pipeline import run_ai_pipeline_for_task
-
     run_ai_pipeline_for_task(session, task_id=task_id, prompt_types=missing_steps)
 
 
@@ -525,21 +552,50 @@ def build_image_prompt_variables(session: Session, *, task: ProductTask, slot: s
             if isinstance(raw_points, list):
                 selling_points = [str(item).strip() for item in raw_points if str(item).strip()]
 
+    product_info_obj = product_info if isinstance(product_info, dict) else {}
+    product_core_v2 = product_info_obj.get("product_core_v2") if isinstance(product_info_obj.get("product_core_v2"), dict) else {}
+    visual_facts = product_info_obj.get("visual_facts") if isinstance(product_info_obj.get("visual_facts"), dict) else {}
+    image_generation_basis = (
+        product_info_obj.get("image_generation_basis")
+        if isinstance(product_info_obj.get("image_generation_basis"), dict)
+        else {}
+    )
+    title_basis = product_info_obj.get("title_basis") if isinstance(product_info_obj.get("title_basis"), dict) else {}
+    product_info_context = {
+        "product_subject": str(product_core_v2.get("product_subject") or image_generation_basis.get("main_subject") or ""),
+        "product_type": str(product_core_v2.get("product_type") or ""),
+        "core_product_words": [str(x).strip() for x in (title_package or {}).get("core_product_words", []) if str(x).strip()] if isinstance(title_package, dict) else [],
+        "attribute_words": [str(x).strip() for x in (title_basis.get("must_include") or []) if str(x).strip()],
+        "structure_words": [str(x).strip() for x in (visual_facts.get("visible_structures") or []) if str(x).strip()],
+        "scene_words": [str(x).strip() for x in (product_core_v2.get("usage_scenarios") or []) if str(x).strip()],
+        "style_tags": [str(x).strip() for x in (product_core_v2.get("style_tags") or []) if str(x).strip()],
+        "visible_colors": [str(x).strip() for x in (visual_facts.get("visible_colors") or []) if str(x).strip()],
+        "visible_shapes": [str(x).strip() for x in (visual_facts.get("visible_shapes") or []) if str(x).strip()],
+        "must_keep_elements": [str(x).strip() for x in (image_generation_basis.get("must_keep_elements") or []) if str(x).strip()],
+        "must_avoid_elements": [str(x).strip() for x in (image_generation_basis.get("must_avoid_elements") or []) if str(x).strip()],
+        "selling_point_candidates": [str(x).strip() for x in (image_generation_basis.get("selling_point_candidates") or []) if str(x).strip()],
+        "sku_axes": [str(x).strip() for x in (image_generation_basis.get("sku_axes") or []) if str(x).strip()],
+        "dimension_candidates": [str(x).strip() for x in (image_generation_basis.get("dimension_candidates") or []) if str(x).strip()],
+    }
+
     return {
         "raw_title": (raw.title if raw else task.title),
         "title": (raw.title if raw else task.title),
         "optimized_title_cn": title_cn or task.title,
         "selected_category_path": category_path or "",
         "category_path": category_path or "",
-        "product_info": product_info or {},
+        "resolved_category_path": category_path or "",
+        "category_match": category_out if isinstance(category_out, dict) else {},
+        "product_info": product_info_obj,
+        "product_info_context": product_info_context,
         "title_package": title_package or {},
         "title_en_with_cn_translation": title_en_package or {},
         "selling_points": selling_points,
         "material": "",
         "target_user": "",
         "scenes": (
-            (product_info or {}).get("product_core", {}).get("scene_keywords", [])
-            if isinstance(product_info, dict)
+            product_core_v2.get("usage_scenarios", [])
+            if isinstance(product_core_v2, dict)
             else []
         ),
         "reference_image_notes": raw.screenshot_url if raw else "",
@@ -557,16 +613,18 @@ def resolve_image_prompt(
 ) -> tuple[int | None, dict[str, Any], str]:
     _ensure_prompt_upstream_outputs(session, task_id=task.id)
 
-    template = resolve_prompt(session, prompt_type=prompt_type, task_id=task.id, category_id=category_id)
+    effective_prompt_type = PROMPT_TYPE_ALIASES.get(prompt_type, prompt_type)
+    template = resolve_prompt(session, prompt_type=effective_prompt_type, task_id=task.id, category_id=category_id)
     if template is None:
-        raise RuntimeError(f"No enabled prompt template found for prompt_type={prompt_type}")
+        raise RuntimeError(f"No enabled prompt template found for prompt_type={effective_prompt_type}")
     inferred_slot: str | None = None
     if prompt_type.startswith("image_prompt_"):
         inferred_slot = prompt_type.removeprefix("image_prompt_")
     variables = build_image_prompt_variables(session, task=task, slot=inferred_slot)
     rendered = render_template_text(template_text=template.template_text, variables=variables)
     snapshot = {
-        "prompt_type": prompt_type,
+        "prompt_type": effective_prompt_type,
+        "requested_prompt_type": prompt_type,
         "template_id": template.id,
         "scope": template.scope,
         "category_id": template.category_id,
@@ -575,3 +633,32 @@ def resolve_image_prompt(
         "variables": variables,
     }
     return template.id, snapshot, rendered
+
+
+def auto_generate_and_crop_4grid_for_task(session: Session, *, task: ProductTask) -> int:
+    runtime = resolve_image_runtime(session)
+    if not runtime.get("enabled"):
+        raise RuntimeError("Image provider not configured/enabled")
+
+    template_id, prompt_snapshot, final_prompt = resolve_image_prompt(
+        session,
+        task=task,
+        prompt_type="image_prompt_carousel_4grid",
+        category_id=task.selected_category_id,
+    )
+    job = create_job(
+        session,
+        task=task,
+        job_type="carousel_4grid",
+        slot="carousel_4grid",
+        target_slots=["carousel_1", "carousel_2", "carousel_3", "carousel_4"],
+        provider_name=str(runtime.get("provider_name") or "stub"),
+        model_name=str(runtime.get("model") or "stub-v1"),
+        size=str(runtime.get("size") or "1024x1024"),
+        provider_config_snapshot=build_image_provider_snapshot(runtime),
+        prompt_template_id=template_id,
+        prompt_snapshot=prompt_snapshot,
+        final_prompt=final_prompt,
+    )
+    run_job(session, job_id=job.id)
+    return job.id

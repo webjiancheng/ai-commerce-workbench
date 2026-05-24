@@ -37,6 +37,7 @@ class ProductTaskCreateResponse(BaseModel):
     raw_product_id: int
     main_status: TaskMainStatus
     generation_mode: GenerationMode
+    include_product_info: bool = True
     existed: bool = False
     split_index: int = 1
     split_total: int = 1
@@ -51,6 +52,7 @@ class ProductTaskUpdate(BaseModel):
     export_status: ExportStatus | None = None
     selected_category_id: str | None = None
     generation_mode: GenerationMode | None = None
+    include_product_info: bool | None = None
     notes: str | None = None
 
 
@@ -64,6 +66,7 @@ class ProductTaskListItem(BaseModel):
     source_id: str | None
     platform_sku: str | None
     generation_mode: GenerationMode
+    include_product_info: bool = True
     main_status: TaskMainStatus
     category_status: CategoryStatus
     title_status: TitleStatus

@@ -32,6 +32,8 @@ const PROMPT_TYPE_LABELS: Record<string, string> = {
   title_package_lite: "轻量标题包",
   title_package: "标题包",
   title_en: "英文标题生成",
+  title_en_only: "英文标题单独生成",
+  title_en_with_cn_translation: "英文标题及中文翻译",
   image_prompt_package: "图片提示词包",
   image_prompt_main: "主图提示词",
   image_prompt_carousel_1: "轮播图1提示词",
@@ -132,17 +134,21 @@ export default function PromptsPage() {
 
   useEffect(() => {
     async function bootstrap() {
-      const [typesRes, varsRes] = await Promise.all([
-        fetch(`${apiBaseUrl}/api/system/prompt-types`, { cache: "no-store" }),
-        fetch(`${apiBaseUrl}/api/system/prompt-variables`, { cache: "no-store" }),
-      ]);
-      if (typesRes.ok) {
-        const data = (await typesRes.json()) as { items: string[] };
-        setPromptTypes(data.items || []);
-      }
-      if (varsRes.ok) {
-        const data = (await varsRes.json()) as { items: Record<string, { type: string; desc: string }> };
-        setPromptVariables(data.items || {});
+      try {
+        const [typesRes, varsRes] = await Promise.all([
+          fetch(`${apiBaseUrl}/api/system/prompt-types`, { cache: "no-store" }),
+          fetch(`${apiBaseUrl}/api/system/prompt-variables`, { cache: "no-store" }),
+        ]);
+
+        if (!typesRes.ok) throw new Error(`提示词类型加载失败: HTTP ${typesRes.status}`);
+        if (!varsRes.ok) throw new Error(`提示词变量加载失败: HTTP ${varsRes.status}`);
+
+        const typesData = (await typesRes.json()) as { items: string[] };
+        const varsData = (await varsRes.json()) as { items: Record<string, { type: string; desc: string }> };
+        setPromptTypes(typesData.items || []);
+        setPromptVariables(varsData.items || {});
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "系统提示词配置接口请求失败");
       }
     }
     void bootstrap();
@@ -221,20 +227,21 @@ export default function PromptsPage() {
   }
 
   async function createGlobal() {
-    if (!filterPromptType) {
-      alert("请先选择 prompt_type");
+    const promptType = filterPromptType || promptTypes[0];
+    if (!promptType) {
+      alert("提示词类型尚未加载，请确认后端服务是否正常运行");
       return;
     }
     const res = await fetch(`${apiBaseUrl}/api/prompt-templates`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        name: `${PROMPT_TYPE_LABELS[filterPromptType] || filterPromptType}（全局）`,
-        prompt_type: filterPromptType,
+        name: `${PROMPT_TYPE_LABELS[promptType] || promptType}（全局）`,
+        prompt_type: promptType,
         scope: "global",
         category_id: null,
         task_id: null,
-        template_text: defaultTemplateTextByType(filterPromptType),
+        template_text: defaultTemplateTextByType(promptType),
         variables_json: {},
         version: 1,
         enabled: true,
@@ -272,7 +279,7 @@ export default function PromptsPage() {
 
   return (
     <div className="min-h-screen px-4 py-6 md:px-6">
-      <section className="mx-auto max-w-6xl">
+      <section className="mx-auto ">
         <header className="rounded-[28px] border border-[var(--card-border)] bg-[var(--card)] p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
@@ -464,7 +471,7 @@ export default function PromptsPage() {
                         onChange={(e) => setTestVarsJson(e.target.value)}
                         className="mt-2 h-[180px] w-full resize-none rounded-[16px] border border-slate-200 bg-white p-3 text-xs font-mono outline-none focus:border-slate-400"
                       />
-                      {renderError ? <div className="mt-2 text-xs text-rose-600">{renderError}</div> : null}
+                      {renderError ? <div className="mt-2 text-xs text-rose-600" >{renderError}</div> : null}
                     </div>
                     <div>
                       <div className="text-xs font-semibold text-slate-700">渲染结果</div>

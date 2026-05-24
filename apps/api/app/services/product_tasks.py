@@ -41,7 +41,8 @@ def create_task_from_raw_product(
     *,
     split_index: int = 1,
     split_total: int = 1,
-    generation_mode: str = GenerationMode.title_and_image_prompts.value,
+    generation_mode: str = GenerationMode.title_and_4grid.value,
+    include_product_info: bool = True,
 ) -> ProductTask:
     task = ProductTask(
         raw_product_id=raw_product.id,
@@ -54,6 +55,7 @@ def create_task_from_raw_product(
         split_index=split_index,
         split_total=split_total,
         generation_mode=generation_mode,
+        include_product_info=include_product_info,
         main_status=DEFAULT_MAIN_STATUS,
         category_status=DEFAULT_CATEGORY_STATUS,
         title_status=DEFAULT_TITLE_STATUS,
@@ -322,7 +324,7 @@ def _build_ai_events(ai_row: ProductAIResult | None) -> list[ProductTaskTimeline
         elif field_name == "title_package" and isinstance(output, dict):
             message = f"生成标题包：{output.get('title_cn') or '-'} / {output.get('title_en') or '-'}"
         elif field_name == "image_prompt_package" and isinstance(output, dict):
-            message = "已生成四宫格、轮播图和尺寸图提示词包。"
+            message = "已基于商品理解和标题结果生成动态图片提示词上下文，未调用图片提示词 AI。"
         elif field_name == "title_en" and isinstance(output, dict):
             title_value = output.get("title") or output.get("title_en") or "-"
             message = f"生成标题：{title_value}"
@@ -364,6 +366,15 @@ def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimel
     events: list[ProductTaskTimelineEvent] = []
     for job in jobs:
         target_slots = [slot for slot in (job.target_slots_json or []) if isinstance(slot, str)]
+        provider_snapshot = job.provider_config_snapshot if isinstance(job.provider_config_snapshot, dict) else {}
+        provider_config = provider_snapshot.get("config_json") if isinstance(provider_snapshot.get("config_json"), dict) else {}
+        provider_id = provider_snapshot.get("id")
+        provider_source = (
+            "request_runtime"
+            if provider_id is None and job.provider == "openai_compatible"
+            else "default_provider"
+        )
+        runtime_base_url = provider_config.get("base_url")
         meta = {
             "job_id": job.id,
             "job_type": job.job_type,
@@ -372,6 +383,8 @@ def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimel
             "provider": job.provider,
             "model_name": job.model_name,
             "size": job.size,
+            "provider_source": provider_source,
+            "base_url": runtime_base_url,
         }
         events.append(
             _event(
@@ -394,6 +407,20 @@ def _build_image_events(jobs: list[ImageGenerationJob]) -> list[ProductTaskTimel
                     message=f"调用 {job.provider}/{job.model_name} 开始生成，当前槽位：{job.slot}。",
                     source="image_generation_jobs",
                     meta=meta | {"progress": job.progress},
+                )
+            )
+            events.append(
+                _event(
+                    ts=job.started_at,
+                    stage="image.runtime",
+                    status="info",
+                    title=f"图片运行时参数 #{job.id}",
+                    message=(
+                        f"运行时来源：{provider_source}；provider={job.provider}；model={job.model_name}；"
+                        f"base_url={runtime_base_url or '-'}。"
+                    ),
+                    source="image_generation_jobs",
+                    meta=meta,
                 )
             )
         if job.finished_at:

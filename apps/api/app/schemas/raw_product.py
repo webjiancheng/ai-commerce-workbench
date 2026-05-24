@@ -113,6 +113,8 @@ class RawProductDetail(BaseModel):
     sku_images: list[str]
     detail_images: list[str]
     size_chart_images: list[str]
+    task_id: int | None = None
+    task_created: bool = False
     debug_payload: dict
     raw_payload: dict
     created_at: datetime
@@ -131,7 +133,8 @@ class RawProductListResponse(BaseModel):
 class RawProductBatchCreateTasksIn(BaseModel):
     raw_product_ids: list[int] = Field(default_factory=list)
     split_count: int = Field(default=1, ge=1, le=50)
-    generation_mode: GenerationMode = GenerationMode.title_and_image_prompts
+    generation_mode: GenerationMode = GenerationMode.title_and_4grid
+    include_product_info: bool = True
 
 
 class RawProductBatchDeleteIn(BaseModel):

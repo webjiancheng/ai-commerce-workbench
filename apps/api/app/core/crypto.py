@@ -24,6 +24,11 @@ def get_fernet() -> Fernet:
     return Fernet(_derive_fernet_key(settings.settings_secret_key))
 
 
+def has_settings_secret_key() -> bool:
+    settings = get_settings()
+    return bool((settings.settings_secret_key or "").strip())
+
+
 def encrypt_secret(plaintext: str) -> str:
     f = get_fernet()
     return f.encrypt(plaintext.encode("utf-8")).decode("utf-8")
@@ -38,4 +43,3 @@ def mask_secret(value: str, *, keep_last: int = 4) -> str:
     v = value or ""
     tail = v[-keep_last:] if len(v) >= keep_last else v
     return f"****{tail}" if tail else "****"
-

@@ -72,12 +72,30 @@ def _render_dimension_prompt(session: Session, *, task: ProductTask) -> str:
         category_out = ((ai.category_match or {}).get("output") or {})
         category_path = str(category_out.get("best_path") or category_out.get("selected_category") or "")
         product_info = ((ai.product_info or {}).get("output") or {})
+    product_info_obj = product_info if isinstance(product_info, dict) else {}
+    product_core_v2 = product_info_obj.get("product_core_v2") if isinstance(product_info_obj.get("product_core_v2"), dict) else {}
+    visual_facts = product_info_obj.get("visual_facts") if isinstance(product_info_obj.get("visual_facts"), dict) else {}
+    image_generation_basis = (
+        product_info_obj.get("image_generation_basis")
+        if isinstance(product_info_obj.get("image_generation_basis"), dict)
+        else {}
+    )
+    product_info_context = {
+        "product_subject": str(product_core_v2.get("product_subject") or image_generation_basis.get("main_subject") or ""),
+        "product_type": str(product_core_v2.get("product_type") or ""),
+        "visible_colors": [str(x).strip() for x in (visual_facts.get("visible_colors") or []) if str(x).strip()],
+        "visible_shapes": [str(x).strip() for x in (visual_facts.get("visible_shapes") or []) if str(x).strip()],
+        "must_keep_elements": [str(x).strip() for x in (image_generation_basis.get("must_keep_elements") or []) if str(x).strip()],
+        "dimension_candidates": [str(x).strip() for x in (image_generation_basis.get("dimension_candidates") or []) if str(x).strip()],
+    }
+
     variables = {
         "raw_title": (raw.title if raw else task.title),
         "title": (raw.title if raw else task.title),
         "selected_category_path": category_path,
         "category_path": category_path,
-        "product_info": product_info if isinstance(product_info, dict) else {},
+        "product_info": product_info_obj,
+        "product_info_context": product_info_context,
         "attributes_text": (raw.attributes_text if raw else None),
         "sku_text": (raw.sku_text if raw else None),
     }

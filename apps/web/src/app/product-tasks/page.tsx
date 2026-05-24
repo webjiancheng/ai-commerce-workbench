@@ -2,10 +2,11 @@
 
 import { apiBaseUrl } from "@/lib/api";
 import { HoverZoomImage } from "@/components/hover-zoom-image";
-import { AiPurpose, resolveLocalTextRuntime } from "@/lib/local-settings";
+import { AiPurpose, resolveLocalImageRuntime, resolveLocalTextRuntime } from "@/lib/local-settings";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import Select, { type InputActionMeta, type SingleValue, type StylesConfig } from "react-select";
 
 type TaskMainStatus =
   | "draft"
@@ -23,7 +24,30 @@ type TaskMainStatus =
 type CategoryStatus = "pending" | "running" | "success" | "low_confidence" | "failed";
 type ImagePromptStatus = "pending" | "running" | "ready" | "failed";
 type ExportStatus = "pending" | "ready" | "running" | "exported" | "failed";
-type GenerationMode = "no_ai" | "title_only" | "title_and_image_prompts" | "full_later";
+
+// 归一化历史 enum 到三模式口径
+export type NormalizedGenerationMode = "task_only" | "title_only" | "title_and_4grid";
+
+const BACKWARD_COMPAT_MAP: Record<string, NormalizedGenerationMode> = {
+  no_ai: "task_only",
+  title_and_image_prompts: "title_and_4grid",
+  full_later: "title_and_4grid",
+};
+
+export function normalizeGenerationMode(raw: string): NormalizedGenerationMode {
+  return BACKWARD_COMPAT_MAP[raw] as NormalizedGenerationMode || (raw as NormalizedGenerationMode);
+}
+
+function getGenerationModeLabel(mode: string): string {
+  switch (mode) {
+    case "task_only": return "仅创建任务，不使用 AI";
+    case "title_only": return "AI 标题 + 类目";
+    case "title_and_4grid": return "AI 标题 + 类目 + 商品理解 + 四宫格";
+    default: return mode;
+  }
+}
+
+type GenerationMode = "task_only" | "title_only" | "title_and_4grid" | "no_ai" | "title_and_image_prompts" | "full_later";
 
 type ProductTaskListItem = {
   id: number;
@@ -113,6 +137,7 @@ type RawProductDetail = {
   price: string | null;
   category_path: string | null;
   platform_sku: string | null;
+  sku_text?: string | null;
   source_id: string | null;
   screenshot_url: string | null;
   main_image: string | null;
@@ -128,11 +153,14 @@ function buildAiRequestHeaders(
   preferredPurposes?: AiPurpose[],
 ): Record<string, string> {
   const runtime = resolveLocalTextRuntime(preferredPurposes);
+  const imageRuntime = resolveLocalImageRuntime();
   const headers: Record<string, string> = includeJsonContentType ? { "content-type": "application/json" } : {};
-  if (!runtime) return headers;
-  if (runtime.apiKey) headers["X-AI-API-Key"] = runtime.apiKey;
-  if (runtime.baseUrl) headers["X-AI-Base-URL"] = runtime.baseUrl;
-  if (runtime.model) headers["X-AI-Model"] = runtime.model;
+  if (runtime?.apiKey) headers["X-AI-API-Key"] = runtime.apiKey;
+  if (runtime?.baseUrl) headers["X-AI-Base-URL"] = runtime.baseUrl;
+  if (runtime?.model) headers["X-AI-Model"] = runtime.model;
+  if (imageRuntime?.apiKey) headers["X-AI-Image-API-Key"] = imageRuntime.apiKey;
+  if (imageRuntime?.baseUrl) headers["X-AI-Image-Base-URL"] = imageRuntime.baseUrl;
+  if (imageRuntime?.model) headers["X-AI-Image-Model"] = imageRuntime.model;
   return headers;
 }
 
@@ -208,6 +236,15 @@ type WorkbenchDetailResponse = {
   export_draft: ExportFieldDraft | null;
 };
 
+function rowMetaFromWorkbenchDetail(payload: WorkbenchDetailResponse): RowMeta {
+  return {
+    raw: payload.raw,
+    assets: payload.assets || {},
+    detail: payload.task,
+    exportDraft: payload.export_draft || null,
+  };
+}
+
 type CategorySearchItem = {
   path: string;
   leaf: string;
@@ -218,6 +255,358 @@ type CategorySearchResponse = {
   total: number;
   query: string;
 };
+
+type CategorySelectOption = {
+  value: string;
+  label: string;
+  path: string;
+  leaf: string;
+  preferred: boolean;
+};
+
+function categoryLeaf(path: string): string {
+  const parts = String(path || "")
+    .split(">")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return parts[parts.length - 1] || String(path || "").trim();
+}
+
+function mergeCategoryOptions(
+  preferredPaths: string[],
+  allOptions: CategorySearchItem[],
+  query: string,
+  limit = 24,
+): CategorySearchItem[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const merged = new Map<string, CategorySearchItem>();
+
+  // When query is provided, filter by query first, then show results
+  if (normalizedQuery) {
+    const matched: CategorySearchItem[] = [];
+    for (const option of allOptions) {
+      const path = String(option.path || "").trim();
+      if (!path || merged.has(path)) continue;
+      const path_lc = path.toLowerCase();
+      const leaf_lc = (option.leaf || categoryLeaf(path)).toLowerCase();
+      // Match if query appears in path or leaf
+      if (path_lc.includes(normalizedQuery) || leaf_lc.includes(normalizedQuery)) {
+        matched.push({ path, leaf: option.leaf || categoryLeaf(path) });
+        merged.set(path, matched[matched.length - 1]);
+      }
+      if (merged.size >= limit) break;
+    }
+    // If not enough results, also try partial token matches
+    if (merged.size < limit && normalizedQuery.length > 1) {
+      for (const option of allOptions) {
+        const path = String(option.path || "").trim();
+        if (!path || merged.has(path)) continue;
+        const path_lc = path.toLowerCase();
+        const leaf_lc = (option.leaf || categoryLeaf(path)).toLowerCase();
+        // Try matching individual tokens from the query
+        const tokens = normalizedQuery.split(/[\s,，]+/).filter(Boolean);
+        const hasMatch = tokens.some(token => path_lc.includes(token) || leaf_lc.includes(token));
+        if (hasMatch) {
+          matched.push({ path, leaf: option.leaf || categoryLeaf(path) });
+          merged.set(path, matched[matched.length - 1]);
+        }
+        if (merged.size >= limit) break;
+      }
+    }
+    return Array.from(merged.values());
+  }
+
+  // When query is empty, show preferred first then fill with all options
+  const preferredSet = new Set(preferredPaths.map((item) => String(item || "").trim()).filter(Boolean));
+
+  for (const path of preferredPaths) {
+    const text = String(path || "").trim();
+    if (!text || merged.has(text)) continue;
+    merged.set(text, { path: text, leaf: categoryLeaf(text) });
+  }
+
+  if (merged.size < limit) {
+    const remaining = limit - merged.size;
+    for (const option of allOptions) {
+      const path = String(option.path || "").trim();
+      if (!path || merged.has(path) || !preferredSet.has(path)) continue;
+      merged.set(path, { path, leaf: option.leaf || categoryLeaf(path) });
+      if (merged.size >= limit) break;
+    }
+  }
+
+  if (merged.size < limit) {
+    for (const option of allOptions) {
+      const path = String(option.path || "").trim();
+      if (!path || merged.has(path)) continue;
+      merged.set(path, { path, leaf: option.leaf || categoryLeaf(path) });
+      if (merged.size >= limit) break;
+    }
+  }
+
+  return Array.from(merged.values());
+}
+
+function toCategorySelectOptions(items: CategorySearchItem[], preferredPaths: string[]): CategorySelectOption[] {
+  const preferredSet = new Set(preferredPaths.map((item) => String(item || "").trim()).filter(Boolean));
+  return items.map((item) => ({
+    value: item.path,
+    label: item.leaf || categoryLeaf(item.path),
+    path: item.path,
+    leaf: item.leaf || categoryLeaf(item.path),
+    preferred: preferredSet.has(item.path),
+  }));
+}
+
+function SearchableCategoryInput({
+  value,
+  onChange,
+  onSelect,
+  allOptions,
+  preferredPaths,
+  placeholder,
+  className,
+  minHeight = 44,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSelect: (path: string) => void;
+  allOptions: CategorySearchItem[];
+  preferredPaths: string[];
+  placeholder: string;
+  className?: string;
+  minHeight?: number;
+}) {
+  const [inputValue, setInputValue] = useState("");
+  const [serverSuggestions, setServerSuggestions] = useState<CategorySearchItem[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+
+  // Debounced search on server when input changes
+  useEffect(() => {
+    const query = inputValue.trim();
+    if (!query) {
+      setServerSuggestions([]);
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      setIsSearching(true);
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/categories/search?q=${encodeURIComponent(query)}&limit=100`, {
+          cache: "no-store",
+        });
+        if (response.ok) {
+          const result = (await response.json()) as CategorySearchResponse;
+          setServerSuggestions(result.items || []);
+        }
+      } catch {
+        // ignore search errors
+      } finally {
+        setIsSearching(false);
+      }
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [inputValue]);
+
+  // Compute suggestions: use server results if available, otherwise local search
+  // Always include the currently selected value in options to ensure it displays correctly
+  const suggestions = useMemo(() => {
+    const query = inputValue.trim();
+    let baseItems: CategorySearchItem[] = [];
+
+    // When we have server results, use them as the base
+    if (serverSuggestions.length > 0) {
+      baseItems = serverSuggestions;
+    } else if (query) {
+      // No server results, fall back to local search
+      baseItems = mergeCategoryOptions(preferredPaths, allOptions, query, 80);
+    }
+
+    // Deduplicate by path
+    const pathMap = new Map<string, string>();
+    for (const item of baseItems) {
+      pathMap.set(item.path, item.leaf || categoryLeaf(item.path));
+    }
+
+    // Always add the currently selected value to ensure it displays correctly
+    if (value && !pathMap.has(value)) {
+      pathMap.set(value, categoryLeaf(value));
+    }
+
+    // Add preferred paths that might not be in results yet
+    for (const preferredPath of preferredPaths) {
+      if (!pathMap.has(preferredPath)) {
+        pathMap.set(preferredPath, categoryLeaf(preferredPath));
+      }
+    }
+
+    // Convert back to array, limit to 80
+    const result: CategorySearchItem[] = [];
+    for (const [path, leaf] of pathMap) {
+      if (result.length >= 80) break;
+      result.push({ path, leaf });
+    }
+    return result;
+  }, [allOptions, preferredPaths, inputValue, serverSuggestions, value]);
+
+  // Compute options from suggestions
+  const options = useMemo(
+    () => toCategorySelectOptions(suggestions, preferredPaths),
+    [preferredPaths, suggestions],
+  );
+
+  // Find selected option: look in both current options AND allOptions to handle server search results
+  const selectedOption = useMemo(() => {
+    const text = String(value || "").trim();
+    if (!text) return null;
+    // First try to find in current options (for display after search)
+    const found = options.find((option) => option.value === text);
+    if (found) return found;
+    // Fallback: search in allOptions and serverSuggestions to create the option
+    const allItems = [...serverSuggestions, ...allOptions];
+    const match = allItems.find((item) => item.path === text);
+    if (match) {
+      return {
+        value: match.path,
+        label: match.leaf || categoryLeaf(match.path),
+        path: match.path,
+        leaf: match.leaf || categoryLeaf(match.path),
+        preferred: preferredPaths.includes(match.path),
+      };
+    }
+    return null;
+  }, [options, value, allOptions, serverSuggestions, preferredPaths]);
+
+  const styles: StylesConfig<CategorySelectOption, false> = {
+    control: (base, state) => ({
+      ...base,
+      minHeight,
+      borderRadius: 14,
+      borderColor: state.isFocused ? "#94a3b8" : "#e2e8f0",
+      backgroundColor: "#fff",
+      boxShadow: "none",
+      paddingLeft: 4,
+      paddingRight: 4,
+      "&:hover": { borderColor: "#94a3b8" },
+    }),
+    valueContainer: (base) => ({
+      ...base,
+      padding: "0 8px",
+    }),
+    placeholder: (base) => ({
+      ...base,
+      color: "#94a3b8",
+      fontSize: 14,
+    }),
+    singleValue: (base) => ({
+      ...base,
+      color: "#0f172a",
+      fontSize: 14,
+    }),
+    input: (base) => ({
+      ...base,
+      color: "#0f172a",
+      fontSize: 14,
+    }),
+    menu: (base) => ({
+      ...base,
+      borderRadius: 18,
+      border: "1px solid #e2e8f0",
+      boxShadow: "0 18px 50px rgba(15,23,42,0.12)",
+      overflow: "hidden",
+      zIndex: 30,
+    }),
+    menuList: (base) => ({
+      ...base,
+      padding: 8,
+      maxHeight: 320,
+    }),
+    option: (base, state) => ({
+      ...base,
+      borderRadius: 12,
+      backgroundColor: state.isSelected ? "#dbeafe" : state.isFocused ? "#f8fafc" : "#fff",
+      color: "#0f172a",
+      padding: 0,
+      cursor: "pointer",
+      overflow: "hidden",
+    }),
+    noOptionsMessage: (base) => ({
+      ...base,
+      color: "#64748b",
+      fontSize: 12,
+      padding: "8px 10px",
+    }),
+    indicatorSeparator: () => ({ display: "none" }),
+    dropdownIndicator: (base) => ({
+      ...base,
+      color: "#64748b",
+      padding: 6,
+    }),
+    clearIndicator: (base) => ({
+      ...base,
+      color: "#64748b",
+      padding: 6,
+    }),
+  };
+
+  return (
+    <div className={`relative ${className || ""}`}>
+      {isSearching && inputValue.trim() ? (
+        <div className="absolute right-10 top-1/2 -translate-y-1/2 text-xs text-slate-400">搜索中...</div>
+      ) : null}
+      <Select<CategorySelectOption, false>
+        unstyled={false}
+        options={options}
+        value={selectedOption}
+        inputValue={inputValue}
+        onInputChange={(nextValue: string, meta: InputActionMeta) => {
+          if (meta.action === "input-change") {
+            setInputValue(nextValue);
+            onChange(nextValue);
+          }
+          if (meta.action === "menu-close") {
+            setInputValue("");
+          }
+          return nextValue;
+        }}
+        onChange={(option: SingleValue<CategorySelectOption>) => {
+          const nextPath = option?.path || "";
+          // If user selected an option, add it to serverSuggestions to ensure it stays visible
+          if (nextPath && !serverSuggestions.some((s) => s.path === nextPath)) {
+            setServerSuggestions((prev) => [
+              { path: nextPath, leaf: categoryLeaf(nextPath) },
+              ...prev.slice(0, 99),
+            ]);
+          }
+          // Call onChange and onSelect to update external state first
+          onChange(nextPath);
+          onSelect(nextPath);
+          // Clear input after a brief delay to ensure value is updated first
+          setTimeout(() => setInputValue(""), 0);
+        }}
+        isClearable
+        filterOption={null}
+        styles={styles}
+        formatOptionLabel={(option) => (
+          <div className="px-3 py-2">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-slate-800">{option.leaf}</span>
+              {option.preferred ? (
+                <span className="rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-medium text-sky-700">优先</span>
+              ) : null}
+            </div>
+            <div className="mt-1 line-clamp-2 text-[11px] text-slate-500">{option.path}</div>
+          </div>
+        )}
+        noOptionsMessage={() => "没有匹配类目，继续输入搜索"}
+        placeholder={placeholder}
+      />
+    </div>
+  );
+}
 
 type ViewMode = "cards" | "table";
 type DrawerSize = "50" | "70" | "100";
@@ -347,11 +736,50 @@ function taskThumbnail(task: ProductTaskListItem, meta?: RowMeta | null): string
 }
 
 function latestAsset(assets: ProductAsset[] | undefined): ProductAsset | null {
-  return assets?.find((asset) => asset.selected_for_export) || assets?.[0] || null;
+  const usableAssets = (assets || []).filter((asset) => asset.status !== "removed" && asset.public_url);
+  return usableAssets.find((asset) => asset.selected_for_export) || usableAssets[0] || null;
 }
 
 function selectedSlotAsset(assetsBySlot: AssetsBySlotResponse | undefined, slot: string): ProductAsset | null {
   return latestAsset(assetsBySlot?.[slot]);
+}
+
+function slotHasRemovalMarker(assetsBySlot: AssetsBySlotResponse | undefined, slot: string): boolean {
+  return Boolean(
+    (assetsBySlot?.[slot] || []).some(
+      (asset) => asset.selected_for_export && (asset.status === "removed" || asset.source_type === "manual_removed"),
+    ),
+  );
+}
+
+function rawCarouselSequence(raw: RawProductDetail | null | undefined): string[] {
+  return Array.from(new Set([...(raw?.main_image ? [raw.main_image] : []), ...(raw?.carousel_images || [])]));
+}
+
+function rawImageForCarouselSlot(raw: RawProductDetail | null | undefined, slot: string): string | null {
+  if (!slot.startsWith("carousel_")) return null;
+  const index = Number(slot.split("_")[1]) - 1;
+  if (!Number.isInteger(index) || index < 0) return null;
+  return rawCarouselSequence(raw)[index] || null;
+}
+
+type TableSlotImage = {
+  slot: string;
+  asset: ProductAsset | null;
+  rawUrl: string | null;
+  publicUrl: string | null;
+};
+
+function tableSlotImage(
+  assetsBySlot: AssetsBySlotResponse | undefined,
+  raw: RawProductDetail | null | undefined,
+  slot: string,
+): TableSlotImage {
+  const asset = selectedSlotAsset(assetsBySlot, slot);
+  const suppressRawFallback = Boolean(asset?.public_url) || slotHasRemovalMarker(assetsBySlot, slot);
+  const rawUrl = suppressRawFallback ? null : rawImageForCarouselSlot(raw, slot);
+  const publicUrl = asset?.public_url || rawUrl || null;
+  return { slot, asset, rawUrl, publicUrl };
 }
 
 function ThumbnailPlaceholder({ label = "暂无图" }: { label?: string }) {
@@ -363,6 +791,14 @@ function ThumbnailPlaceholder({ label = "暂无图" }: { label?: string }) {
 }
 
 export default function ProductTasksPage() {
+  return (
+    <Suspense fallback={<div className="p-6 text-sm text-slate-500">加载中...</div>}>
+      <ProductTasksPageInner />
+    </Suspense>
+  );
+}
+
+function ProductTasksPageInner() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const initialViewMode: ViewMode = pathname === "/logs" || searchParams.get("view") === "logs" ? "cards" : "table";
@@ -405,6 +841,7 @@ export default function ProductTasksPage() {
   const [drawerLoading, setDrawerLoading] = useState(false);
   const [drawerError, setDrawerError] = useState<string | null>(null);
   const [promptEditor, setPromptEditor] = useState<PromptEditorConfig | null>(null);
+  const [drawerSyncing, setDrawerSyncing] = useState(false);
   const isLogsRoute = pathname === "/logs";
 
   useEffect(() => {
@@ -572,6 +1009,7 @@ export default function ProductTasksPage() {
     const detail = (await detailRes.json()) as WorkbenchDetailResponse;
     setTaskDetail(detail.task);
     setRawDetail(detail.raw);
+    setRowMeta((prev) => ({ ...prev, [taskId]: rowMetaFromWorkbenchDetail(detail) }));
     setTimelineMap((prev) => ({ ...prev, [taskId]: timeline }));
   }
 
@@ -593,6 +1031,17 @@ export default function ProductTasksPage() {
     }
   }
 
+  async function syncDrawerAndTable(): Promise<void> {
+    if (!activeTaskId) return;
+    setDrawerSyncing(true);
+    try {
+      await loadWorkbenchDetail(activeTaskId);
+      await loadList();
+    } finally {
+      setDrawerSyncing(false);
+    }
+  }
+
   function closeDrawer(): void {
     setDrawerOpen(false);
     setActiveTaskId(null);
@@ -609,15 +1058,7 @@ export default function ProductTasksPage() {
             return [item.id, { raw: null, assets: {}, detail: null, exportDraft: null }] as const;
           }
           const payload = (await response.json()) as WorkbenchDetailResponse;
-          return [
-            item.id,
-            {
-              raw: payload.raw,
-              assets: payload.assets || {},
-              detail: payload.task,
-              exportDraft: payload.export_draft || null,
-            },
-          ] as const;
+          return [item.id, rowMetaFromWorkbenchDetail(payload)] as const;
         } catch {
           return [item.id, { raw: null, assets: {}, detail: null, exportDraft: null }] as const;
         }
@@ -714,9 +1155,9 @@ export default function ProductTasksPage() {
   }
 
   async function generateTitles(taskId: number): Promise<void> {
-    const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-titles`, {
+    const response = await fetch(`${apiBaseUrl}/api/product-tasks/${taskId}/generate-title-en-only`, {
       method: "POST",
-      headers: buildAiRequestHeaders(false, ["title_package", "title"]),
+      headers: buildAiRequestHeaders(false, ["title"]),
     });
     const result = (await response.json()) as { detail?: string };
     if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
@@ -910,22 +1351,46 @@ export default function ProductTasksPage() {
         body: JSON.stringify({ product_task_ids: selectedIds }),
       });
       const result = (await response.json()) as {
-        rows?: { validation_result?: { errors?: unknown[]; warnings?: unknown[] } }[];
+        rows?: { task_id?: number; validation_result?: { errors?: { field_name?: string; message?: string; type?: string }[]; warnings?: unknown[] } }[];
         detail?: string;
       };
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
-      const errorsCount =
-        result.rows?.reduce(
-          (sum, row) => sum + (Array.isArray(row.validation_result?.errors) ? row.validation_result.errors.length : 0),
-          0,
-        ) || 0;
+
+      // Collect all errors with readable messages
+      const allErrors: string[] = [];
+      for (const row of result.rows || []) {
+        const taskId = row.task_id || "?";
+        for (const err of row.validation_result?.errors || []) {
+          const fieldName = err.field_name || "未知字段";
+          let message = err.message || "校验失败";
+          // Translate common error types to Chinese
+          if (err.type === "missing" || err.type === "missing_image") {
+            message = "未填写或未上传";
+          } else if (err.type === "invalid_url") {
+            message = "链接格式无效";
+          } else if (err.type === "carousel_min_count") {
+            message = "轮播图数量不足（至少3张）";
+          }
+          allErrors.push(`#${taskId} 【${fieldName}】${message}`);
+        }
+      }
+
+      const errorsCount = allErrors.length;
       const warningsCount =
         result.rows?.reduce(
           (sum, row) =>
             sum + (Array.isArray(row.validation_result?.warnings) ? row.validation_result.warnings.length : 0),
           0,
         ) || 0;
-      setNotice(`已校验 ${selectedIds.length} 个商品，错误 ${errorsCount} 条，警告 ${warningsCount} 条。`);
+
+      if (errorsCount > 0) {
+        // Show first 10 errors with field names
+        const errorSummary = allErrors.slice(0, 10).join("\n");
+        const moreText = errorsCount > 10 ? `\n...还有 ${errorsCount - 10} 个错误` : "";
+        setError(`校验未通过，共 ${errorsCount} 个错误：\n${errorSummary}${moreText}`);
+      } else {
+        setNotice(`已校验 ${selectedIds.length} 个商品，全部通过！警告 ${warningsCount} 条。`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量校验失败");
     } finally {
@@ -948,7 +1413,18 @@ export default function ProductTasksPage() {
         body: JSON.stringify({ product_task_ids: selectedIds }),
       });
       const result = (await response.json()) as { batch_no?: string; detail?: string };
-      if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+      if (!response.ok) {
+        // Try to parse detailed error message
+        const detailStr = result.detail || "";
+        if (detailStr.includes("缺少必填字段")) {
+          // Extract task-specific errors from the message
+          const taskErrors = detailStr.split("；").filter(Boolean);
+          const errorSummary = taskErrors.slice(0, 10).join("\n");
+          const moreText = taskErrors.length > 10 ? `\n...还有 ${taskErrors.length - 10} 个商品有错误` : "";
+          throw new Error(`导出失败，以下商品缺少必填字段：\n${errorSummary}${moreText}\n\n提示：请先完善商品信息（标题、类目、规格、尺寸图等）后再导出。`);
+        }
+        throw new Error(result.detail || `HTTP ${response.status}`);
+      }
       setNotice(`已提交 ${selectedIds.length} 个商品导出，批次号：${result.batch_no || "-"}`);
       await loadList();
     } catch (err) {
@@ -1268,11 +1744,22 @@ export default function ProductTasksPage() {
               </div>
 
               <div className="mt-3 grid gap-3 xl:grid-cols-[1fr_auto_auto_auto_auto_auto]">
-                <input
+                <SearchableCategoryInput
                   value={bulkCategoryValue}
-                  onChange={(event) => setBulkCategoryValue(event.target.value)}
+                  onChange={setBulkCategoryValue}
+                  onSelect={setBulkCategoryValue}
+                  allOptions={categoryOptions}
+                  preferredPaths={selectedIds.flatMap((taskId) => {
+                    const detail = rowMeta[taskId]?.detail;
+                    return [
+                      ...(detail?.ai?.category_top3 || []).map((candidate) => candidate.path),
+                      detail?.selected_category_id || "",
+                      detail?.ai?.category_best_path || "",
+                    ].filter(Boolean);
+                  })}
+                  className="min-w-0"
+                  minHeight={44}
                   placeholder="输入完整类目路径，应用到当前选中商品"
-                  className="h-11 rounded-[16px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
                 />
                 <button
                   type="button"
@@ -1420,6 +1907,14 @@ export default function ProductTasksPage() {
                 </div>
 
                 <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void syncDrawerAndTable()}
+                    disabled={!activeTaskId || drawerSyncing}
+                    className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs text-emerald-700 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {drawerSyncing ? "保存中..." : "保存并同步"}
+                  </button>
                   <div className="hidden items-center gap-1 rounded-full border border-slate-200 bg-slate-50 p-1 sm:flex">
                     {(["50", "70", "100"] as const).map((size) => (
                       <button
@@ -1497,8 +1992,9 @@ export default function ProductTasksPage() {
                     task={taskDetail}
                     raw={rawDetail}
                     timeline={activeTaskId ? timelineMap[activeTaskId] || null : null}
-                    onRefresh={activeTaskId ? () => loadWorkbenchDetail(activeTaskId) : undefined}
+                    onRefresh={activeTaskId ? syncDrawerAndTable : undefined}
                     isLogsRoute={isLogsRoute}
+                    onOpenPromptEditor={openPromptEditor}
                   />
                 )}
               </div>
@@ -1532,8 +2028,6 @@ function slotLabel(slot: string): string {
   return map[slot] || slot;
 }
 
-type ImageViewTab = "layout" | "pool" | "size";
-
 type LightboxImage = {
   src: string;
   alt: string;
@@ -1547,18 +2041,31 @@ type PoolCandidate = {
   assetId?: number;
 };
 
-function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDetail | null }) {
+function ImagesTab({
+  task,
+  raw,
+  onRefresh,
+  onOpenPromptEditor,
+}: {
+  task: ProductTaskDetail;
+  raw: RawProductDetail | null;
+  onRefresh?: (() => Promise<void>) | undefined;
+  onOpenPromptEditor: (fieldLabel: string, promptTypes: string[]) => void;
+}) {
   const [assets, setAssets] = useState<AssetsBySlotResponse>({});
   const [loading, setLoading] = useState(false);
   const [opError, setOpError] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string | null>(null);
   const [dimensionJson, setDimensionJson] = useState<Record<string, unknown> | null>(null);
-  const [activeView, setActiveView] = useState<ImageViewTab>("layout");
   const [lightbox, setLightbox] = useState<LightboxImage | null>(null);
   const [selectedTargetSlot, setSelectedTargetSlot] = useState<string>("carousel_1");
   const [assigning, setAssigning] = useState(false);
   const [draggedSlot, setDraggedSlot] = useState<string | null>(null);
-  const [draggedCandidate, setDraggedCandidate] = useState<PoolCandidate | null>(null);
+  const [busySlot, setBusySlot] = useState<string | null>(null);
+  const [removedSlots, setRemovedSlots] = useState<Record<string, boolean>>({});
+  const [skuCodeDraft, setSkuCodeDraft] = useState("");
+  const [skuTextDraft, setSkuTextDraft] = useState("");
+  const [skuSaving, setSkuSaving] = useState(false);
 
   async function readErrorDetail(res: Response): Promise<string> {
     try {
@@ -1593,6 +2100,15 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id]);
 
+  useEffect(() => {
+    setRemovedSlots({});
+  }, [task.id]);
+
+  useEffect(() => {
+    setSkuCodeDraft(raw?.platform_sku || task.platform_sku || "");
+    setSkuTextDraft(raw?.sku_text || "");
+  }, [raw?.id, raw?.platform_sku, raw?.sku_text, task.platform_sku]);
+
   async function pollJob(jobId: number): Promise<void> {
     setJobStatus(`job ${jobId}: queued`);
     for (let i = 0; i < 60; i += 1) {
@@ -1606,6 +2122,7 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
       if (job.status === "success" || job.status === "failed") break;
     }
     await loadAssets();
+    await onRefresh?.();
   }
 
   async function generateCarousel4Grid(): Promise<void> {
@@ -1629,10 +2146,16 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
   async function generateSingle(slot: string): Promise<void> {
     setOpError(null);
     setJobStatus(null);
+    setBusySlot(slot);
     try {
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-image`, {
         method: "POST",
-        headers: buildAiRequestHeaders(true, slot === "size_chart" ? ["dimension_extract", "image_prompt_package"] : ["image_prompt_package", "title_package"]),
+        headers: buildAiRequestHeaders(
+          true,
+          slot === "size_chart"
+            ? ["dimension_extract", "title_package", "product_info"]
+            : ["title_package", "product_info", "image_prompt_package"],
+        ),
         body: JSON.stringify({ slot }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -1640,6 +2163,62 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
       if (data.job_id) void pollJob(data.job_id);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "生成失败");
+    } finally {
+      setBusySlot(null);
+    }
+  }
+
+  async function generateSellingImages(): Promise<void> {
+    setOpError(null);
+    setJobStatus(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-selling-images`, {
+        method: "POST",
+        headers: buildAiRequestHeaders(true, ["title_package", "product_info", "image_prompt_package"]),
+        body: JSON.stringify({ slots: ["carousel_1", "carousel_2", "carousel_3", "carousel_4"] }),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      const data = (await res.json()) as { job_ids: number[] };
+      setJobStatus(`卖点主图已提交 ${(data.job_ids || []).length} 个任务`);
+      for (const jobId of data.job_ids || []) {
+        await pollJob(jobId);
+      }
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "卖点主图生成失败");
+    }
+  }
+
+  async function generateSkuImage(): Promise<void> {
+    setOpError(null);
+    setJobStatus(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-sku-image`, {
+        method: "POST",
+        headers: buildAiRequestHeaders(true, ["title_package", "product_info", "image_prompt_package"]),
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      const data = (await res.json()) as { job_id?: number };
+      if (data.job_id) await pollJob(data.job_id);
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "SKU图生成失败");
+    }
+  }
+
+  async function generateSizeImage(): Promise<void> {
+    setOpError(null);
+    setJobStatus(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-size-image`, {
+        method: "POST",
+        headers: buildAiRequestHeaders(true, ["dimension_extract", "title_package", "product_info"]),
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      const data = (await res.json()) as { job_id?: number };
+      if (data.job_id) await pollJob(data.job_id);
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "尺寸图生成失败");
     }
   }
 
@@ -1649,6 +2228,7 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
       const res = await fetch(`${apiBaseUrl}/api/assets/${assetId}/set-final`, { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await loadAssets();
+      await onRefresh?.();
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "设置最终图失败");
     }
@@ -1691,18 +2271,18 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
   const carouselSlots = ["carousel_1", "carousel_2", "carousel_3", "carousel_4"] as const;
   const extraCarouselSlots = ["carousel_5", "carousel_6", "carousel_7", "carousel_8"] as const;
   const supportSlots = ["sku_image", "size_chart"] as const;
-  const assignableSlots = [...carouselSlots, ...extraCarouselSlots, ...supportSlots] as const;
   const selectedCarouselAssets = carouselSlots
-    .map((slot) => ({ slot, asset: assets[slot]?.find((item) => item.selected_for_export) || assets[slot]?.[0] || null }))
+    .map((slot) => ({ slot, asset: latestAsset(assets[slot]) }))
     .filter((item) => item.asset?.public_url);
   const selectedExtraCarouselAssets = extraCarouselSlots
-    .map((slot) => ({ slot, asset: assets[slot]?.find((item) => item.selected_for_export) || assets[slot]?.[0] || null }))
+    .map((slot) => ({ slot, asset: latestAsset(assets[slot]) }))
     .filter((item) => item.asset?.public_url);
   const carouselExportValue = [...selectedCarouselAssets, ...selectedExtraCarouselAssets]
     .map((item) => item.asset?.public_url)
     .filter(Boolean)
     .join(",");
   const allAssets = Object.values(assets).flat();
+  const rawCarouselImages = rawCarouselSequence(raw);
   const rawCandidates: PoolCandidate[] = [
     ...(raw?.main_image ? [{ src: raw.main_image, label: "原始主图", source: "raw" }] : []),
     ...(raw?.carousel_images || []).map((src, index) => ({ src, label: `原始轮播 ${index + 1}`, source: "raw" })),
@@ -1724,12 +2304,67 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
       assetId: asset.id,
     }));
 
+  function getRawReferenceImage(slot: string): string | null {
+    if (removedSlots[slot] || slotHasRemovalMarker(assets, slot)) return null;
+    if (slot.startsWith("carousel_")) {
+      const index = Number(slot.split("_")[1]) - 1;
+      return rawCarouselImages[index] || null;
+    }
+    if (slot === "sku_image") return raw?.sku_images?.[0] || null;
+    if (slot === "size_chart") return raw?.size_chart_images?.[0] || null;
+    return null;
+  }
+
+  function getPromptEditorConfig(slot: string): { label: string; promptTypes: string[] } {
+    if (slot === "size_chart") {
+      return { label: "尺寸图", promptTypes: ["dimension_extract_from_image", "image_prompt_dimension"] };
+    }
+    if (slot === "sku_image") {
+      return { label: "SKU 图", promptTypes: ["product_info_from_screenshot", "image_prompt_package"] };
+    }
+    if (slot === "carousel_4grid") {
+      return { label: "四宫格", promptTypes: ["image_prompt_carousel_4grid", "image_prompt_package", "title_package"] };
+    }
+    if (slot === "carousel_1") {
+      return { label: "轮播1（主图）", promptTypes: ["image_prompt_carousel_1", "image_prompt_main", "image_prompt_package"] };
+    }
+    if (slot === "carousel_2") {
+      return { label: "轮播2（细节）", promptTypes: ["image_prompt_carousel_2", "image_prompt_package"] };
+    }
+    if (slot === "carousel_3") {
+      return { label: "轮播3（场景）", promptTypes: ["image_prompt_carousel_3", "image_prompt_package"] };
+    }
+    if (slot === "carousel_4") {
+      return { label: "轮播4（卖点）", promptTypes: ["image_prompt_carousel_4", "image_prompt_package"] };
+    }
+    if (slot.startsWith("carousel_")) {
+      return { label: slotLabel(slot), promptTypes: ["image_prompt_package"] };
+    }
+    if (slot === "main") {
+      return { label: "主图", promptTypes: ["image_prompt_main", "image_prompt_package"] };
+    }
+    return { label: slotLabel(slot), promptTypes: ["image_prompt_package", "title_package"] };
+  }
+
+  function focusRawOverview(slot: string): void {
+    setSelectedTargetSlot(slot);
+    if (typeof document !== "undefined") {
+      document.getElementById("raw-source-overview")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
+  function getFinalAssetForSlot(slot: string): ProductAsset | null {
+    return latestAsset(assets[slot]);
+  }
+
   async function assignCandidateToSlot(payload: {
     targetSlot: string;
     sourceAssetId?: number;
     sourceUrl?: string;
     imageDataUrl?: string;
-  }): Promise<void> {
+  }, options: { syncTable?: boolean; showStatus?: boolean } = {}): Promise<void> {
+    const syncTable = options.syncTable ?? true;
+    const showStatus = options.showStatus ?? true;
     setAssigning(true);
     setOpError(null);
     try {
@@ -1746,9 +2381,38 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
       await loadAssets();
-      setJobStatus(`已把图片放入 ${slotLabel(payload.targetSlot)}。`);
+      if (syncTable) await onRefresh?.();
+      setRemovedSlots((prev) => ({ ...prev, [payload.targetSlot]: false }));
+      if (showStatus) setJobStatus(`已把图片放入 ${slotLabel(payload.targetSlot)}。`);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "放入图片失败");
+    } finally {
+      setAssigning(false);
+    }
+  }
+
+  async function syncVisibleCarouselToTable(): Promise<void> {
+    setAssigning(true);
+    setOpError(null);
+    try {
+      const slots = [...carouselSlots, ...extraCarouselSlots];
+      let createdCount = 0;
+      for (const slot of slots) {
+        if (getFinalAssetForSlot(slot)?.public_url || removedSlots[slot] || slotHasRemovalMarker(assets, slot)) continue;
+        const rawImage = getRawReferenceImage(slot);
+        if (!rawImage) continue;
+        await assignCandidateToSlot({ targetSlot: slot, sourceUrl: rawImage }, { syncTable: false, showStatus: false });
+        createdCount += 1;
+      }
+      await loadAssets();
+      await onRefresh?.();
+      setJobStatus(
+        createdCount > 0
+          ? `已把 ${createdCount} 张原始轮播图写入当前编排，并同步外层表格。`
+          : "当前编排已同步外层表格。",
+      );
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "同步表格失败");
     } finally {
       setAssigning(false);
     }
@@ -1766,11 +2430,16 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
 
   async function uploadToSlot(slot: string, file: File): Promise<void> {
     setSelectedTargetSlot(slot);
+    setBusySlot(slot);
     const reader = new FileReader();
     reader.onload = async () => {
       const result = typeof reader.result === "string" ? reader.result : "";
-      if (!result) return;
+      if (!result) {
+        setBusySlot(null);
+        return;
+      }
       await assignCandidateToSlot({ targetSlot: slot, imageDataUrl: result });
+      setBusySlot(null);
     };
     reader.readAsDataURL(file);
   }
@@ -1780,19 +2449,97 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
     setAssigning(true);
     setOpError(null);
     try {
+      const sourceRaw = getRawReferenceImage(sourceSlot);
+      const targetRaw = getRawReferenceImage(targetSlot);
+      const sourceAsset = getFinalAssetForSlot(sourceSlot);
+      const targetAsset = getFinalAssetForSlot(targetSlot);
       const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/reorder-slots`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ source_slot: sourceSlot, target_slot: targetSlot }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
+      const data = (await res.json()) as { noop?: boolean };
+      if (data.noop && !sourceAsset && sourceRaw) {
+        if (targetAsset?.id) {
+          await assignCandidateToSlot({ targetSlot: sourceSlot, sourceAssetId: targetAsset.id }, { syncTable: false, showStatus: false });
+        } else if (targetRaw) {
+          await assignCandidateToSlot({ targetSlot: sourceSlot, sourceUrl: targetRaw }, { syncTable: false, showStatus: false });
+        }
+        await assignCandidateToSlot({ targetSlot, sourceUrl: sourceRaw }, { syncTable: false, showStatus: false });
+      } else if (sourceAsset && !targetAsset && targetRaw) {
+        await assignCandidateToSlot({ targetSlot: sourceSlot, sourceUrl: targetRaw }, { syncTable: false, showStatus: false });
+      }
       await loadAssets();
+      await onRefresh?.();
+      setRemovedSlots((prev) => ({ ...prev, [sourceSlot]: false, [targetSlot]: false }));
       setJobStatus(`已调整 ${slotLabel(sourceSlot)} 和 ${slotLabel(targetSlot)} 的位置。`);
     } catch (err) {
       setOpError(err instanceof Error ? err.message : "调整位置失败");
     } finally {
       setAssigning(false);
       setDraggedSlot(null);
+    }
+  }
+
+  async function deleteSlotImage(slot: string): Promise<void> {
+    setAssigning(true);
+    setOpError(null);
+    setBusySlot(slot);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/remove-slot-image`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ slot, compact_following: true }),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      const data = (await res.json()) as { compacted?: { from_slot: string; to_slot: string }[] };
+      await loadAssets();
+      await onRefresh?.();
+      setRemovedSlots((prev) => {
+        const next = { ...prev, [slot]: true };
+        for (const item of data.compacted || []) {
+          next[item.to_slot] = next[item.from_slot] || false;
+          delete next[item.from_slot];
+        }
+        return next;
+      });
+      setJobStatus(
+        slot.startsWith("carousel_")
+          ? `已删除 ${slotLabel(slot)}，并将后续轮播图自动前移。`
+          : `已删除 ${slotLabel(slot)}。`,
+      );
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "删除图片失败");
+    } finally {
+      setBusySlot(null);
+      setAssigning(false);
+    }
+  }
+
+  async function saveSkuAttributes(): Promise<void> {
+    if (!raw?.id) {
+      setOpError("缺少原始商品，无法保存 SKU 属性");
+      return;
+    }
+    setSkuSaving(true);
+    setOpError(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/raw-products/${raw.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          platform_sku: skuCodeDraft.trim() || null,
+          sku_text: skuTextDraft.trim() || null,
+        }),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      setJobStatus("SKU 属性已保存并同步。");
+      await onRefresh?.();
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : "保存 SKU 属性失败");
+    } finally {
+      setSkuSaving(false);
     }
   }
 
@@ -1818,368 +2565,301 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
             value={String(allAssets.filter((asset) => asset.selected_for_export).length)}
             hint="已确认用于导出"
           />
-          <MetricCard
-            label="当前视图"
-            value={
-              activeView === "layout" ? "轮播编排" : activeView === "pool" ? "素材池" : "尺寸"
-            }
-            hint="围绕选图、入槽、排序来处理"
-          />
-        </div>
-
-        <div className="mt-4 flex flex-wrap gap-2">
-          {(
-            [
-              { key: "layout", label: "轮播编排", desc: "按位置放图和重生" },
-              { key: "pool", label: "素材池", desc: "从原图 / AI 图 / 上传图选图" },
-              { key: "size", label: "尺寸图", desc: "尺寸识别与结果" },
-            ] as const
-          ).map((tab) => (
-            <button
-              key={tab.key}
-              type="button"
-              onClick={() => setActiveView(tab.key)}
-              className={[
-                "rounded-2xl border px-4 py-3 text-left",
-                activeView === tab.key
-                  ? "border-slate-900 bg-slate-900 text-white"
-                  : "border-slate-200 bg-slate-50 text-slate-700 hover:bg-white",
-              ].join(" ")}
-            >
-              <div className="text-sm font-medium">{tab.label}</div>
-              <div className={["mt-1 text-xs", activeView === tab.key ? "text-slate-300" : "text-slate-500"].join(" ")}>
-                {tab.desc}
-              </div>
-            </button>
-          ))}
+          <MetricCard label="当前处理" value="轮播编排" hint="先看原始图，再决定是否采用 AI 图" />
         </div>
       </Section>
 
-      <Section title="原始采集图片总览">
-        <div className="grid gap-4 xl:grid-cols-2">
-          <ImageGallerySection
-            title="主图 / 轮播图"
-            description="完整回显采集到的主图和轮播图，未生成 AI 图时这里就是后续选图基础。"
-            images={[...(raw?.main_image ? [raw.main_image] : []), ...(raw?.carousel_images || [])]}
-            onPreview={(src, index) =>
-              setLightbox({
-                src,
-                alt: `raw-carousel-${index + 1}`,
-                caption: `原始主图/轮播图 · 第 ${index + 1} 张`,
-              })
-            }
-          />
-          <ImageGallerySection
-            title="详情图 / SKU 图"
-            description="把详情图、SKU 图全部展开，方便在抽屉里直接核对和换图。"
-            images={[...(raw?.detail_images || []), ...(raw?.sku_images || [])]}
-            onPreview={(src, index) =>
-              setLightbox({
-                src,
-                alt: `raw-detail-${index + 1}`,
-                caption: `原始详情/SKU 图 · 第 ${index + 1} 张`,
-              })
-            }
-          />
-        </div>
-      </Section>
-
-      {activeView === "layout" ? (
-        <Section title="轮播编排">
+      <Section title="轮播编排">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={generateCarousel4Grid}
-              className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800"
-            >
-              生成四宫格轮播图
-            </button>
-            {assignableSlots.map((slot) => (
-              <button
-                key={slot}
-                type="button"
-                onClick={() => setSelectedTargetSlot(slot)}
-                className={[
-                  "rounded-full border px-4 py-2 text-sm",
-                  selectedTargetSlot === slot
-                    ? "border-slate-900 bg-slate-900 text-white"
-                    : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50",
-                ].join(" ")}
-              >
-                目标位置：{slotLabel(slot)}
-              </button>
-            ))}
-            <button
-              type="button"
-              onClick={loadAssets}
-              className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
-            >
-              刷新
-            </button>
+          <button
+            type="button"
+            onClick={generateCarousel4Grid}
+            className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800"
+          >
+            生成四宫格轮播图
+          </button>
+          <button
+            type="button"
+            onClick={() => void generateSellingImages()}
+            className="rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            批量生成前 4 张 AI 图
+          </button>
+          <button
+            type="button"
+            onClick={() => void generateSkuImage()}
+            className="rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            生成 SKU 图
+          </button>
+          <button
+            type="button"
+            onClick={() => void generateSizeImage()}
+            className="rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            生成尺寸图
+          </button>
+          <button
+            type="button"
+            onClick={loadAssets}
+            className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            刷新
+          </button>
           </div>
+          <button
+            type="button"
+            onClick={() => void syncVisibleCarouselToTable()}
+            className="rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm text-emerald-700 hover:bg-emerald-100"
+          >
+            保存并同步表格
+          </button>
+        </div>
 
-          <div className="mt-4 grid gap-4 xl:grid-cols-[1.2fr_0.9fr_1.1fr]">
-            <div className="grid gap-3">
-              {carouselSlots.slice(0, 2).map((slot) => (
-                <CompactSlotCard
-                  key={slot}
-                  slot={slot}
-                  assets={assets[slot] || []}
-                  onSetFinal={setFinal}
-                  onRegenerate={regenerate}
-                  onGenerateSingle={generateSingle}
-                  onSelectSlot={setSelectedTargetSlot}
-                  selected={selectedTargetSlot === slot}
-                  dragged={draggedSlot === slot}
-                  onDragStart={setDraggedSlot}
-                  onReorder={reorderSlots}
-                  onOpenPoolForSlot={(slot) => {
-                    setSelectedTargetSlot(slot);
-                    setActiveView("pool");
-                  }}
-                  onUploadToSlot={uploadToSlot}
-                  allowGenerate
-                  onAssignCandidate={(candidate) =>
-                    assignCandidateToSlot({
-                      targetSlot: slot,
-                      sourceAssetId: candidate.assetId,
-                      sourceUrl: candidate.assetId ? undefined : candidate.src,
-                    })
-                  }
-                  draggedCandidate={draggedCandidate}
-                  onCandidateDragStateChange={setDraggedCandidate}
-                  onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
-                />
-              ))}
-            </div>
-
-            <div className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold text-slate-900">四宫格母图</div>
-                  <div className="mt-1 text-xs text-slate-500">中间保留一张母图，用来核对切图来源和整体画面。</div>
-                </div>
-                <div className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600">
-                  {assets.carousel_4grid?.length || 0} 张
-                </div>
-              </div>
-              {(assets.carousel_4grid || []).length ? (
-                <div className="mt-4 space-y-3">
-                  {(assets.carousel_4grid || []).slice(0, 1).map((asset) => (
-                    <button
-                      key={asset.id}
-                      type="button"
-                      onClick={() =>
-                        asset.public_url &&
-                        setLightbox({
-                          src: asset.public_url,
-                          alt: "四宫格母图",
-                          caption: `四宫格母图 v${asset.version}`,
-                        })
-                      }
-                      className="block w-full rounded-[16px] border border-slate-200 bg-white p-2"
-                    >
-                      <HoverZoomImage
-                        src={asset.public_url || ""}
-                        alt="四宫格母图"
-                        thumbClassName="h-72 w-full rounded-[12px] object-contain bg-slate-50"
-                      />
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={generateCarousel4Grid}
-                    className="w-full rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800"
-                  >
-                    重生成四宫格母图
-                  </button>
-                </div>
-              ) : (
-                <div className="mt-4 flex h-72 items-center justify-center rounded-[16px] border border-dashed border-slate-200 bg-white text-sm text-slate-500">
-                  暂无四宫格母图
-                </div>
-              )}
-            </div>
-
-            <div className="grid gap-3">
-              {carouselSlots.slice(2, 4).map((slot) => (
-                <CompactSlotCard
-                  key={slot}
-                  slot={slot}
-                  assets={assets[slot] || []}
-                  onSetFinal={setFinal}
-                  onRegenerate={regenerate}
-                  onGenerateSingle={generateSingle}
-                  onSelectSlot={setSelectedTargetSlot}
-                  selected={selectedTargetSlot === slot}
-                  dragged={draggedSlot === slot}
-                  onDragStart={setDraggedSlot}
-                  onReorder={reorderSlots}
-                  onOpenPoolForSlot={(slot) => {
-                    setSelectedTargetSlot(slot);
-                    setActiveView("pool");
-                  }}
-                  onUploadToSlot={uploadToSlot}
-                  allowGenerate
-                  onAssignCandidate={(candidate) =>
-                    assignCandidateToSlot({
-                      targetSlot: slot,
-                      sourceAssetId: candidate.assetId,
-                      sourceUrl: candidate.assetId ? undefined : candidate.src,
-                    })
-                  }
-                  draggedCandidate={draggedCandidate}
-                  onCandidateDragStateChange={setDraggedCandidate}
-                  onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
-                />
-              ))}
-            </div>
-          </div>
-
-            <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-sm font-semibold text-slate-900">主图轮播图字段</div>
-                <div className="mt-1 text-xs text-slate-500">
-                  默认同步当前 `轮播1~4` 位置的最终图。你在上面换图、拖拽、补图后，这里会一起变化，导出时可直接作为产品轮播图字段。
-                </div>
-              </div>
-              <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600">
-                当前 {selectedCarouselAssets.length + selectedExtraCarouselAssets.length} 张
-              </div>
-            </div>
-
-            <div className="mt-4 grid gap-3 lg:grid-cols-4">
-              {[...carouselSlots, ...extraCarouselSlots].map((slot) => {
-                const asset = assets[slot]?.find((item) => item.selected_for_export) || assets[slot]?.[0] || null;
-                return (
-                  <div key={`export-${slot}`} className="rounded-[16px] border border-slate-200 bg-slate-50 p-3">
-                    <div className="text-xs font-medium text-slate-700">{slotLabel(slot)}</div>
-                    {asset?.public_url ? (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => setLightbox({ src: asset.public_url || "", alt: slotLabel(slot), caption: `${slotLabel(slot)} · 导出采用图` })}
-                          className="mt-2 block w-full"
-                        >
-                          <HoverZoomImage
-                            src={asset.public_url}
-                            alt={slotLabel(slot)}
-                            thumbClassName="h-28 w-full rounded-[12px] bg-white object-contain"
-                          />
-                        </button>
-                        <div className="mt-2 text-[11px] text-slate-500">{asset.source_type} / v{asset.version}</div>
-                      </>
-                    ) : (
-                      <div className="mt-2 flex h-28 items-center justify-center rounded-[12px] border border-dashed border-slate-200 bg-white text-xs text-slate-400">
-                        未放图
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="mt-4 rounded-[14px] border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-500">导出字段预览值</div>
-              <div className="mt-2 break-all text-xs text-slate-700">
-                {carouselExportValue || "当前还没有可导出的轮播图 URL"}
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-sm font-semibold text-slate-900">附加轮播图位</div>
-                <div className="mt-1 text-xs text-slate-500">
-                  这里用于继续补更多主图轮播图。`5~8` 不参与四宫格生成，但会进入最终导出的轮播图字段。
-                </div>
-              </div>
-              <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600">
-                已补 {selectedExtraCarouselAssets.length} 张
-              </div>
-            </div>
-            <div className="mt-4 grid gap-3 xl:grid-cols-2">
-              {extraCarouselSlots.map((slot) => (
-                <CompactSlotCard
-                  key={slot}
-                  slot={slot}
-                  assets={assets[slot] || []}
-                  onSetFinal={setFinal}
-                  onRegenerate={regenerate}
-                  onGenerateSingle={generateSingle}
-                  onSelectSlot={setSelectedTargetSlot}
-                  selected={selectedTargetSlot === slot}
-                  dragged={draggedSlot === slot}
-                  onDragStart={setDraggedSlot}
-                  onReorder={reorderSlots}
-                  onOpenPoolForSlot={(nextSlot) => {
-                    setSelectedTargetSlot(nextSlot);
-                    setActiveView("pool");
-                  }}
-                  onUploadToSlot={uploadToSlot}
-                  allowGenerate={false}
-                  onAssignCandidate={(candidate) =>
-                    assignCandidateToSlot({
-                      targetSlot: slot,
-                      sourceAssetId: candidate.assetId,
-                      sourceUrl: candidate.assetId ? undefined : candidate.src,
-                    })
-                  }
-                  draggedCandidate={draggedCandidate}
-                  onCandidateDragStateChange={setDraggedCandidate}
-                  onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
-                />
-              ))}
-            </div>
-          </div>
-
-          <div className="mt-4 grid gap-3 xl:grid-cols-2">
-            {supportSlots.map((slot) => (
-              <CompactSlotCard
+        <div className="mt-4 grid gap-4 xl:grid-cols-[1.15fr_0.8fr_1.15fr]">
+          <div className="grid gap-3">
+            {carouselSlots.slice(0, 2).map((slot) => (
+              <LayoutCompareCard
                 key={slot}
                 slot={slot}
+                rawImage={getRawReferenceImage(slot)}
                 assets={assets[slot] || []}
-                onSetFinal={setFinal}
-                onRegenerate={regenerate}
-                onGenerateSingle={generateSingle}
-                onSelectSlot={setSelectedTargetSlot}
                 selected={selectedTargetSlot === slot}
                 dragged={draggedSlot === slot}
+                draggedSlot={draggedSlot}
+                busy={busySlot === slot || assigning}
+                onSelectSlot={setSelectedTargetSlot}
                 onDragStart={setDraggedSlot}
                 onReorder={reorderSlots}
-                onOpenPoolForSlot={(slot) => {
-                  setSelectedTargetSlot(slot);
-                  setActiveView("pool");
-                }}
+                onChooseOther={focusRawOverview}
                 onUploadToSlot={uploadToSlot}
-                allowGenerate
-                onAssignCandidate={(candidate) =>
-                  assignCandidateToSlot({
-                    targetSlot: slot,
-                    sourceAssetId: candidate.assetId,
-                    sourceUrl: candidate.assetId ? undefined : candidate.src,
-                  })
-                }
-                draggedCandidate={draggedCandidate}
-                onCandidateDragStateChange={setDraggedCandidate}
+                onGenerateSingle={generateSingle}
+                onSetFinal={setFinal}
+                onRegenerate={regenerate}
+                onDeleteSlot={deleteSlotImage}
+                onAssignFromAsset={async (slot, sourceAssetId) => assignCandidateToSlot({ targetSlot: slot, sourceAssetId })}
+                onAssignFromUrl={async (slot, sourceUrl) => assignCandidateToSlot({ targetSlot: slot, sourceUrl })}
                 onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+                onOpenPrompt={() => {
+                  const config = getPromptEditorConfig(slot);
+                  onOpenPromptEditor(config.label, config.promptTypes);
+                }}
               />
             ))}
           </div>
 
-        </Section>
-      ) : null}
+          <FourGridCenterCard
+            rawImage={getRawReferenceImage("carousel_1")}
+            assets={assets.carousel_4grid || []}
+            onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+            onGenerate={generateCarousel4Grid}
+            onOpenPrompt={() => {
+              const config = getPromptEditorConfig("carousel_4grid");
+              onOpenPromptEditor(config.label, config.promptTypes);
+            }}
+          />
 
-      {activeView === "pool" ? (
-        <Section title="素材池">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
-              当前放入位置：{slotLabel(selectedTargetSlot)}
+          <div className="grid gap-3">
+            {carouselSlots.slice(2, 4).map((slot) => (
+              <LayoutCompareCard
+                key={slot}
+                slot={slot}
+                rawImage={getRawReferenceImage(slot)}
+                assets={assets[slot] || []}
+                selected={selectedTargetSlot === slot}
+                dragged={draggedSlot === slot}
+                draggedSlot={draggedSlot}
+                busy={busySlot === slot || assigning}
+                onSelectSlot={setSelectedTargetSlot}
+                onDragStart={setDraggedSlot}
+                onReorder={reorderSlots}
+                onChooseOther={focusRawOverview}
+                onUploadToSlot={uploadToSlot}
+                onGenerateSingle={generateSingle}
+                onSetFinal={setFinal}
+                onRegenerate={regenerate}
+                onDeleteSlot={deleteSlotImage}
+                onAssignFromAsset={async (slot, sourceAssetId) => assignCandidateToSlot({ targetSlot: slot, sourceAssetId })}
+                onAssignFromUrl={async (slot, sourceUrl) => assignCandidateToSlot({ targetSlot: slot, sourceUrl })}
+                onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+                onOpenPrompt={() => {
+                  const config = getPromptEditorConfig(slot);
+                  onOpenPromptEditor(config.label, config.promptTypes);
+                }}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-900">剩余主图轮播图</div>
+              <div className="mt-1 text-xs text-slate-500">前 4 张之外的轮播位继续往下排，用于补充展示，不再单独拆“附加轮播图位”。</div>
+            </div>
+            <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600">
+              当前 {selectedCarouselAssets.length + selectedExtraCarouselAssets.length} 张
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 xl:grid-cols-4">
+            {extraCarouselSlots.map((slot) => (
+              <LayoutCompareCard
+                key={slot}
+                slot={slot}
+                rawImage={getRawReferenceImage(slot)}
+                assets={assets[slot] || []}
+                selected={selectedTargetSlot === slot}
+                dragged={draggedSlot === slot}
+                draggedSlot={draggedSlot}
+                busy={busySlot === slot || assigning}
+                onSelectSlot={setSelectedTargetSlot}
+                onDragStart={setDraggedSlot}
+                onReorder={reorderSlots}
+                onChooseOther={focusRawOverview}
+                onUploadToSlot={uploadToSlot}
+                onGenerateSingle={generateSingle}
+                onSetFinal={setFinal}
+                onRegenerate={regenerate}
+                onDeleteSlot={deleteSlotImage}
+                onAssignFromAsset={async (slot, sourceAssetId) => assignCandidateToSlot({ targetSlot: slot, sourceAssetId })}
+                onAssignFromUrl={async (slot, sourceUrl) => assignCandidateToSlot({ targetSlot: slot, sourceUrl })}
+                onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+                onOpenPrompt={() => {
+                  const config = getPromptEditorConfig(slot);
+                  onOpenPromptEditor(config.label, config.promptTypes);
+                }}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 xl:grid-cols-2">
+          {supportSlots.map((slot) => (
+            <LayoutCompareCard
+              key={slot}
+              slot={slot}
+              rawImage={getRawReferenceImage(slot)}
+              assets={assets[slot] || []}
+              selected={selectedTargetSlot === slot}
+              dragged={draggedSlot === slot}
+              draggedSlot={draggedSlot}
+              busy={busySlot === slot || assigning}
+              onSelectSlot={setSelectedTargetSlot}
+              onDragStart={setDraggedSlot}
+              onReorder={reorderSlots}
+              onChooseOther={focusRawOverview}
+              onUploadToSlot={uploadToSlot}
+              onGenerateSingle={generateSingle}
+              onSetFinal={setFinal}
+              onRegenerate={regenerate}
+              onDeleteSlot={deleteSlotImage}
+              onAssignFromAsset={async (slot, sourceAssetId) => assignCandidateToSlot({ targetSlot: slot, sourceAssetId })}
+              onAssignFromUrl={async (slot, sourceUrl) => assignCandidateToSlot({ targetSlot: slot, sourceUrl })}
+              onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+              onOpenPrompt={() => {
+                const config = getPromptEditorConfig(slot);
+                onOpenPromptEditor(config.label, config.promptTypes);
+              }}
+            />
+          ))}
+        </div>
+
+        <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-900">SKU 图管理</div>
+              <div className="mt-1 text-xs text-slate-500">这里展示采集到的全部 SKU 图，可逐张设为上方 `SKU 图` 槽位。</div>
+            </div>
+            <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600">
+              {raw?.sku_images?.length || 0} 张
+            </div>
+          </div>
+          {raw?.sku_images?.length ? (
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {raw.sku_images.map((src, index) => (
+                <div key={`${task.id}-sku-candidate-${index + 1}`} className="rounded-[14px] border border-slate-200 bg-slate-50 p-2">
+                  <button type="button" onClick={() => setLightbox({ src, alt: `SKU 图 ${index + 1}`, caption: `SKU 图 ${index + 1}` })} className="block w-full">
+                    <HoverZoomImage src={src} alt={`SKU 图 ${index + 1}`} thumbClassName="h-28 w-full rounded-[10px] bg-white object-contain" />
+                  </button>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData("application/x-candidate-url", src);
+                        event.dataTransfer.effectAllowed = "copyMove";
+                      }}
+                      className="cursor-grab rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600 active:cursor-grabbing"
+                      title="拖到任意卡片替换图片"
+                    >
+                      拖拽
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void assignCandidateToSlot({ targetSlot: "sku_image", sourceUrl: src })}
+                      className="flex-1 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                    >
+                      设为 SKU 图
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-3 rounded-[12px] border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">
+              暂无采集到的 SKU 图
+            </div>
+          )}
+          <div className="mt-4 grid gap-3 xl:grid-cols-2">
+            <label className="text-xs text-slate-600">
+              平台 SKU
+              <input
+                value={skuCodeDraft}
+                onChange={(event) => setSkuCodeDraft(event.target.value)}
+                className="mt-1 w-full rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                placeholder="例如：SKU-001 / 颜色款式编码"
+              />
+            </label>
+            <label className="text-xs text-slate-600">
+              SKU 文本
+              <textarea
+                value={skuTextDraft}
+                onChange={(event) => setSkuTextDraft(event.target.value)}
+                className="mt-1 h-20 w-full rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                placeholder="例如：颜色: 银色; 尺寸: 8mm"
+              />
+            </label>
+          </div>
+          <div className="mt-3">
+            <button
+              type="button"
+              onClick={() => void saveSkuAttributes()}
+              disabled={skuSaving}
+              className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {skuSaving ? "保存中..." : "保存 SKU 属性"}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-[14px] border border-slate-200 bg-slate-50 p-3">
+          <div className="text-xs text-slate-500">导出字段预览值</div>
+          <div className="mt-2 break-all text-xs text-slate-700">
+            {carouselExportValue || "当前还没有可导出的轮播图 URL"}
+          </div>
+        </div>
+      </Section>
+
+      <Section title="原始采集图片总览">
+        <div id="raw-source-overview" className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-900">当前目标位：{slotLabel(selectedTargetSlot)}</div>
+              <div className="mt-1 text-xs text-slate-500">这里是原始采集图片的总览和素材池。选中任意图片后，会直接放到上面的当前目标位。</div>
             </div>
             <label className="inline-flex cursor-pointer items-center rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">
-              本地上传
+              本地上传到当前位
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/webp"
@@ -2191,79 +2871,66 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
                 }}
               />
             </label>
-            {assigning ? <span className="text-xs text-slate-500">正在放图...</span> : null}
           </div>
+        </div>
 
+        <div className="mt-4 grid gap-4 xl:grid-cols-2">
+          <CandidatePoolSection
+            title="原始主图 / 轮播图"
+            description="默认从这里同步到轮播编排。适合快速替换某个轮播位的原始底图。"
+            items={rawCandidates.filter((item) => item.label.startsWith("原始主图") || item.label.startsWith("原始轮播"))}
+            onAssign={(item) => void assignCandidateToSlot({ targetSlot: selectedTargetSlot, sourceUrl: item.src })}
+            onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+            onDragStateChange={() => {}}
+          />
+          <CandidatePoolSection
+            title="详情 / SKU / 尺寸 / 页面截图"
+            description="用于补细节、SKU 差异、尺寸说明或缺失角度，也可以拖到上面的任意位置。"
+            items={rawCandidates.filter((item) => !item.label.startsWith("原始主图") && !item.label.startsWith("原始轮播"))}
+            onAssign={(item) => void assignCandidateToSlot({ targetSlot: selectedTargetSlot, sourceUrl: item.src })}
+            onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+            onDragStateChange={() => {}}
+          />
+        </div>
+
+        <div className="mt-4">
+          <CandidatePoolSection
+            title="AI 生成素材"
+            description="这里收纳已经生成出来的四宫格切图、SKU 图、尺寸图和其他 AI 图，可直接替换到上面的任意位置。"
+            items={aiCandidates}
+            onAssign={(item) =>
+              void assignCandidateToSlot({
+                targetSlot: selectedTargetSlot,
+                sourceAssetId: item.assetId,
+              })
+            }
+            onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
+            onDragStateChange={() => {}}
+          />
+        </div>
+
+        <div className="mt-4 rounded-[18px] border border-slate-200 bg-white p-4">
+          <div className="text-sm font-semibold text-slate-900">尺寸识别工作区</div>
+          <div className="mt-1 text-xs text-slate-500">从采集尺寸图或已生成尺寸图里挑一张识别，结果会显示在下方。</div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {allAssets.slice(0, 12).map((asset) => (
+              <button
+                key={asset.id}
+                type="button"
+                onClick={() => runDimensionExtract(asset.id)}
+                className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+              >
+                识别：{slotLabel(asset.slot)} v{asset.version}
+              </button>
+            ))}
+          </div>
           <div className="mt-4">
-            <CandidatePoolSection
-              title="原始采集素材"
-              description="从原始主图、轮播图、详情图、SKU 图、尺寸图、页面截图里选一张塞进当前目标位"
-              items={rawCandidates}
-              onAssign={(item) => void assignCandidateToSlot({ targetSlot: selectedTargetSlot, sourceUrl: item.src })}
-              onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
-              onDragStateChange={setDraggedCandidate}
-            />
+            <pre className="max-h-[360px] overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+              {dimensionJson ? JSON.stringify(dimensionJson, null, 2) : "暂无尺寸识别结果"}
+            </pre>
           </div>
-
-          <div className="mt-4">
-            <CandidatePoolSection
-              title="AI 生成素材"
-              description="从已经生成过的四宫格切图、预览图、尺寸资产里挑图放到当前目标位"
-              items={aiCandidates}
-              onAssign={(item) =>
-                void assignCandidateToSlot({
-                  targetSlot: selectedTargetSlot,
-                  sourceAssetId: item.assetId,
-                })
-              }
-              onPreview={(src, caption) => setLightbox({ src, alt: caption, caption })}
-              onDragStateChange={setDraggedCandidate}
-            />
-          </div>
-        </Section>
-      ) : null}
-
-      {activeView === "size" ? (
-        <>
-          <Section title="尺寸识别工作区">
-            <div className="text-sm text-slate-600">
-              先从原始尺寸图或生成图里挑一张更清晰的图，再执行尺寸识别。识别结果会显示在下方 JSON 区。
-            </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {allAssets.slice(0, 12).map((asset) => (
-                <button
-                  key={asset.id}
-                  type="button"
-                  onClick={() => runDimensionExtract(asset.id)}
-                  className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
-                >
-                  识别：{slotLabel(asset.slot)} v{asset.version}
-                </button>
-              ))}
-            </div>
-            <div className="mt-4">
-              <pre className="max-h-[360px] overflow-auto rounded-[14px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
-                {dimensionJson ? JSON.stringify(dimensionJson, null, 2) : "暂无尺寸识别结果"}
-              </pre>
-            </div>
-          </Section>
-
-          <Section title="尺寸相关参考图">
-            <ImageGallerySection
-              title="采集尺寸图"
-              description="优先使用采集的尺寸图进行人工核对"
-              images={raw?.size_chart_images || []}
-              onPreview={(src, index) =>
-                setLightbox({
-                  src,
-                  alt: `size-chart-${index + 1}`,
-                  caption: `采集尺寸图 · 第 ${index + 1} 张`,
-                })
-              }
-            />
-          </Section>
-        </>
-      ) : null}
+        </div>
+      </Section>
 
       {loading ? (
         <div className="rounded-[18px] border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
@@ -2276,168 +2943,326 @@ function ImagesTab({ task, raw }: { task: ProductTaskDetail; raw: RawProductDeta
   );
 }
 
-function CompactSlotCard({
+function LayoutCompareCard({
   slot,
+  rawImage,
   assets,
-  onSetFinal,
-  onRegenerate,
-  onGenerateSingle,
-  onSelectSlot,
   selected,
   dragged,
+  busy,
+  onSelectSlot,
   onDragStart,
   onReorder,
-  onOpenPoolForSlot,
+  onChooseOther,
   onUploadToSlot,
-  allowGenerate,
-  onAssignCandidate,
-  draggedCandidate,
-  onCandidateDragStateChange,
+  onGenerateSingle,
+  onSetFinal,
+  onRegenerate,
+  onDeleteSlot,
+  onAssignFromAsset,
+  onAssignFromUrl,
   onPreview,
+  onOpenPrompt,
+  draggedSlot,
 }: {
   slot: string;
+  rawImage: string | null;
   assets: ProductAsset[];
-  onSetFinal: (assetId: number) => Promise<void>;
-  onRegenerate: (assetId: number) => Promise<void>;
-  onGenerateSingle: (slot: string) => Promise<void>;
-  onSelectSlot: (slot: string) => void;
   selected: boolean;
   dragged: boolean;
+  busy: boolean;
+  onSelectSlot: (slot: string) => void;
   onDragStart: (slot: string | null) => void;
   onReorder: (sourceSlot: string, targetSlot: string) => Promise<void>;
-  onOpenPoolForSlot: (slot: string) => void;
+  onChooseOther: (slot: string) => void;
   onUploadToSlot: (slot: string, file: File) => Promise<void>;
-  allowGenerate: boolean;
-  onAssignCandidate: (candidate: PoolCandidate) => Promise<void>;
-  draggedCandidate: PoolCandidate | null;
-  onCandidateDragStateChange: (candidate: PoolCandidate | null) => void;
+  onGenerateSingle: (slot: string) => Promise<void>;
+  onSetFinal: (assetId: number) => Promise<void>;
+  onRegenerate: (assetId: number) => Promise<void>;
+  onDeleteSlot: (slot: string) => Promise<void>;
+  onAssignFromAsset: (slot: string, sourceAssetId: number) => Promise<void>;
+  onAssignFromUrl: (slot: string, sourceUrl: string) => Promise<void>;
   onPreview: (src: string, caption: string) => void;
+  onOpenPrompt: () => void;
+  draggedSlot: string | null;
 }) {
   const finalAsset = assets.find((a) => a.selected_for_export) || assets[0] || null;
+  function bindSlotDragData(dataTransfer: DataTransfer): void {
+    dataTransfer.setData("text/plain", slot);
+    dataTransfer.setData("application/x-slot", slot);
+    dataTransfer.effectAllowed = "move";
+  }
+  const isSwapSource = draggedSlot === slot;
+  const isSwapTarget = Boolean(draggedSlot && draggedSlot !== slot);
 
   return (
     <div
-      draggable={Boolean(finalAsset)}
-      onDragStart={(event) => {
-        event.dataTransfer.setData("text/plain", slot);
-        onDragStart(slot);
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = Array.from(event.dataTransfer.types).includes("application/x-slot") ? "move" : "copy";
       }}
-      onDragEnd={() => onDragStart(null)}
-      onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault();
-        if (draggedCandidate) {
-          void onAssignCandidate(draggedCandidate);
-          onCandidateDragStateChange(null);
+        const candidateAssetId = Number((event.dataTransfer.getData("application/x-candidate-asset-id") || "").trim());
+        if (Number.isInteger(candidateAssetId) && candidateAssetId > 0) {
+          void onAssignFromAsset(slot, candidateAssetId);
+          onDragStart(null);
           return;
         }
-        void onReorder((event.dataTransfer.getData("text/plain") || slot).trim(), slot);
+        const candidateUrl = (event.dataTransfer.getData("application/x-candidate-url") || "").trim();
+        if (candidateUrl) {
+          void onAssignFromUrl(slot, candidateUrl);
+          onDragStart(null);
+          return;
+        }
+        const dropped =
+          (event.dataTransfer.getData("application/x-slot") || event.dataTransfer.getData("text/plain") || draggedSlot || slot).trim();
+        void onReorder(dropped, slot);
       }}
       className={[
         "rounded-[18px] border p-4 transition",
-        selected ? "border-slate-900 bg-slate-50" : "border-slate-200 bg-white",
+        isSwapTarget
+          ? "border-sky-300 bg-sky-50/70"
+          : selected
+            ? "border-slate-900 bg-slate-50"
+            : "border-slate-200 bg-white",
         dragged ? "opacity-60" : "",
-        draggedCandidate ? "ring-2 ring-sky-200" : "",
       ].join(" ")}
     >
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-semibold text-slate-900">{slotLabel(slot)}</div>
-          <div className="mt-1 text-xs text-slate-500">{assets.length ? `候选 ${assets.length} 张` : "暂无图片"}</div>
+          <div className="mt-1 text-xs text-slate-500">{finalAsset ? `当前采用 ${finalAsset.source_type} / v${finalAsset.version}` : "默认原始采集图"}</div>
+          <div className="mt-1 text-[11px] text-slate-400">可拖拽到其他卡片换位置</div>
         </div>
-        <button
-          type="button"
-          onClick={() => onSelectSlot(slot)}
-          className={[
-            "rounded-full px-3 py-1 text-xs",
-            selected ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50",
-          ].join(" ")}
-        >
-          {selected ? "当前目标位" : "设为目标位"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            draggable
+            onClick={() => onDragStart(isSwapSource ? null : slot)}
+            onDragStart={(event) => {
+              bindSlotDragData(event.dataTransfer);
+              onDragStart(slot);
+            }}
+            onDragEnd={() => onDragStart(null)}
+            className={[
+              "cursor-grab rounded-full border px-2 py-1 text-[11px] active:cursor-grabbing",
+              isSwapSource ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-600",
+            ].join(" ")}
+            title="拖拽此位到其他卡片换位置"
+          >
+            {isSwapSource ? "取消换位" : "拖拽换位"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (draggedSlot && draggedSlot !== slot) {
+                void onReorder(draggedSlot, slot);
+                return;
+              }
+              onSelectSlot(slot);
+            }}
+            className={[
+              "rounded-full px-3 py-1 text-xs",
+              isSwapTarget
+                ? "bg-sky-700 text-white hover:bg-sky-800"
+                : selected
+                  ? "bg-slate-900 text-white"
+                  : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50",
+            ].join(" ")}
+          >
+            {isSwapTarget ? "换到这里" : selected ? "当前目标位" : "设为目标位"}
+          </button>
+        </div>
       </div>
 
-      <div className="mt-3 flex items-center gap-3">
-        {finalAsset?.public_url ? (
-          <button type="button" onClick={() => onPreview(finalAsset.public_url || "", `${slotLabel(slot)} · v${finalAsset.version}`)}>
-            <HoverZoomImage
-              src={finalAsset.public_url}
-              alt={slotLabel(slot)}
-              thumbClassName="h-24 w-24 rounded-[14px] border border-slate-200 bg-white p-1 object-contain"
-            />
-          </button>
-        ) : (
-          <div className="flex h-24 w-24 items-center justify-center rounded-[14px] border border-dashed border-slate-200 bg-white text-xs text-slate-400">
-            暂无
+      <div className="relative mt-3 grid gap-3 md:grid-cols-2">
+        {busy ? (
+          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[16px] bg-white/80 text-sm text-slate-700">
+            正在处理 {slotLabel(slot)}…
           </div>
-        )}
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="text-xs text-slate-600">
-            当前采用：
-            {finalAsset ? `${finalAsset.source_type} / v${finalAsset.version}` : "未设置"}
-          </div>
-          <div className="text-[11px] text-slate-500">支持槽位拖拽换位，也可以把素材池图片直接拖到这里入槽。</div>
-          <div className="flex flex-wrap gap-2">
-            {finalAsset ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void onSetFinal(finalAsset.id)}
-                  className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
-                >
-                  设为最终
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void onRegenerate(finalAsset.id)}
-                  className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
-                >
-                  重生成
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onSelectSlot(slot)}
-                  className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
-                >
-                  选中位置
-                </button>
-              </>
-            ) : null}
+        ) : null}
+        <div className="rounded-[16px] border border-slate-200 bg-white p-2">
+          <div className="text-[11px] font-medium text-slate-500">原始图片</div>
+          {rawImage ? (
+            <button type="button" onClick={() => onPreview(rawImage, `${slotLabel(slot)} · 原始图`)} className="mt-2 block w-full">
+              <HoverZoomImage
+                src={rawImage}
+                alt={`${slotLabel(slot)} 原始图`}
+                thumbClassName="h-36 w-full rounded-[12px] bg-slate-50 object-contain"
+              />
+            </button>
+          ) : (
+            <div className="mt-2 flex h-36 items-center justify-center rounded-[12px] border border-dashed border-slate-200 bg-slate-50 text-xs text-slate-400">
+              暂无原始图
+            </div>
+          )}
+        </div>
+        <div className="rounded-[16px] border border-sky-200 bg-sky-50/60 p-2">
+          <div className="text-[11px] font-medium text-slate-500">当前采用图</div>
+          {finalAsset?.public_url ? (
+            <button type="button" onClick={() => onPreview(finalAsset.public_url || "", `${slotLabel(slot)} · 当前采用图`)} className="mt-2 block w-full">
+              <HoverZoomImage
+                src={finalAsset.public_url}
+                alt={`${slotLabel(slot)} 当前采用图`}
+                thumbClassName="h-36 w-full rounded-[12px] bg-white object-contain"
+              />
+            </button>
+          ) : rawImage ? (
+            <button type="button" onClick={() => onPreview(rawImage, `${slotLabel(slot)} · 当前默认原图`)} className="mt-2 block w-full">
+              <HoverZoomImage
+                src={rawImage}
+                alt={`${slotLabel(slot)} 当前默认原图`}
+                thumbClassName="h-36 w-full rounded-[12px] bg-white object-contain"
+              />
+            </button>
+          ) : (
+            <div className="mt-2 flex h-36 items-center justify-center rounded-[12px] border border-dashed border-slate-200 bg-white text-xs text-slate-400">
+              暂无采用图
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => onChooseOther(slot)}
+          className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+        >
+          选其他图片
+        </button>
+        <label className="inline-flex cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50">
+          本地上传
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void onUploadToSlot(slot, file);
+              event.currentTarget.value = "";
+            }}
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() => void onGenerateSingle(slot)}
+          className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+        >
+          AI 生成
+        </button>
+        <button
+          type="button"
+          onClick={onOpenPrompt}
+          className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+        >
+          提示词
+        </button>
+        <button
+          type="button"
+          onClick={() => void onDeleteSlot(slot)}
+          className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs text-rose-700 hover:bg-rose-100"
+        >
+          删除当前图
+        </button>
+        {finalAsset ? (
+          <>
             <button
               type="button"
-              onClick={() => onOpenPoolForSlot(slot)}
+              onClick={() => void onSetFinal(finalAsset.id)}
               className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
             >
-              选其他图片
+              设为最终
             </button>
-            <label className="inline-flex cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50">
-              本地上传
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void onUploadToSlot(slot, file);
-                  event.currentTarget.value = "";
-                }}
-              />
-            </label>
-            {allowGenerate ? (
-              <button
-                type="button"
-                onClick={() => void onGenerateSingle(slot)}
-                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
-              >
-                AI 生一张
-              </button>
-            ) : (
-              <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-500">
-                仅支持手动补图
-              </span>
-            )}
-          </div>
+            <button
+              type="button"
+              onClick={() => void onRegenerate(finalAsset.id)}
+              className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+            >
+              重生成
+            </button>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function FourGridCenterCard({
+  rawImage,
+  assets,
+  onPreview,
+  onGenerate,
+  onOpenPrompt,
+}: {
+  rawImage: string | null;
+  assets: ProductAsset[];
+  onPreview: (src: string, caption: string) => void;
+  onGenerate: () => Promise<void>;
+  onOpenPrompt: () => void;
+}) {
+  const asset = assets[0] || null;
+  return (
+    <div className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold text-slate-900">四宫格母图</div>
+          <div className="mt-1 text-xs text-slate-500">中间保留母图，用来核对裁切前后的整体效果。</div>
         </div>
+        <div className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600">
+          {assets.length} 张
+        </div>
+      </div>
+      <div className="mt-4 space-y-3">
+        <div className="rounded-[16px] border border-slate-200 bg-white p-2">
+          <div className="text-[11px] font-medium text-slate-500">上：原始参考图（主图）</div>
+          {rawImage ? (
+            <button type="button" onClick={() => onPreview(rawImage, "四宫格参考图")} className="mt-2 block w-full">
+              <HoverZoomImage
+                src={rawImage}
+                alt="四宫格参考图"
+                thumbClassName="h-36 w-full rounded-[12px] object-contain bg-slate-50"
+              />
+            </button>
+          ) : (
+            <div className="mt-2 flex h-36 items-center justify-center rounded-[12px] border border-dashed border-slate-200 bg-slate-50 text-xs text-slate-400">
+              暂无原始参考图
+            </div>
+          )}
+        </div>
+        <div className="rounded-[16px] border border-sky-200 bg-white p-2">
+          <div className="text-[11px] font-medium text-slate-500">下：四宫格母图</div>
+          {asset?.public_url ? (
+            <button type="button" onClick={() => onPreview(asset.public_url || "", `四宫格母图 v${asset.version}`)} className="mt-2 block w-full">
+              <HoverZoomImage
+                src={asset.public_url}
+                alt="四宫格母图"
+                thumbClassName="h-36 w-full rounded-[12px] object-contain bg-slate-50"
+              />
+            </button>
+          ) : (
+            <div className="mt-2 flex h-36 items-center justify-center rounded-[12px] border border-dashed border-slate-200 bg-slate-50 text-xs text-slate-400">
+              暂无四宫格母图
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => void onGenerate()}
+          className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800"
+        >
+          生成/重生成四宫格
+        </button>
+        <button
+          type="button"
+          onClick={onOpenPrompt}
+          className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+        >
+          提示词
+        </button>
       </div>
     </div>
   );
@@ -2475,9 +3300,18 @@ function CandidatePoolSection({
             <div
               key={`${item.label}-${index}-${item.src}`}
               draggable
-              onDragStart={() => onDragStateChange(item)}
+              onDragStart={(event) => {
+                onDragStateChange(item);
+                if (item.assetId) {
+                  event.dataTransfer.setData("application/x-candidate-asset-id", String(item.assetId));
+                }
+                event.dataTransfer.setData("application/x-candidate-url", item.src);
+                event.dataTransfer.setData("text/uri-list", item.src);
+                event.dataTransfer.setData("text/plain", item.src);
+                event.dataTransfer.effectAllowed = "copyMove";
+              }}
               onDragEnd={() => onDragStateChange(null)}
-              className="rounded-[16px] border border-slate-200 bg-white p-2"
+              className="cursor-grab rounded-[16px] border border-slate-200 bg-white p-2 active:cursor-grabbing"
             >
               <button type="button" onClick={() => onPreview(item.src, item.label)} className="block w-full">
                 <HoverZoomImage
@@ -2849,25 +3683,25 @@ function WorkbenchTable({
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="英文标题"
-                onEditPrompt={() => onOpenPromptEditor("标题处理", ["product_info_from_screenshot", "title_package"])}
+                onEditPrompt={() => onOpenPromptEditor("英文标题", ["title_en", "title_en_only", "title_package_lite", "title_package", "title_en_with_cn_translation", "product_info_from_screenshot"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="类目处理"
-                onEditPrompt={() => onOpenPromptEditor("类目处理", ["product_info_from_screenshot"])}
+                onEditPrompt={() => onOpenPromptEditor("类目处理", ["product_info_from_screenshot", "title_package"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="SKU 图/字段"
-                onEditPrompt={() => onOpenPromptEditor("SKU 图/字段", ["product_info_from_screenshot"])}
+                onEditPrompt={() => onOpenPromptEditor("SKU 图/字段", ["product_info_from_screenshot", "image_prompt_package"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">
               <PromptableHeader
                 label="主图 / 四宫格"
-                onEditPrompt={() => onOpenPromptEditor("主图 / 四宫格", ["title_package", "image_prompt_package", "image_prompt_carousel_4grid"])}
+                onEditPrompt={() => onOpenPromptEditor("主图 / 四宫格", ["image_prompt_main", "image_prompt_carousel_1", "image_prompt_carousel_2", "image_prompt_carousel_3", "image_prompt_carousel_4", "image_prompt_carousel_4grid", "image_prompt_package"])}
               />
             </th>
             <th className="px-4 py-3 font-medium">主图轮播图</th>
@@ -2896,15 +3730,18 @@ function WorkbenchTable({
               const detail = meta?.detail || null;
               const rowAction = rowLoading[item.id] || "";
               const thumbnail = taskThumbnail(item, meta);
-              const fourGridSlots = ["carousel_1", "carousel_2", "carousel_3", "carousel_4"].map((slot) => selectedSlotAsset(meta?.assets, slot));
+              const fourGridSlotKeys = ["carousel_1", "carousel_2", "carousel_3", "carousel_4"] as const;
+              const fourGridImages = fourGridSlotKeys.map((slot) => tableSlotImage(meta?.assets, meta?.raw, slot));
               const fourGridAssetCount =
                 (meta?.assets?.carousel_1?.length || 0) +
                 (meta?.assets?.carousel_2?.length || 0) +
                 (meta?.assets?.carousel_3?.length || 0) +
                 (meta?.assets?.carousel_4?.length || 0);
               const fourGridParentCount = meta?.assets?.carousel_4grid?.length || 0;
-              const hasFourGrid = fourGridSlots.some(Boolean);
               const fourGridParent = selectedSlotAsset(meta?.assets, "carousel_4grid");
+              const hasFourGrid = fourGridImages.some((image) => image.publicUrl) || Boolean(fourGridParent?.public_url);
+              const confirmedFourGridCount = fourGridImages.filter((image) => image.asset?.public_url).length;
+              const visibleFourGridCount = fourGridImages.filter((image) => image.publicUrl).length;
               const sizeChartAsset = latestAsset(meta?.assets?.size_chart);
               const sizeAssetCount = meta?.assets?.size_chart?.length || 0;
               const sizeRawCount = meta?.raw?.size_chart_images?.length || 0;
@@ -2941,8 +3778,16 @@ function WorkbenchTable({
               const aiTitleCnText = detail?.ai?.title_cn || (item.main_status === "ai_running" ? "AI 处理中" : "待生成");
               const aiTitleEnText = detail?.ai?.title_en ? detail.ai.title_en : item.main_status === "ai_running" ? "AI 处理中" : "待生成";
               const aiCategoryText = detail?.ai?.category_best_path || item.selected_category_id || "";
+              const rawCategoryText = meta?.raw?.category_path || "";
               const quickTitle = quickTitleDrafts[item.id] ?? String(meta?.exportDraft?.fields_json?.product_title_en || detail?.ai?.title_en || "").trim();
               const quickCategory = quickCategoryDrafts[item.id] ?? detail?.selected_category_id ?? detail?.ai?.category_best_path ?? "";
+              const preferredCategoryPaths = [
+                ...(detail?.ai?.category_top3 || []).map((candidate) => candidate.path),
+                ...(((detail?.ai?.category_candidates || []) as { path: string }[]).map((candidate) => candidate.path)),
+                detail?.selected_category_id || "",
+                detail?.ai?.category_best_path || "",
+                meta?.raw?.category_path || "",
+              ].filter(Boolean);
 
               return (
                 <tr key={item.id} className="border-t border-slate-200 align-top">
@@ -2965,12 +3810,12 @@ function WorkbenchTable({
                       <div className="rounded-[12px] border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
                         <div className="text-[11px] text-slate-500">原英文标题（采集）</div>
                         <HoverTitleText value={originalEnTitleText} />
-                        <div className="mt-2 text-[11px] text-slate-500">AI 中文标题</div>
-                        <HoverTitleText value={aiTitleCnText} />
+                        {/* <div className="mt-2 text-[11px] text-slate-500">AI 中文标题</div>
+                        <HoverTitleText value={aiTitleCnText} /> */}
                       </div>
                       <div className="rounded-[12px] border border-sky-200 bg-sky-50 p-3 text-xs text-slate-600">
-                        <div className="text-[11px] text-slate-500">AI 英文标题</div>
-                        <div className="mt-1 line-clamp-3 text-slate-800">{aiTitleEnText || "-"}</div>
+                        <div className="text-[11px] text-slate-500">AI 中文标题</div>
+                        <HoverTitleText value={aiTitleCnText} />
                       </div>
                       <input
                         value={quickTitle}
@@ -3011,11 +3856,19 @@ function WorkbenchTable({
                       <div className="rounded-[12px] border border-slate-200 bg-slate-50 p-2 text-xs text-slate-600">
                         AI：{aiCategoryText || statusText(item.category_status)}
                       </div>
-                      <input
+                      {rawCategoryText ? (
+                        <div className="rounded-[12px] border border-slate-300 bg-slate-100 p-2 text-xs text-slate-500">
+                          原：{rawCategoryText}
+                        </div>
+                      ) : null}
+                      <SearchableCategoryInput
                         value={quickCategory}
-                        onChange={(event) => onQuickCategoryChange(item.id, event.target.value)}
-                        list="category-options"
-                        className="h-10 w-full rounded-[12px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+                        onChange={(value) => onQuickCategoryChange(item.id, value)}
+                        onSelect={(path) => onQuickCategoryChange(item.id, path)}
+                        allOptions={categoryOptions}
+                        preferredPaths={preferredCategoryPaths}
+                        className="w-full"
+                        minHeight={40}
                         placeholder="最终导出类目"
                       />
                       <div className="flex flex-wrap gap-2">
@@ -3079,10 +3932,13 @@ function WorkbenchTable({
                   <td className="px-4 py-3">
                     {hasFourGrid ? (
                       <div>
-                        <TableFourGridCell parentAsset={fourGridParent} slotAssets={fourGridSlots} />
+                        <TableFourGridCell parentAsset={fourGridParent} slotImages={fourGridImages} />
                         <div className="mt-2 flex flex-wrap gap-2">
                           <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] text-slate-600">
-                            4 槽位 {fourGridSlots.filter(Boolean).length}/4
+                            前 4 位 {visibleFourGridCount}/4
+                          </span>
+                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] text-slate-600">
+                            已确认 {confirmedFourGridCount}/4
                           </span>
                           <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] text-slate-600">
                             母图 {fourGridParentCount} 张
@@ -3239,23 +4095,16 @@ function WorkbenchTable({
         </tbody>
         </table>
       </div>
-      <datalist id="category-options">
-        {categoryOptions.map((option) => (
-          <option key={option.path} value={option.path}>
-            {option.leaf}
-          </option>
-        ))}
-      </datalist>
     </>
   );
 }
 
 function TableFourGridCell({
   parentAsset,
-  slotAssets,
+  slotImages,
 }: {
   parentAsset: ProductAsset | null;
-  slotAssets: Array<ProductAsset | null>;
+  slotImages: TableSlotImage[];
 }) {
   return (
     <div className="w-[180px] space-y-2">
@@ -3266,10 +4115,10 @@ function TableFourGridCell({
         </div>
       </div>
       <div className="grid grid-cols-4 gap-1">
-        {slotAssets.map((asset, index) => (
-          <div key={`slot-${index + 1}`} className="space-y-1">
+        {slotImages.map((image, index) => (
+          <div key={image.slot} className="space-y-1">
             <div className="text-center text-[10px] text-slate-400">{index + 1}</div>
-            <TableMiniImage asset={asset} fallback={String(index + 1)} />
+            <TableMiniImage asset={image.asset} rawUrl={image.rawUrl} fallback={String(index + 1)} />
           </div>
         ))}
       </div>
@@ -3294,37 +4143,22 @@ function TableCarouselFieldCell({
     "carousel_7",
     "carousel_8",
   ] as const;
-  const exportAssets = carouselSlots
-    .map((slot) => ({ slot, asset: selectedSlotAsset(assets, slot) }))
-    .filter((item) => item.asset?.public_url);
-  const rawFallbackImages = [
-    ...(raw?.main_image ? [raw.main_image] : []),
-    ...(raw?.carousel_images || []),
-    ...(raw?.detail_images || []),
-  ];
+  const slotImages = carouselSlots.map((slot) => tableSlotImage(assets, raw, slot));
+  const confirmedCount = slotImages.filter((item) => item.asset?.public_url).length;
+  const visibleCount = slotImages.filter((item) => item.publicUrl).length;
 
   return (
     <div className="w-[180px] space-y-2">
       <div className="grid grid-cols-4 gap-1">
-        {carouselSlots.map((slot, index) => (
-          <div key={slot} className="space-y-1">
+        {slotImages.map((image, index) => (
+          <div key={image.slot} className="space-y-1">
             <div className="text-center text-[10px] text-slate-400">{index + 1}</div>
-            {selectedSlotAsset(assets, slot)?.public_url ? (
-              <TableMiniImage asset={selectedSlotAsset(assets, slot)} fallback={String(index + 1)} />
-            ) : rawFallbackImages[index] ? (
-              <HoverZoomImage
-                src={rawFallbackImages[index]}
-                alt={`raw-carousel-${index + 1}`}
-                thumbClassName="h-12 w-12 rounded-lg border border-slate-200 bg-white p-1 object-contain"
-              />
-            ) : (
-              <TableMiniImage asset={null} fallback={String(index + 1)} />
-            )}
+            <TableMiniImage asset={image.asset} rawUrl={image.rawUrl} fallback={String(index + 1)} />
           </div>
         ))}
       </div>
       <div className="text-[11px] text-slate-500">
-        当前导出 {exportAssets.length} 张；无 AI 图时回显采集到的主图/轮播图。
+        当前显示 {visibleCount} 张；已确认 {confirmedCount} 张。无手选/AI 图时回显采集轮播图。
       </div>
     </div>
   );
@@ -3332,14 +4166,17 @@ function TableCarouselFieldCell({
 
 function TableMiniImage({
   asset,
+  rawUrl,
   fallback,
   highlight = false,
 }: {
   asset: ProductAsset | null;
+  rawUrl?: string | null;
   fallback: string;
   highlight?: boolean;
 }) {
-  if (!asset?.public_url) {
+  const src = asset?.public_url || rawUrl || null;
+  if (!src) {
     return (
       <div
         className={[
@@ -3356,7 +4193,7 @@ function TableMiniImage({
 
   return (
     <HoverZoomImage
-      src={asset.public_url}
+      src={src}
       alt={fallback}
       thumbClassName={[
         "h-12 w-12 rounded-lg border bg-white p-1 object-contain",
@@ -3373,6 +4210,7 @@ function DrawerTabContent({
   timeline,
   onRefresh,
   isLogsRoute,
+  onOpenPromptEditor,
 }: {
   tab: DrawerTab;
   task: ProductTaskDetail | null;
@@ -3380,6 +4218,7 @@ function DrawerTabContent({
   timeline: ProductTaskTimelineResponse | null;
   onRefresh?: (() => Promise<void>) | undefined;
   isLogsRoute: boolean;
+  onOpenPromptEditor: (fieldLabel: string, promptTypes: string[]) => void;
 }) {
   if (!task) {
     return (
@@ -3402,7 +4241,7 @@ function DrawerTabContent({
   }
 
   if (tab === "images") {
-    return <ImagesTab task={task} raw={raw} />;
+    return <ImagesTab task={task} raw={raw} onRefresh={onRefresh} onOpenPromptEditor={onOpenPromptEditor} />;
   }
 
   if (tab === "defaults") {
@@ -3418,7 +4257,7 @@ function CompareCard({
   items,
 }: {
   title: string;
-  tone: "raw" | "ai" | "final";
+  tone: "raw" | "ai" | "final" | "neutral";
   items: { label: string; value: string }[];
 }) {
   const toneClass =
@@ -3426,7 +4265,9 @@ function CompareCard({
       ? "border-slate-200 bg-slate-50"
       : tone === "ai"
         ? "border-sky-200 bg-sky-50"
-        : "border-emerald-200 bg-emerald-50";
+        : tone === "neutral"
+          ? "border-slate-300 bg-slate-100"
+          : "border-emerald-200 bg-emerald-50";
 
   return (
     <div className={["rounded-[18px] border p-4", toneClass].join(" ")}>
@@ -3505,6 +4346,7 @@ function TraceTab({
   const allEvents = timeline?.events || [];
   const aiEvents = allEvents.filter((event) => String(event.stage).startsWith("ai."));
   const backendEvents = allEvents.filter((event) => !String(event.stage).startsWith("ai."));
+  const normMode = normalizeGenerationMode(task.generation_mode);
   const categoryEvent = aiEvents.find((event) => event.stage === "ai.category_match") || null;
   const categoryOutput = ((categoryEvent?.meta?.output as Record<string, unknown> | undefined) || {});
   const categoryInput = ((categoryEvent?.meta?.input as Record<string, unknown> | undefined) || {});
@@ -3525,7 +4367,8 @@ function TraceTab({
   const runtimeFromEvents =
     ((aiEvents.find((event) => event.meta?.runtime)?.meta?.runtime as Record<string, unknown> | undefined) || {});
   const timelineEventsForDisplay = (() => {
-    if (task.generation_mode !== "title_only") return allEvents;
+    const normMode = normalizeGenerationMode(task.generation_mode);
+    if (normMode !== "title_only") return allEvents;
     return allEvents.filter((event) => {
       const stage = String(event.stage || "");
       return (
@@ -3540,28 +4383,31 @@ function TraceTab({
     });
   })();
   const expectedAiStages = (() => {
-    if (task.generation_mode === "title_only") return ["ai.title_package", "ai.category_match"];
-    if (task.generation_mode === "title_and_image_prompts" || task.generation_mode === "full_later") {
-      return ["ai.product_info", "ai.category_match", "ai.title_package", "ai.image_prompt_package"];
+    const normMode = normalizeGenerationMode(task.generation_mode);
+    if (normMode === "title_only") return ["ai.title_package", "ai.category_match"];
+    if (normMode === "title_and_4grid") {
+      return ["ai.title_package", "ai.category_match", "ai.product_info", "ai.image_prompt_package"];
     }
     return ["ai.category_match"];
   })();
   const flowPlan = (() => {
-    if (task.generation_mode === "title_only") {
+    const normMode = normalizeGenerationMode(task.generation_mode);
+    if (normMode === "title_only") {
       return [
         { label: "标题生成", value: "title_package_lite -> 一次轻量 AI 调用，返回标题 + 类目检索字段" },
         { label: "类目处理", value: "category_match -> 基于 AI 检索词和原始字段做代码字典召回，默认采用第 1 候选" },
       ];
     }
-    if (task.generation_mode === "title_and_image_prompts" || task.generation_mode === "full_later") {
+    if (normMode === "title_and_4grid") {
       return [
-        { label: "商品理解", value: "product_info_from_screenshot -> product_info" },
-        { label: "标题生成", value: "title_package -> 基于商品理解做标题包、合规判断和类目检索关键词" },
-        { label: "类目处理", value: "category_match -> 结合标题包和商品理解结果做代码字典检索" },
-        { label: "图片提示词", value: "image_prompt_package -> 四宫格 / 主图 / 尺寸图提示词包" },
+        { label: "标题生成", value: "title_package_lite -> 基于 raw 字段做标题包和类目检索关键词" },
+        { label: "类目处理", value: "category_match -> 结合标题包和原始字段做代码字典检索" },
+        { label: "商品理解", value: "product_info_from_screenshot -> product_info（后置增强，仅服务图片）" },
+        { label: "动态图片提示词", value: "image_prompt_package -> 代码拼装商品理解/标题/类目字段，供四宫格、SKU 图、轮播主图、尺寸图使用" },
+        { label: "四宫格出图", value: "bootstrap -> image_prompt_carousel_4grid -> 自动生成母图并裁切 carousel_1~4" },
       ];
     }
-    return [{ label: "当前模式", value: "no_ai，不触发 AI，只保留原始采集和人工处理。" }];
+    return [{ label: "当前模式", value: "task_only，不触发 AI，只保留原始采集和人工处理。" }];
   })();
   const totalPromptTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.prompt_tokens || 0), 0);
   const totalCompletionTokens = aiEvents.reduce((sum, event) => sum + Number((event.meta?.usage as Record<string, unknown> | undefined)?.completion_tokens || 0), 0);
@@ -3611,10 +4457,10 @@ function TraceTab({
     {
       key: "product_info",
       label: "商品理解",
-      hint: task.generation_mode === "title_only" ? "当前模式应跳过该步骤，不应调用商品理解 AI。" : "是否跑过商品理解 / 截图理解。",
+      hint: normMode === "title_only" ? "当前模式应跳过该步骤，不应调用商品理解 AI。" : "是否跑过商品理解 / 截图理解。",
       done: aiEvents.some((event) => event.stage === "ai.product_info" && event.status === "success"),
       status:
-        task.generation_mode === "title_only"
+        normMode === "title_only"
           ? "skipped"
           : task.main_status === "failed" && task.title_status === "failed"
             ? "failed"
@@ -3625,14 +4471,14 @@ function TraceTab({
     {
       key: "category_match",
       label: "类目处理",
-      hint: task.generation_mode === "title_only" ? "应由代码字典直接产出候选类目，不依赖商品理解 AI。" : "是否产出类目候选或人工采用类目。",
+      hint: normMode === "title_only" ? "应由代码字典直接产出候选类目，不依赖商品理解 AI。" : "是否产出类目候选或人工采用类目。",
       done: aiEvents.some((event) => event.stage === "ai.category_match" && event.status === "success") || Boolean(task.selected_category_id),
       status: task.category_status,
     },
     {
       key: "title_package",
       label: "标题包",
-      hint: task.generation_mode === "title_only" ? "应只调用一次标题 AI，直接返回中英标题。" : "是否生成标题包并回写任务标题。",
+      hint: normMode === "title_only" ? "应只调用一次标题 AI，直接返回中英标题。" : "是否生成标题包并回写任务标题。",
       done: aiEvents.some((event) => event.stage === "ai.title_package" && event.status === "success") || Boolean(task.ai?.title_package),
       status: task.title_status,
     },
@@ -3640,11 +4486,11 @@ function TraceTab({
       key: "image_prompt_package",
       label: "图片提示词",
       hint:
-        task.generation_mode === "title_only"
+        normMode === "title_only"
           ? "当前模式应跳过该步骤。"
-          : "是否生成 image prompt package。",
+          : "是否已基于商品理解、标题包和类目结果生成动态图片提示词上下文（不调 AI）。",
       done: aiEvents.some((event) => event.stage === "ai.image_prompt_package" && event.status === "success") || Boolean(task.ai?.image_prompt_package),
-      status: task.generation_mode === "title_only" ? "skipped" : task.image_prompt_status,
+      status: normMode === "title_only" ? "skipped" : task.image_prompt_status,
     },
     {
       key: "image_jobs",
@@ -3662,7 +4508,7 @@ function TraceTab({
     },
   ];
   const defaultChainChecks = (() => {
-    if (task.generation_mode === "title_only") {
+    if (normMode === "title_only") {
       return [
         processChecks[0],
         {
@@ -3755,7 +4601,7 @@ function TraceTab({
             title="默认链路"
             tone="final"
             items={
-              task.generation_mode === "title_only"
+              normMode === "title_only"
                 ? [
                     { label: "模式定义", value: "1 次轻量标题 AI + 代码类目召回 + 原始素材回显" },
                     { label: "默认 AI 次数", value: "1 次" },
@@ -3770,9 +4616,9 @@ function TraceTab({
             tone="raw"
             items={[
               { label: "轮播图 / SKU 图", value: "原始回显" },
-              { label: "标题", value: task.generation_mode === "no_ai" ? "原始回显" : "AI 生成" },
-              { label: "类目检索词", value: task.generation_mode === "no_ai" ? "-" : "AI 生成" },
-              { label: "默认候选类目", value: task.generation_mode === "no_ai" ? "人工搜索" : "代码召回" },
+              { label: "标题", value: normMode === "task_only" ? "原始回显" : "AI 生成" },
+              { label: "类目检索词", value: normMode === "task_only" ? "-" : "AI 生成" },
+              { label: "默认候选类目", value: normMode === "task_only" ? "人工搜索" : "代码召回" },
             ]}
           />
           <CompareCard
@@ -3789,12 +4635,18 @@ function TraceTab({
       </Section>
 
       <Section title="类目处理">
-        <div className="grid gap-4 xl:grid-cols-3">
+        <div className="grid gap-4 xl:grid-cols-4">
+          <CompareCard
+            title="原始采集类目"
+            tone="neutral"
+            items={[
+              { label: "采集时抓取的类目", value: raw?.category_path || "-" },
+            ]}
+          />
           <CompareCard
             title="类目定位"
             tone="final"
             items={[
-              { label: "原始类目", value: raw?.category_path || "-" },
               { label: "默认第 1 候选", value: String(categoryOutput.selected_category || categoryOutput.best_path || task.selected_category_id || "-") },
               { label: "候选数量", value: String(categoryCandidates.length || 0) },
               { label: "人工选中类目", value: task.selected_category_id || "-" },
@@ -4050,7 +4902,7 @@ function TraceTab({
         </div>
       </Section>
 
-      <Section title={task.generation_mode === "title_only" ? "关键时间线" : "全量时间线"}>
+      <Section title={normMode === "title_only" ? "关键时间线" : "全量时间线"}>
         {timelineEventsForDisplay.length ? (
           <div className="space-y-3">
             {timelineEventsForDisplay.map((event, index) => (
@@ -4367,7 +5219,7 @@ function InfoTab({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-titles`, {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/generate-title-en-only`, {
         method: "POST",
         headers: buildAiRequestHeaders(),
       });
@@ -4430,6 +5282,12 @@ function InfoTab({
     | undefined;
   const categoryCandidates =
     task.ai?.category_candidates?.length ? task.ai.category_candidates : ((task.category_candidates_json as { path: string; score?: number | null }[]) || []);
+  const preferredCategoryPaths = [
+    ...(task.ai?.category_top3 || []).map((candidate) => candidate.path),
+    ...categoryCandidates.map((candidate) => candidate.path),
+    task.selected_category_id || "",
+    task.ai?.category_best_path || "",
+  ].filter(Boolean);
 
   return (
     <div className="space-y-4">
@@ -4547,20 +5405,16 @@ function InfoTab({
 
         <div className="mt-4 rounded-[16px] border border-slate-200 bg-slate-50 p-4">
           <div className="text-xs text-slate-500">手动类目</div>
-          <input
+          <SearchableCategoryInput
             value={manualCategory}
-            onChange={(event) => setManualCategory(event.target.value)}
-            list="drawer-category-options"
-            className="mt-2 h-11 w-full rounded-[14px] border border-slate-200 bg-white px-4 text-sm outline-none focus:border-slate-400"
+            onChange={setManualCategory}
+            onSelect={setManualCategory}
+            allOptions={categoryOptions}
+            preferredPaths={preferredCategoryPaths}
+            className="mt-2"
+            minHeight={44}
             placeholder="输入完整类目路径"
           />
-          <datalist id="drawer-category-options">
-            {categoryOptions.map((option) => (
-              <option key={option.path} value={option.path}>
-                {option.leaf}
-              </option>
-            ))}
-          </datalist>
           <div className="mt-3">
             <button
               type="button"
@@ -4644,7 +5498,7 @@ function InfoTab({
           </div>
           <div>
             <div className="text-xs text-slate-500">生成模式</div>
-            <div className="mt-1">{task.generation_mode}</div>
+            <div className="mt-1">{getGenerationModeLabel(task.generation_mode)}</div>
           </div>
         </div>
       </Section>
@@ -4756,14 +5610,473 @@ function InfoTab({
 }
 
 function DefaultsTab({ task }: { task: ProductTaskDetail }) {
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [draft, setDraft] = useState<ExportFieldDraft | null>(null);
+  const [editingField, setEditingField] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+
+  // 表单状态 - 基础设置
+  const [jingYingZhanDian, setJingYingZhanDian] = useState("美国站");
+  const [faHuoCang, setFaHuoCang] = useState("美国-饰品");
+  const [chengNuoFaHuoShiXiao, setChengNuoFaHuoShiXiao] = useState("7个工作日内发货");
+  const [suCaiYuYan, setSuCaiYuYan] = useState("英语");
+  const [chanPinChanDi, setChanPinChanDi] = useState("中国");
+  const [chanDiShengFen, setChanDiShengFen] = useState("广东省");
+
+  // 表单状态 - SKU规格
+  const [moRenGuiGeLeiXing, setMoRenGuiGeLeiXing] = useState("款式/颜色");
+  const [skuFenLei, setSkuFenLei] = useState("单品");
+  const [skuShuLiang, setSkuShuLiang] = useState("1");
+  const [skuShuLiangDanWei, setSkuShuLiangDanWei] = useState("件");
+  const [shiFouDuLiBaoZhuang, setShiFouDuLiBaoZhuang] = useState("是");
+  const [guiGe1NeiRong, setGuiGe1NeiRong] = useState("");
+  const [guiGe2NeiRong, setGuiGe2NeiRong] = useState("");
+
+  // 表单状态 - 敏感属性
+  const [minGanShuXing1, setMinGanShuXing1] = useState("");
+  const [minGanShuXing2, setMinGanShuXing2] = useState("");
+  const [minGanShuXing3, setMinGanShuXing3] = useState("");
+  const [yeTiRongLiang, setYeTiRongLiang] = useState("");
+  const [daoJuChangDu, setDaoJuChangDu] = useState("");
+  const [daoJuJianDu, setDaoJuJianDu] = useState("");
+  const [chuDianRongLiang, setChuDianRongLiang] = useState("");
+
+  // 表单状态 - 体积重量
+  const [zuiChangBian, setZuiChangBian] = useState("10");
+  const [ciChangBian, setCiChangBian] = useState("8");
+  const [zuiDuanBian, setZuiDuanBian] = useState("2");
+  const [zhongLiang, setZhongLiang] = useState("30");
+
+  // 价格状态
+  const [shenBaoJia, setShenBaoJia] = useState("");
+  const [jianYiShouJia, setJianYiShouJia] = useState("");
+
+  async function loadDefaults(): Promise<void> {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/export-fields/preview`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { draft: ExportFieldDraft | null };
+      const fields = data.draft?.fields_json || {};
+      setDraft(data.draft || null);
+
+      // 从已有字段加载值
+      if (fields["经营站点"]) setJingYingZhanDian(String(fields["经营站点"]));
+      if (fields["发货仓"]) setFaHuoCang(String(fields["发货仓"]));
+      if (fields["承诺发货时效"]) setChengNuoFaHuoShiXiao(String(fields["承诺发货时效"]));
+      if (fields["素材语言"]) setSuCaiYuYan(String(fields["素材语言"]));
+      if (fields["商品产地"]) setChanPinChanDi(String(fields["商品产地"]));
+      if (fields["产地省份"]) setChanDiShengFen(String(fields["产地省份"]));
+      if (fields["默认规格类型"]) setMoRenGuiGeLeiXing(String(fields["默认规格类型"]));
+      if (fields["SKU分类"]) setSkuFenLei(String(fields["SKU分类"]));
+      if (fields["SKU数量"]) setSkuShuLiang(String(fields["SKU数量"]));
+      if (fields["SKU数量单位"]) setSkuShuLiangDanWei(String(fields["SKU数量单位"]));
+      if (fields["是否独立包装"]) setShiFouDuLiBaoZhuang(String(fields["是否独立包装"]));
+      if (fields["规格1内容"]) setGuiGe1NeiRong(String(fields["规格1内容"]));
+      if (fields["规格2内容"]) setGuiGe2NeiRong(String(fields["规格2内容"]));
+      if (fields["敏感词属性1"]) setMinGanShuXing1(String(fields["敏感词属性1"]));
+      if (fields["敏感词属性2"]) setMinGanShuXing2(String(fields["敏感词属性2"]));
+      if (fields["敏感词属性3"]) setMinGanShuXing3(String(fields["敏感词属性3"]));
+      if (fields["液体容量（ml）"]) setYeTiRongLiang(String(fields["液体容量（ml）"]));
+      if (fields["刀具长度(cm)"]) setDaoJuChangDu(String(fields["刀具长度(cm)"]));
+      if (fields["刀尖角度(度)"]) setDaoJuJianDu(String(fields["刀尖角度(度)"]));
+      if (fields["储电容量（wh）"]) setChuDianRongLiang(String(fields["储电容量（wh）"]));
+      if (fields["最长边（cm）"]) setZuiChangBian(String(fields["最长边（cm）"]));
+      if (fields["次长边（cm）"]) setCiChangBian(String(fields["次长边（cm）"]));
+      if (fields["最短边（cm）"]) setZuiDuanBian(String(fields["最短边（cm）"]));
+      if (fields["重量（g）"]) setZhongLiang(String(fields["重量（g）"]));
+      if (fields["申报价CNY"]) setShenBaoJia(String(fields["申报价CNY"]));
+      if (fields["建议售价CNY"]) setJianYiShouJia(String(fields["建议售价CNY"]));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadDefaults();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id]);
+
+  async function saveDefaults(): Promise<void> {
+    setSaving(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const fields: Record<string, string> = {
+        "经营站点": jingYingZhanDian,
+        "发货仓": faHuoCang,
+        "承诺发货时效": chengNuoFaHuoShiXiao,
+        "素材语言": suCaiYuYan,
+        "商品产地": chanPinChanDi,
+        "产地省份": chanDiShengFen,
+        "默认规格类型": moRenGuiGeLeiXing,
+        "SKU分类": skuFenLei,
+        "SKU数量": skuShuLiang,
+        "SKU数量单位": skuShuLiangDanWei,
+        "是否独立包装": shiFouDuLiBaoZhuang,
+        "规格1内容": guiGe1NeiRong,
+        "规格2内容": guiGe2NeiRong,
+        "敏感词属性1": minGanShuXing1,
+        "敏感词属性2": minGanShuXing2,
+        "敏感词属性3": minGanShuXing3,
+        "最长边（cm）": zuiChangBian,
+        "次长边（cm）": ciChangBian,
+        "最短边（cm）": zuiDuanBian,
+        "重量（g）": zhongLiang,
+      };
+      if (shenBaoJia) fields["申报价CNY"] = shenBaoJia;
+      if (jianYiShouJia) fields["建议售价CNY"] = jianYiShouJia;
+      // 条件字段
+      if (minGanShuXing1 === "液体" && yeTiRongLiang) fields["液体容量（ml）"] = yeTiRongLiang;
+      if (minGanShuXing1 === "刀具" && daoJuChangDu) fields["刀具长度(cm)"] = daoJuChangDu;
+      if (minGanShuXing1 === "刀具" && daoJuJianDu) fields["刀尖角度(度)"] = daoJuJianDu;
+      if ((minGanShuXing1 === "纯电" || minGanShuXing1 === "内电") && chuDianRongLiang) fields["储电容量（wh）"] = chuDianRongLiang;
+
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/export-fields`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ fields }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSuccess("保存成功");
+      await loadDefaults();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveSingleField(fieldKey: string, value: string): Promise<void> {
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/product-tasks/${task.id}/export-fields`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ fields: { [fieldKey]: value } }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setEditingField(null);
+      await loadDefaults();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存失败");
+    }
+  }
+
+  const minGanOptions = ["", "纯电", "内电", "液体", "粉末", "膏体", "刀具", "磁性", "气雾剂"];
+  const showLiquid = minGanShuXing1 === "液体" || minGanShuXing2 === "液体" || minGanShuXing3 === "液体";
+  const showKnife = minGanShuXing1 === "刀具" || minGanShuXing2 === "刀具" || minGanShuXing3 === "刀具";
+  const showBattery = minGanShuXing1 === "纯电" || minGanShuXing1 === "内电" || minGanShuXing2 === "纯电" || minGanShuXing2 === "内电" || minGanShuXing3 === "纯电" || minGanShuXing3 === "内电";
+
+  // 从AI结果和草稿获取字段值
+  const aiTitleCn = String(task.ai?.title_cn || draft?.fields_json?.["商品名称"] || task.title || "");
+  const aiTitleEn = String(task.ai?.title_en || draft?.fields_json?.["英文名称"] || "");
+  const draftFields: Record<string, unknown> = draft?.fields_json || {};
+
+  // 字段总览数据
+  const overviewFields: Array<{
+    group: string;
+    icon: string;
+    items: Array<{ key: string; value: string; source: string; editable: boolean; link?: string }>;
+  }> = [
+    {
+      group: "📝 标题",
+      icon: "📝",
+      items: [
+        { key: "商品标题", value: aiTitleCn, source: aiTitleCn ? "AI生成" : "待生成", editable: true },
+        { key: "英文标题", value: aiTitleEn, source: aiTitleEn ? "AI生成" : "待生成", editable: true },
+      ]
+    },
+    {
+      group: "💰 价格",
+      icon: "💰",
+      items: [
+        { key: "申报价(CNY)", value: String(draftFields["申报价CNY"] || shenBaoJia || ""), source: draftFields["申报价CNY"] ? "已填" : "待填写", editable: true },
+        { key: "建议售价(CNY)", value: String(draftFields["建议售价CNY"] || jianYiShouJia || ""), source: draftFields["建议售价CNY"] ? "已填" : "选填", editable: true },
+      ]
+    },
+    {
+      group: "📦 SKU规格",
+      icon: "📦",
+      items: [
+        { key: "规格1内容", value: String(guiGe1NeiRong || draftFields["规格1内容"] || ""), source: guiGe1NeiRong || draftFields["规格1内容"] ? "已填" : "待填写", editable: false },
+        { key: "规格2内容", value: String(guiGe2NeiRong || draftFields["规格2内容"] || ""), source: guiGe2NeiRong || draftFields["规格2内容"] ? "已填" : "-", editable: false },
+      ]
+    },
+    {
+      group: "🖼️ 图片",
+      icon: "🖼️",
+      items: [
+        { key: "轮播图1", value: draftFields["商品轮播图1-英语"] ? "[已生成]" : "待生成", source: draftFields["商品轮播图1-英语"] ? "已生成" : "待生成", editable: false, link: "图片处理" },
+        { key: "轮播图2-4", value: draftFields["商品轮播图2-英语"] ? "[已生成]" : "待生成", source: draftFields["商品轮播图2-英语"] ? "已生成" : "待生成", editable: false, link: "图片处理" },
+        { key: "SKU预览图", value: draftFields["SKU预览图-英语"] ? "[已生成]" : "待生成", source: draftFields["SKU预览图-英语"] ? "已生成" : "待生成", editable: false, link: "图片处理" },
+      ]
+    },
+    {
+      group: "🏷️ 类目属性",
+      icon: "🏷️",
+      items: [
+        { key: "镀层", value: String(draftFields["镀层"] || "无镀层"), source: draftFields["镀层"] ? "已填" : "系统默认", editable: false },
+        { key: "镶嵌材质", value: String(draftFields["镶嵌材质"] || "无镶嵌"), source: draftFields["镶嵌材质"] ? "已填" : "系统默认", editable: false },
+        { key: "主体材质", value: String(draftFields["主体材质"] || "合金"), source: draftFields["主体材质"] ? "已填" : "系统默认", editable: false },
+        { key: "风格", value: draftFields["风格1"] ? "已填" : "待填写", source: draftFields["风格1"] ? "已填" : "待填写", editable: false },
+      ]
+    },
+    {
+      group: "🎬 视频",
+      icon: "🎬",
+      items: [
+        { key: "主图视频", value: draftFields["SPU主图视频"] ? "[已上传]" : "未上传", source: draftFields["SPU主图视频"] ? "已填" : "未上传", editable: false },
+        { key: "详情视频", value: draftFields["SPU详情视频"] ? "[已上传]" : "未上传", source: draftFields["SPU详情视频"] ? "已填" : "未上传", editable: false },
+      ]
+    },
+    {
+      group: "📄 详情图文",
+      icon: "📄",
+      items: [
+        { key: "详情图文", value: draftFields["详情图文-英语"] ? "[已上传]" : "待上传", source: draftFields["详情图文-英语"] ? "已上传" : "待上传", editable: false, link: "图片处理" },
+      ]
+    },
+  ];
+
   return (
     <div className="space-y-4">
-      <Section title="上架默认值">
-        <div className="text-sm leading-6 text-slate-600">
-          这里用于补当前商品导出模板里还没填满的字段。可以套用系统默认值、时间默认值，也可以对单个字段改成当前商品专用值。
+      {error && (
+        <div className="rounded-[18px] border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{error}</div>
+      )}
+      {success && (
+        <div className="rounded-[18px] border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700">{success}</div>
+      )}
+
+      {/* 导出字段总览 */}
+      <Section title="导出字段总览">
+        <div className="space-y-4">
+          {overviewFields.map((group) => (
+            <div key={group.group}>
+              <div className="mb-2 text-xs font-semibold text-slate-700">{group.group}</div>
+              <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                {group.items.map((item) => (
+                  <div key={item.key} className="flex items-center justify-between rounded-[12px] border border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs text-slate-500">{item.key}</div>
+                      <div className={`mt-1 truncate text-sm font-medium ${item.value && item.value !== "待生成" && item.value !== "待填写" && item.value !== "未上传" ? "text-slate-900" : "text-amber-600"}`}>
+                        {item.value || "-"}
+                      </div>
+                    </div>
+                    <div className="ml-2 flex flex-col items-end gap-1">
+                      <span className={`rounded-full border px-2 py-0.5 text-[10px] ${item.source === "AI生成" || item.source === "已填" ? "border-emerald-200 bg-emerald-50 text-emerald-700" : item.source === "系统默认" ? "border-slate-200 bg-slate-100 text-slate-500" : "border-amber-200 bg-amber-50 text-amber-700"}`}>
+                        {item.source}
+                      </span>
+                      {item.editable && (
+                        <button
+                          type="button"
+                          onClick={() => { setEditingField(item.key); setEditValue(String(item.value || "")); }}
+                          className="text-[10px] text-slate-500 hover:text-slate-700"
+                        >
+                          编辑
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
       </Section>
-      <ExportFieldsTab task={task} />
+
+      {/* 单字段编辑弹窗 */}
+      {editingField && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-[360px] rounded-[20px] border border-slate-200 bg-white p-5 shadow-xl">
+            <div className="text-sm font-semibold text-slate-900">编辑 {editingField}</div>
+            <textarea
+              value={editValue}
+              onChange={(e) => setEditValue(e.target.value)}
+              className="mt-3 h-[100px] w-full resize-none rounded-[14px] border border-slate-200 bg-white p-3 text-sm outline-none focus:border-slate-400"
+              placeholder={`输入 ${editingField} 的值`}
+            />
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditingField(null)}
+                className="h-10 rounded-full border border-slate-200 px-4 text-sm text-slate-700 hover:bg-slate-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveSingleField(editingField, editValue)}
+                className="h-10 rounded-full bg-slate-900 px-4 text-sm text-white hover:bg-slate-800"
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 分组1：基础设置 */}
+      <Section title="基础设置">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <FormSelect label="经营站点" value={jingYingZhanDian} onChange={setJingYingZhanDian}
+            options={["美国站", "英国站", "德国站", "法国站", "意大利站", "西班牙站", "日本站", "澳大利亚站"]} />
+          <FormSelect label="发货仓" value={faHuoCang} onChange={setFaHuoCang}
+            options={["美国-饰品", "美国-普货", "英国-饰品", "英国-普货", "德国-饰品", "德国-普货"]} />
+          <FormSelect label="承诺发货时效" value={chengNuoFaHuoShiXiao} onChange={setChengNuoFaHuoShiXiao}
+            options={["2个工作日内发货", "3个工作日内发货", "5个工作日内发货", "7个工作日内发货"]} />
+          <FormSelect label="素材语言" value={suCaiYuYan} onChange={setSuCaiYuYan}
+            options={["英语", "英语+德语", "英语+法语", "英语+西班牙语", "多语言"]} />
+          <FormSelect label="商品产地" value={chanPinChanDi} onChange={setChanPinChanDi}
+            options={["中国", "美国", "日本", "韩国", "英国"]} />
+          <FormInput label="产地省份" value={chanDiShengFen} onChange={setChanDiShengFen}
+            placeholder="如：广东省" />
+        </div>
+      </Section>
+
+      {/* 分组2：SKU规格 */}
+      <Section title="SKU规格">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <FormSelect label="默认规格类型" value={moRenGuiGeLeiXing} onChange={setMoRenGuiGeLeiXing}
+            options={["款式/颜色", "颜色/尺寸", "尺寸/颜色", "款式", "颜色"]} />
+          <FormSelect label="SKU分类" value={skuFenLei} onChange={setSkuFenLei}
+            options={["单品", "同款多件装", "混合套装"]} />
+          <div className="grid grid-cols-2 gap-2">
+            <FormInput label="SKU数量" value={skuShuLiang} onChange={setSkuShuLiang} type="number" placeholder="1" />
+            <FormSelect label="单位" value={skuShuLiangDanWei} onChange={setSkuShuLiangDanWei}
+              options={["件", "套", "对", "个", "组", "盒", "袋"]} />
+          </div>
+          <FormSelect label="是否独立包装" value={shiFouDuLiBaoZhuang} onChange={setShiFouDuLiBaoZhuang}
+            options={["是", "否"]} />
+          <FormInput label="规格1内容" value={guiGe1NeiRong} onChange={setGuiGe1NeiRong}
+            placeholder="如：黑色、红色、蓝色" />
+          <FormInput label="规格2内容" value={guiGe2NeiRong} onChange={setGuiGe2NeiRong}
+            placeholder="如：S、M、L、XL" />
+        </div>
+      </Section>
+
+      {/* 分组3：敏感属性 */}
+      <Section title="敏感属性">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <FormSelect label="敏感词属性1" value={minGanShuXing1} onChange={setMinGanShuXing1}
+            options={minGanOptions} />
+          <FormSelect label="敏感词属性2" value={minGanShuXing2} onChange={setMinGanShuXing2}
+            options={minGanOptions} />
+          <FormSelect label="敏感词属性3" value={minGanShuXing3} onChange={setMinGanShuXing3}
+            options={minGanOptions} />
+          {showLiquid && <FormInput label="液体容量（ml）" value={yeTiRongLiang} onChange={setYeTiRongLiang}
+            placeholder="如：100" type="number" />}
+          {showKnife && (
+            <>
+              <FormInput label="刀具长度(cm)" value={daoJuChangDu} onChange={setDaoJuChangDu}
+                placeholder="如：10" type="number" />
+              <FormInput label="刀尖角度(度)" value={daoJuJianDu} onChange={setDaoJuJianDu}
+                placeholder="如：30" type="number" />
+            </>
+          )}
+          {showBattery && <FormInput label="储电容量（wh）" value={chuDianRongLiang} onChange={setChuDianRongLiang}
+            placeholder="如：20" type="number" />}
+        </div>
+        {!showLiquid && !showKnife && !showBattery && (
+          <div className="mt-2 text-xs text-slate-500">无敏感属性则留空即可</div>
+        )}
+      </Section>
+
+      {/* 分组4：体积重量 */}
+      <Section title="体积重量">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <FormInput label="最长边（cm）" value={zuiChangBian} onChange={setZuiChangBian}
+            placeholder="10" type="number" />
+          <FormInput label="次长边（cm）" value={ciChangBian} onChange={setCiChangBian}
+            placeholder="8" type="number" />
+          <FormInput label="最短边（cm）" value={zuiDuanBian} onChange={setZuiDuanBian}
+            placeholder="2" type="number" />
+          <FormInput label="重量（g）" value={zhongLiang} onChange={setZhongLiang}
+            placeholder="30" type="number" />
+        </div>
+        <div className="mt-2 text-xs text-slate-500">
+          提示：体积重量影响运费计算，默认值适合小件饰品。如商品较大请根据实际测量值填写。
+        </div>
+      </Section>
+
+      {/* 保存按钮 */}
+      <div className="flex items-center justify-between">
+        <div className="text-xs text-slate-500">
+          {draft ? `草稿状态: ${draft.status} · 更新于 ${draft.updated_at}` : "暂无草稿"}
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => void loadDefaults()}
+            className="h-11 rounded-full border border-slate-200 bg-white px-5 text-sm text-slate-700 hover:bg-slate-50"
+            disabled={loading}
+          >
+            {loading ? "加载中..." : "重置"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void saveDefaults()}
+            className="h-11 rounded-full bg-slate-900 px-5 text-sm font-medium text-white hover:bg-slate-800"
+            disabled={saving}
+          >
+            {saving ? "保存中..." : "保存全部"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 表单组件：输入框
+function FormInput({
+  label, value, onChange, placeholder, type = "text"
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  type?: string;
+}) {
+  return (
+    <div>
+      <label className="block text-xs text-slate-600">{label}</label>
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="mt-1 h-10 w-full rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+      />
+    </div>
+  );
+}
+
+// 表单组件：下拉选择
+function FormSelect({
+  label, value, onChange, options
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+}) {
+  return (
+    <div>
+      <label className="block text-xs text-slate-600">{label}</label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="mt-1 h-10 w-full rounded-[14px] border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"
+      >
+        {options.map((opt) => (
+          <option key={opt} value={opt}>{opt || "（空）"}</option>
+        ))}
+      </select>
     </div>
   );
 }

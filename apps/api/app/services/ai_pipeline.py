@@ -38,6 +38,11 @@ def _now_iso() -> str:
 
 
 class ProductInfoOutput(BaseModel):
+    product_core_v2: dict[str, Any] = Field(default_factory=dict)
+    visual_facts: dict[str, Any] = Field(default_factory=dict)
+    category_basis: dict[str, Any] = Field(default_factory=dict)
+    image_generation_basis: dict[str, Any] = Field(default_factory=dict)
+    evidence: dict[str, Any] = Field(default_factory=dict)
     source_visible: dict[str, Any] = Field(default_factory=dict)
     product_core: dict[str, Any] = Field(default_factory=dict)
     category_search: dict[str, Any] = Field(default_factory=dict)
@@ -80,6 +85,14 @@ class TitlePackageLiteOutput(BaseModel):
     category_search_keywords: list[str] = Field(default_factory=list)
     suggested_category_search_query: str | None = None
     suggested_category_path_keywords: list[str] = Field(default_factory=list)
+
+
+class TitleEnOnlyOutput(BaseModel):
+    title_en: str
+    title_en_short: str | None = None
+    core_product_words: list[str] = Field(default_factory=list)
+    used_basis_fields: list[str] = Field(default_factory=list)
+    avoid_claims: list[str] = Field(default_factory=list)
 
 
 class PromptBundleItem(BaseModel):
@@ -360,15 +373,23 @@ def _get_prompt(
     return rendered, snapshot
 
 
-def _normalize_requested_steps(prompt_types: list[str] | None, generation_mode: str) -> set[str]:
+def _normalize_requested_steps(
+    prompt_types: list[str] | None,
+    generation_mode: str,
+    *,
+    include_product_info: bool,
+) -> set[str]:
+    normalized_mode = _normalize_generation_mode(generation_mode)
     if not prompt_types:
-        if generation_mode == GenerationMode.no_ai.value:
+        if normalized_mode == GenerationMode.task_only.value:
             return set()
-        if generation_mode == GenerationMode.title_only.value:
-            return {"title_package"}
-        wanted = {"product_info", "title_package"}
-        if generation_mode in {GenerationMode.title_and_image_prompts.value, GenerationMode.full_later.value}:
-            wanted.add("image_prompt_package")
+        if normalized_mode == GenerationMode.title_only.value:
+            return {"product_info", "title_package"} if include_product_info else {"title_package"}
+        # title_and_4grid mode: prompt package should also be prepared from the
+        # same product understanding + title/category context before 4-grid runs.
+        wanted = {"title_package", "image_prompt_package"}
+        if include_product_info:
+            wanted.add("product_info")
         return wanted
 
     wanted: set[str] = set()
@@ -378,6 +399,8 @@ def _normalize_requested_steps(prompt_types: list[str] | None, generation_mode: 
             wanted.add("product_info")
         elif token in {"title_en", "title_en_with_cn_translation", "title_package", "title_package_lite"}:
             wanted.add("title_package")
+        elif token in {"title_en_only"}:
+            wanted.add("title_en_only")
         elif token in {
             "image_prompt_package",
             "image_prompt_main",
@@ -391,6 +414,9 @@ def _normalize_requested_steps(prompt_types: list[str] | None, generation_mode: 
             wanted.add("image_prompt_package")
         elif token == "category_match":
             wanted.add("product_info")
+    if "title_en_only" in wanted:
+        wanted.discard("title_package")
+        wanted.discard("image_prompt_package")
     return wanted
 
 
@@ -401,33 +427,121 @@ def _has_valid_output(payload: Any) -> bool:
     return isinstance(output, dict) and bool(output)
 
 
-def _expand_wanted_with_dependencies(ai_row: ProductAIResult, wanted: set[str], generation_mode: str) -> set[str]:
+def _expand_wanted_with_dependencies(
+    ai_row: ProductAIResult,
+    wanted: set[str],
+    generation_mode: str,
+    *,
+    include_product_info: bool,
+) -> set[str]:
+    normalized_mode = _normalize_generation_mode(generation_mode)
     expanded = set(wanted)
     if "image_prompt_package" in expanded and not _has_valid_output(ai_row.title_package):
         expanded.add("title_package")
-    needs_product_info = "image_prompt_package" in expanded
-    if generation_mode != GenerationMode.title_only.value and "title_package" in expanded:
-        needs_product_info = True
+    # product_info only for title_and_4grid image enhancement, not for title_only manual 4grid
+    needs_product_info = (
+        include_product_info
+        and normalized_mode == GenerationMode.title_and_4grid.value
+        and "image_prompt_package" in expanded
+    )
     if needs_product_info and not _has_valid_output(ai_row.product_info):
+        expanded.add("product_info")
+    if include_product_info and "title_en_only" in expanded and not _has_valid_output(ai_row.product_info):
         expanded.add("product_info")
     return expanded
 
 
+def _normalize_generation_mode(mode: str | None) -> str:
+    token = str(mode or "").strip()
+    if token in {GenerationMode.task_only.value, GenerationMode.no_ai.value}:
+        return GenerationMode.task_only.value
+    if token == GenerationMode.title_only.value:
+        return GenerationMode.title_only.value
+    return GenerationMode.title_and_4grid.value
+
+
 def _normalize_product_info(output: ProductInfoOutput) -> ProductInfoOutput:
     if output.temu_category_search:
-        return output
-    merged = dict(output.category_search or {})
-    raw_category_path = output.source_visible.get("page_path") or ""
-    output.temu_category_search = {
-        "raw_category_path_cn": raw_category_path,
-        "category_terms_cn": list(merged.get("terms_cn") or []),
-        "category_terms_en": list(merged.get("terms_en") or []),
-        "core_leaf_terms_cn": [merged.get("core_leaf_term")] if merged.get("core_leaf_term") else [],
-        "core_leaf_terms_en": [],
-        "parent_terms_cn": list(merged.get("parent_terms") or []),
-        "exclude_terms_cn": list(merged.get("exclude_terms") or []),
-        "search_priority": ["raw_category_path_cn", "core_leaf_terms_cn", "category_terms_cn", "category_terms_en"],
-    }
+        pass
+    else:
+        merged = dict(output.category_search or {})
+        raw_category_path = output.source_visible.get("page_path") or ""
+        output.temu_category_search = {
+            "raw_category_path_cn": raw_category_path,
+            "category_terms_cn": list(merged.get("terms_cn") or []),
+            "category_terms_en": list(merged.get("terms_en") or []),
+            "core_leaf_terms_cn": [merged.get("core_leaf_term")] if merged.get("core_leaf_term") else [],
+            "core_leaf_terms_en": [],
+            "parent_terms_cn": list(merged.get("parent_terms") or []),
+            "exclude_terms_cn": list(merged.get("exclude_terms") or []),
+            "search_priority": ["raw_category_path_cn", "core_leaf_terms_cn", "category_terms_cn", "category_terms_en"],
+        }
+
+    # v2 normalized structure for downstream title/category/image tasks
+    pc = output.product_core if isinstance(output.product_core, dict) else {}
+    ib = output.image_basis if isinstance(output.image_basis, dict) else {}
+    tb = output.title_basis if isinstance(output.title_basis, dict) else {}
+    tc = output.temu_category_search if isinstance(output.temu_category_search, dict) else {}
+    ev_notes = output.evidence_notes if isinstance(output.evidence_notes, list) else []
+    visible_opts = output.source_visible.get("visible_options") if isinstance(output.source_visible, dict) else []
+    if not isinstance(visible_opts, list):
+        visible_opts = []
+
+    if not output.product_core_v2:
+        output.product_core_v2 = {
+            "product_subject": str(pc.get("actual_selling_subject") or pc.get("product_name_en") or pc.get("product_name_cn") or "").strip(),
+            "product_type": str(pc.get("product_type_en") or pc.get("product_type_cn") or "").strip(),
+            "product_form": str(pc.get("visual_structure") or "").strip(),
+            "is_set_or_pack": bool(pc.get("set_or_pack") or False),
+            "pack_count": str(output.source_visible.get("quantity_hint") or ib.get("subject_count") or "").strip() if isinstance(output.source_visible, dict) else "",
+            "target_gender": [],
+            "target_age_group": [],
+            "usage_scenarios": [str(pc.get("usage_scene") or "").strip()] if str(pc.get("usage_scene") or "").strip() else [],
+            "style_tags": [str(x).strip() for x in (pc.get("style_keywords") or []) if str(x).strip()] if isinstance(pc.get("style_keywords"), list) else [],
+        }
+
+    if not output.visual_facts:
+        output.visual_facts = {
+            "visible_colors": [str(pc.get("main_color") or "").strip()] if str(pc.get("main_color") or "").strip() else [],
+            "visible_material_like": [],
+            "visible_shapes": [str(pc.get("main_shape") or "").strip()] if str(pc.get("main_shape") or "").strip() else [],
+            "visible_structures": [str(pc.get("visual_structure") or "").strip()] if str(pc.get("visual_structure") or "").strip() else [],
+            "visible_patterns": [],
+            "visible_accessories": [],
+            "dominant_view_type": "",
+            "composition_notes": [str(x).strip() for x in visible_opts if str(x).strip()],
+        }
+
+    if not output.category_basis:
+        output.category_basis = {
+            "category_basis_cn": [str(x).strip() for x in (tc.get("category_terms_cn") or []) if str(x).strip()],
+            "category_basis_en": [str(x).strip() for x in (tc.get("category_terms_en") or []) if str(x).strip()],
+            "leaf_preferred_terms_cn": [str(x).strip() for x in (tc.get("core_leaf_terms_cn") or []) if str(x).strip()],
+            "exclude_category_terms": [str(x).strip() for x in (tc.get("exclude_terms_cn") or []) if str(x).strip()],
+            "category_conflict_notes": [],
+        }
+
+    if not output.image_generation_basis:
+        output.image_generation_basis = {
+            "main_subject": str(ib.get("main_subject") or output.product_core_v2.get("product_subject") or "").strip(),
+            "must_keep_elements": [str(x).strip() for x in (ib.get("required_visible_features") or []) if str(x).strip()],
+            "must_avoid_elements": [str(x).strip() for x in (ib.get("avoid_elements") or []) if str(x).strip()],
+            "consistent_variant_rules": [],
+            "selling_point_candidates": [str(x).strip() for x in (tb.get("must_include") or []) if str(x).strip()],
+            "sku_axes": [],
+            "dimension_candidates": [str(x).strip() for x in (output.dimension_basis.get("suggested_measurement_items") or []) if str(x).strip()] if isinstance(output.dimension_basis, dict) else [],
+            "four_grid_plan": {},
+        }
+
+    if not output.evidence:
+        output.evidence = {
+            "from_title": [],
+            "from_attributes": [],
+            "from_sku_text": [],
+            "from_screenshot": [],
+            "from_images": [],
+            "uncertain_points": [str(x).strip() for x in ev_notes if str(x).strip()],
+        }
     return output
 
 
@@ -446,6 +560,151 @@ def _build_title_quality_guardrail(*, raw_title: str, product_info: ProductInfoO
         f"8) Product core hints: {json.dumps(product_core, ensure_ascii=False)}\n"
         f"9) Title basis hints: {json.dumps(title_basis, ensure_ascii=False)}\n"
     )
+
+
+def _list_texts(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _build_dynamic_image_prompt_package(
+    *,
+    raw: RawProduct,
+    task: ProductTask,
+    product_info: ProductInfoOutput,
+    title_package: TitlePackageOutput,
+) -> dict[str, Any]:
+    product_info_payload = product_info.model_dump()
+    product_core_v2 = product_info_payload.get("product_core_v2") if isinstance(product_info_payload.get("product_core_v2"), dict) else {}
+    visual_facts = product_info_payload.get("visual_facts") if isinstance(product_info_payload.get("visual_facts"), dict) else {}
+    image_generation_basis = (
+        product_info_payload.get("image_generation_basis")
+        if isinstance(product_info_payload.get("image_generation_basis"), dict)
+        else {}
+    )
+    title_basis = product_info_payload.get("title_basis") if isinstance(product_info_payload.get("title_basis"), dict) else {}
+    category_path = str(task.selected_category_id or "").strip()
+    product_info_context = {
+        "product_subject": str(product_core_v2.get("product_subject") or image_generation_basis.get("main_subject") or "").strip(),
+        "product_type": str(product_core_v2.get("product_type") or "").strip(),
+        "core_product_words": _list_texts(title_package.core_product_words),
+        "attribute_words": _list_texts(title_basis.get("must_include")),
+        "structure_words": _list_texts(visual_facts.get("visible_structures")),
+        "scene_words": _list_texts(product_core_v2.get("usage_scenarios")),
+        "style_tags": _list_texts(product_core_v2.get("style_tags")),
+        "visible_colors": _list_texts(visual_facts.get("visible_colors")),
+        "visible_shapes": _list_texts(visual_facts.get("visible_shapes")),
+        "must_keep_elements": _list_texts(image_generation_basis.get("must_keep_elements")),
+        "must_avoid_elements": _list_texts(image_generation_basis.get("must_avoid_elements")),
+        "selling_point_candidates": _list_texts(image_generation_basis.get("selling_point_candidates")),
+        "sku_axes": _list_texts(image_generation_basis.get("sku_axes")),
+        "dimension_candidates": _list_texts(image_generation_basis.get("dimension_candidates")),
+    }
+    title_en_package = {
+        "title_en": title_package.title_en,
+        "title_cn_translation": title_package.title_cn_translation,
+        "title_en_short": title_package.title_en_short,
+    }
+    shared_context = {
+        "selected_category_path": category_path,
+        "title_package": title_package.model_dump(),
+        "title_en_with_cn_translation": title_en_package,
+        "selling_points": _list_texts(title_package.selling_points),
+        "product_info_context": product_info_context,
+        "reference_images": {
+            "main_image": raw.main_image or "",
+            "main_images": (raw.main_images or [])[:3],
+            "carousel_images": (raw.carousel_images or [])[:3],
+            "detail_images": (raw.detail_images or [])[:2],
+            "size_chart_images": (raw.size_chart_images or [])[:2],
+            "screenshot_url": raw.screenshot_url or "",
+        },
+    }
+    slot_contexts = {
+        "carousel_4grid": {
+            "prompt_type": "image_prompt_carousel_4grid",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "selling_points",
+                "product_info_context.product_subject",
+                "product_info_context.structure_words",
+                "product_info_context.scene_words",
+                "product_info_context.must_keep_elements",
+                "product_info_context.must_avoid_elements",
+            ],
+        },
+        "carousel_1": {
+            "prompt_type": "image_prompt_carousel_1",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "product_info_context.product_subject",
+                "product_info_context.structure_words",
+                "product_info_context.visible_colors",
+            ],
+        },
+        "carousel_2": {
+            "prompt_type": "image_prompt_carousel_2",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "product_info_context.must_keep_elements",
+                "product_info_context.structure_words",
+            ],
+        },
+        "carousel_3": {
+            "prompt_type": "image_prompt_carousel_3",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "product_info_context.scene_words",
+                "product_info_context.must_avoid_elements",
+            ],
+        },
+        "carousel_4": {
+            "prompt_type": "image_prompt_carousel_4",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "selling_points",
+                "product_info_context.selling_point_candidates",
+            ],
+        },
+        "sku_image": {
+            "prompt_type": "image_prompt_main",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "product_info_context.product_subject",
+                "product_info_context.visible_colors",
+                "product_info_context.sku_axes",
+            ],
+        },
+        "size_chart": {
+            "prompt_type": "image_prompt_dimension",
+            "mode": "render_template_only",
+            "basis_fields": [
+                "selected_category_path",
+                "title_en_with_cn_translation",
+                "product_info_context.dimension_candidates",
+            ],
+        },
+    }
+    return {
+        "mode": "dynamic_context_only",
+        "generator": "code.dynamic_image_prompt_context",
+        "note": "此步骤只生成图片提示词动态上下文与模板变量，不调用图片提示词 AI。",
+        "shared_context": shared_context,
+        "slot_contexts": slot_contexts,
+    }
 
 
 def _split_category_seed_text(text: str | None) -> list[str]:
@@ -665,7 +924,17 @@ def run_ai_pipeline_for_task(
     client = get_openai_client(session)
     runtime = resolve_text_runtime(session)
     ai_row = _ensure_ai_row(session, task_id=task_id)
-    wanted = _expand_wanted_with_dependencies(ai_row, _normalize_requested_steps(prompt_types, task.generation_mode), task.generation_mode)
+    normalized_mode = _normalize_generation_mode(task.generation_mode)
+    wanted = _expand_wanted_with_dependencies(
+        ai_row,
+        _normalize_requested_steps(
+            prompt_types,
+            normalized_mode,
+            include_product_info=bool(task.include_product_info),
+        ),
+        normalized_mode,
+        include_product_info=bool(task.include_product_info),
+    )
     text_pricing = _resolve_text_pricing(session, runtime)
     provider_meta = {
         "provider_source": runtime.get("provider_source"),
@@ -685,7 +954,7 @@ def run_ai_pipeline_for_task(
 
     task.main_status = TaskMainStatus.ai_running.value
     task.category_status = CategoryStatus.running.value
-    task.title_status = TitleStatus.running.value if "title_package" in wanted else TitleStatus.pending.value
+    task.title_status = TitleStatus.running.value if ("title_package" in wanted or "title_en_only" in wanted) else TitleStatus.pending.value
     task.image_prompt_status = (
         ImagePromptStatus.running.value if "image_prompt_package" in wanted else ImagePromptStatus.pending.value
     )
@@ -759,12 +1028,54 @@ def run_ai_pipeline_for_task(
                 product_info_out = _normalize_product_info(ProductInfoOutput.model_validate(existing_out))
 
         title_package_out: TitlePackageOutput | None = None
-        if "title_package" in wanted:
-            title_prompt_type = (
-                "title_package_lite"
-                if task.generation_mode == GenerationMode.title_only.value
-                else "title_package"
+        if "title_en_only" in wanted:
+            title_en_only_input = {
+                "raw_title": raw.title,
+                "title": raw.title,
+                "product_info": product_info_out.model_dump() if isinstance(product_info_out, ProductInfoOutput) else {},
+                "attributes_text": raw.attributes_text or "",
+                "sku_text": raw.sku_text or "",
+                "platform": raw.platform or task.product_platform or "general",
+                "target_language": "en",
+            }
+            rendered_prompt, prompt_meta = _get_prompt(
+                session,
+                prompt_type="title_en_only",
+                task=task,
+                category_id=task.selected_category_id,
+                variables=title_en_only_input,
             )
+            ai_row.prompt_snapshot = {**(ai_row.prompt_snapshot or {}), "title_en_only": prompt_meta}
+            if isinstance(product_info_out, ProductInfoOutput):
+                rendered_prompt = f"{rendered_prompt}\n\n{_build_title_quality_guardrail(raw_title=raw.title, product_info=product_info_out)}"
+            started = time.time()
+            parsed, usage = _parse_with_fallback(
+                client=client,
+                model_name=model,
+                system_prompt=rendered_prompt,
+                user_input=title_en_only_input,
+                schema=TitleEnOnlyOutput,
+            )
+            ai_row.title_en = _snapshot(
+                prompt=rendered_prompt,
+                model=model,
+                input_obj=title_en_only_input,
+                output_obj=parsed.model_dump(),
+                started_at=started,
+                usage=usage,
+                cost=_estimate_text_cost(text_pricing, usage),
+                provider=provider_meta,
+            )
+            task.title_status = TitleStatus.success.value
+            task.main_status = TaskMainStatus.prompts_ready.value
+            clear_task_exception(task, code="ai_pipeline_failed")
+            session.add(ai_row)
+            session.add(task)
+            session.commit()
+            return
+
+        if "title_package" in wanted:
+            title_prompt_type = "title_package_lite"
             title_input = {
                 "raw_title": raw.title,
                 "title": raw.title,
@@ -785,8 +1096,7 @@ def run_ai_pipeline_for_task(
                 variables=title_input,
             )
             ai_row.prompt_snapshot = {**(ai_row.prompt_snapshot or {}), "title_package": prompt_meta}
-            if isinstance(product_info_out, ProductInfoOutput):
-                rendered_prompt = f"{rendered_prompt}\n\n{_build_title_quality_guardrail(raw_title=raw.title, product_info=product_info_out)}"
+            # product_info 不参与标题质量护栏（产品口径）
             started = time.time()
             title_schema: type[BaseModel] = (
                 TitlePackageLiteOutput
@@ -823,12 +1133,15 @@ def run_ai_pipeline_for_task(
             if isinstance(existing_out, dict):
                 title_package_out = TitlePackageOutput.model_validate(existing_out)
 
-        category_candidates, category_debug = _build_category_candidates(
-            raw=raw,
-            product_info=product_info_out,
-            title_package=title_package_out,
-            prefer_cn_keywords=task.generation_mode == GenerationMode.title_only.value,
-        )
+        category_candidates: list[dict[str, Any]] = []
+        category_debug: dict[str, Any] = {}
+        if isinstance(title_package_out, TitlePackageOutput):
+            category_candidates, category_debug = _build_category_candidates(
+                raw=raw,
+                product_info=product_info_out,
+                title_package=title_package_out,
+                prefer_cn_keywords=True,
+            )
         selected_candidate = category_candidates[0]["path"] if category_candidates else ""
         top_score = float(category_candidates[0].get("score") or 0.0) if category_candidates else 0.0
         confidence = round(min(0.99, max(0.0, top_score / 3.0)), 3) if category_candidates else 0.0
@@ -875,7 +1188,7 @@ def run_ai_pipeline_for_task(
             "output": category_output,
         }
 
-        if task.generation_mode == GenerationMode.title_only.value:
+        if normalized_mode == GenerationMode.title_only.value:
             task.image_prompt_status = ImagePromptStatus.pending.value
             task.main_status = TaskMainStatus.prompts_ready.value
             session.add(ai_row)
@@ -888,51 +1201,35 @@ def run_ai_pipeline_for_task(
                 raise RuntimeError("Missing title_package output (cannot continue)")
             if product_info_out is None:
                 raise RuntimeError("Missing product_info output (cannot continue)")
+            started = time.time()
             image_prompt_input = {
-                "raw_title": raw.title,
-                "title": raw.title,
                 "selected_category_path": task.selected_category_id or "",
-                "category_path": task.selected_category_id or "",
                 "product_info": product_info_out.model_dump(),
                 "title_package": title_package_out.model_dump(),
-                "title_en_with_cn_translation": {
-                    "title_en": title_package_out.title_en,
-                    "title_cn_translation": title_package_out.title_cn_translation,
-                    "title_en_short": title_package_out.title_en_short,
-                },
-                "reference_images": {
+                "raw_images": {
                     "main_image": raw.main_image or "",
                     "main_images": (raw.main_images or [])[:3],
                     "carousel_images": (raw.carousel_images or [])[:3],
-                    "detail_images": (raw.detail_images or [])[:1],
+                    "detail_images": (raw.detail_images or [])[:2],
+                    "size_chart_images": (raw.size_chart_images or [])[:2],
+                    "screenshot_url": raw.screenshot_url or "",
                 },
             }
-            rendered_prompt, prompt_meta = _get_prompt(
-                session,
-                prompt_type="image_prompt_package",
+            image_prompt_out = _build_dynamic_image_prompt_package(
+                raw=raw,
                 task=task,
-                category_id=task.selected_category_id,
-                variables=image_prompt_input,
+                product_info=product_info_out,
+                title_package=title_package_out,
             )
-            ai_row.prompt_snapshot = {**(ai_row.prompt_snapshot or {}), "image_prompt_package": prompt_meta}
-            started = time.time()
-            parsed, usage = _parse_with_fallback(
-                client=client,
-                model_name=model,
-                system_prompt=rendered_prompt,
-                user_input=image_prompt_input,
-                schema=ImagePromptPackageOutput,
-            )
-            image_prompt_out = parsed
             ai_row.image_prompt_package = _snapshot(
-                prompt=rendered_prompt,
-                model=model,
+                prompt="dynamic_image_prompt_context",
+                model="code.dynamic_image_prompt_context",
                 input_obj=image_prompt_input,
-                output_obj=image_prompt_out.model_dump(),
+                output_obj=image_prompt_out,
                 started_at=started,
-                usage=usage,
-                cost=_estimate_text_cost(text_pricing, usage),
-                provider=provider_meta,
+                usage={},
+                cost={},
+                provider={"provider_source": "code", "provider_name": "dynamic_image_prompt_context"},
             )
             task.image_prompt_status = ImagePromptStatus.ready.value
         else:

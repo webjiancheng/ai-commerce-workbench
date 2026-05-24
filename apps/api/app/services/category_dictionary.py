@@ -32,6 +32,16 @@ def _leaf_from_path(path: str) -> str:
     return parts[-1] if parts else path
 
 
+def _is_displayable_category_path(path: str) -> bool:
+    text = str(path or "").strip()
+    if not text:
+        return False
+    if text.isdigit():
+        return False
+    return ">" in text or bool(re.search(r"[\u4e00-\u9fffA-Za-z]", text))
+
+
+@lru_cache(maxsize=1)
 def _unique_category_paths() -> list[str]:
     dictionary = load_temu_category_dictionary()
     seen: set[str] = set()
@@ -41,17 +51,18 @@ def _unique_category_paths() -> list[str]:
             continue
         for path in candidates:
             path_text = str(path or "").strip()
-            if not path_text or path_text in seen:
+            if not _is_displayable_category_path(path_text) or path_text in seen:
                 continue
             seen.add(path_text)
             paths.append(path_text)
-    return sorted(paths, key=lambda item: (len(item), item))
+    # Sort by path (alphabetically) to ensure consistent ordering
+    return sorted(paths)
 
 
 @lru_cache(maxsize=1)
 def load_temu_category_dictionary() -> dict[str, list[str]]:
     repo_root = Path(__file__).resolve().parents[4]
-    dictionary_path = repo_root / "temu_category_review_dict.json"
+    dictionary_path = repo_root / "data" / "temu_category_review_dict.json"
     with dictionary_path.open("r", encoding="utf-8") as file:
         payload = json.load(file)
     dictionary = payload.get("dictionary")
@@ -91,6 +102,8 @@ def recall_category_candidates(
 
         for path in paths[:5]:
             path_lc = path.lower()
+            if not _is_displayable_category_path(path):
+                continue
             leaf_lc = _leaf_from_path(path).lower()
             score = 0.0
 

@@ -30,6 +30,15 @@ def get_export_field_draft(session: Session, *, task_id: int) -> ExportFieldDraf
 
 
 def apply_default_rules(session: Session, *, task: ProductTask) -> ExportFieldDraft:
+    return apply_default_rules_with_options(session, task=task, selected_rule_id=None)
+
+
+def apply_default_rules_with_options(
+    session: Session,
+    *,
+    task: ProductTask,
+    selected_rule_id: int | None,
+) -> ExportFieldDraft:
     existing = get_export_field_draft(session, task_id=task.id)
     fields: dict[str, Any] = {}
     sources: dict[str, Any] = {}
@@ -50,11 +59,14 @@ def apply_default_rules(session: Session, *, task: ProductTask) -> ExportFieldDr
         _set_field(fields, sources, warnings, key=k, value=v, source_meta=base_sources.get(k), priority="product_override", locked=locked_fields)
 
     # Apply enabled rules (priority desc)
-    rules = session.scalars(
+    rules_query = (
         select(DefaultRule)
         .where(DefaultRule.enabled.is_(True))
         .order_by(DefaultRule.priority.desc(), DefaultRule.updated_at.desc(), DefaultRule.id.desc())
-    ).all()
+    )
+    if selected_rule_id is not None:
+        rules_query = rules_query.where(DefaultRule.id == selected_rule_id)
+    rules = session.scalars(rules_query).all()
 
     context = _build_context(session, task=task, base_fields=fields)
     for rule in rules:
@@ -63,7 +75,7 @@ def apply_default_rules(session: Session, *, task: ProductTask) -> ExportFieldDr
             continue
         if not _match_rule(rule, context):
             continue
-        out = rule.output_json or {}
+        out = rule.values_json or rule.output_json or {}
         if not isinstance(out, dict):
             continue
         for k, v in out.items():
@@ -352,6 +364,9 @@ def _build_context(session: Session, *, task: ProductTask, base_fields: dict[str
 
     return {
         "task_id": task.id,
+        "platform": (task.product_platform or (raw.platform if raw else "") or "").strip().lower(),
+        "site": str((base_fields.get("site") or "")).strip().lower(),
+        "fulfillment_mode": str((base_fields.get("fulfillment_mode") or "")).strip().lower(),
         "selected_category_id": task.selected_category_id or category_path,
         "category_path": category_path,
         "title": title,
@@ -379,9 +394,20 @@ def _rule_priority_key(rule: DefaultRule) -> str:
 
 
 def _match_rule(rule: DefaultRule, ctx: dict[str, Any]) -> bool:
-    match = rule.match_json or {}
+    match = rule.conditions_json or rule.match_json or {}
     if not isinstance(match, dict):
         return False
+
+    if rule.platform and str(ctx.get("platform") or "").strip().lower() != str(rule.platform).strip().lower():
+        return False
+    if rule.site and str(ctx.get("site") or "").strip().lower() != str(rule.site).strip().lower():
+        return False
+    if rule.fulfillment_mode and str(ctx.get("fulfillment_mode") or "").strip().lower() != str(rule.fulfillment_mode).strip().lower():
+        return False
+    if rule.category_path:
+        hay = str(ctx.get("category_path") or "").strip().lower()
+        if str(rule.category_path).strip().lower() not in hay:
+            return False
 
     # global: always match when no constraints
     if not match:

@@ -54,7 +54,7 @@
   -> Chrome 插件采集标题/价格/图片/视频/截图/属性
   -> POST /sync/screenshot 上传截图
   -> POST /api/raw-products 写入 raw_products
-  -> 在前端“原始采集数据”页筛选、拆分、修正图片
+  -> 在前端”原始采集数据”页筛选、拆分、修正图片
   -> 单条或批量创建 product_tasks
   -> 后台 bootstrap 异步执行 AI 流程
      -> 商品理解
@@ -64,6 +64,13 @@
   -> 任务进入 review_ready，供人工检查
   -> 按需触发图片生成 / 默认值补齐 / 导出字段预览
   -> POST /api/exports/run 导出 Excel
+
+（备选路径）外部 AI JSON 导入
+  -> 上传 Temu 原始模板
+  -> 外部 AI 输出 JSON（headers/rows/common_fields）
+  -> POST /api/exports/ai-imports/parse 解析校验
+  -> 可选 PATCH draft 修正数据
+  -> POST /api/exports/ai-imports/{batch_id}/export 回写 Excel
 ```
 
 ## 6. 当前真实实现状态
@@ -91,7 +98,7 @@
 - `export_fields`
 - `export_templates`
 - `export_mappings`
-- `exports`
+- `exports`（含 AI 外部导入）
 - `exceptions`
 - `dashboard`
 - `batch_ops`
@@ -100,6 +107,21 @@
 - `settings`
 - `system_health`
 - `health`
+- `ai_imports`
+
+### AI 外部导入相关路由
+- `POST /api/exports/ai-imports/upload-template` — 上传原始模板
+- `POST /api/exports/ai-imports/parse` — 解析外部 AI JSON
+- `GET /api/exports/ai-imports` — 查看批次列表
+- `GET /api/exports/ai-imports/{batch_id}` — 查看草稿详情
+- `PATCH /api/exports/ai-imports/{batch_id}/draft` — 修改草稿后提交
+- `POST /api/exports/ai-imports/{batch_id}/export` — 执行导出
+
+### 批量操作与队列相关路由
+- `POST /api/product-tasks/batch/estimate-image-cost` — 批量预估图片费用
+- `POST /api/product-tasks/batch/retry-failed` — 批量重试失败图片任务
+- `POST /api/assets/{asset_id}/add-to-batch-edit` — 添加图片资产到编辑队列
+- `GET /api/batch-edit-queue` — 查看批量编辑队列
 
 ### 文档与代码的偏差
 - `apps/api/README.md` 仍在讲“phase-2”，但代码里的 `current_phase` 默认值已经是 `phase-5`。
@@ -149,8 +171,16 @@
 - `cost_config / cost_record / usage_limit`
   - 成本控制与限额相关。
 
+### 批量编辑与 AI 导入层
+- `batch_edit_queue`
+  - 异步图片资产编辑队列，支持 `operation_type` + `payload_json`。
+  - 状态：`queued / processing / done / failed`。
+- `ai_import_batches / ai_import_drafts`
+  - AI 外部导入批次：存储外部 JSON 解析结果、校验警告、导出文件路径。
+  - 状态：`uploaded / parsed / confirmed / exported`。
+
 ## 8. 商品任务生成的真实行为
-基于 `docs/generate-task-backend-flow.md` 和现有代码，当前“生成任务”后的后台行为如下：
+基于 `docs/generation-mode-flow.md` 和现有代码，当前“生成任务”后的后台行为如下：
 
 1. 创建一条 `product_tasks` 记录。
 2. 异步执行 bootstrap。
@@ -262,6 +292,9 @@
 - `task_exceptions.py / exceptions.py`
   - 异常收敛和排查。
 - `costing.py / cost_configs.py / usage_limits.py`
+  - 费用预估、配置与记录。
+- `ai_imports.py`
+  - 外部 AI JSON 解析、校验、Excel 回写。
   - 成本、额度、限制逻辑。
 
 ### 图片 provider
@@ -351,12 +384,13 @@ createdb ai_caiji
 如果重新接手这个项目，优先阅读顺序建议：
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/generate-task-backend-flow.md`
-4. `apps/api/app/main.py`
-5. `apps/api/app/services/`
-6. `apps/web/src/app/product-tasks/page.tsx`
-7. `apps/web/src/app/raw-products/page.tsx`
-8. `chrome-extension/content.js`
+3. `docs/generation-mode-flow.md` ← 三种生成模式与完整流程
+4. `docs/generation-mode-flow.md`
+5. `apps/api/app/main.py`
+6. `apps/api/app/services/`
+7. `apps/web/src/app/product-tasks/page.tsx`
+8. `apps/web/src/app/raw-products/page.tsx`
+9. `chrome-extension/content.js`
 
 ### 需要牢记的判断
 - 这是“本地工作台 + 插件 + Excel 导出”的项目，不是纯 SaaS 后台。

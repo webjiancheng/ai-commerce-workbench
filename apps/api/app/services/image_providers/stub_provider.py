@@ -18,6 +18,7 @@ class StubImageProvider:
         size: str,
         model: str,
         extra_options: dict | None = None,
+        provider_options: dict | None = None,
     ) -> GeneratedImage:
         width, height = _parse_size(size)
         seed = hashlib.sha256((prompt + "|" + model + "|" + size).encode("utf-8")).hexdigest()
