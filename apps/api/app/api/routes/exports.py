@@ -9,8 +9,10 @@ from app.db.session import get_db_session
 from app.models.export_batch import ExportBatch
 from app.schemas.ai_import import AiImportBatchOut, AiImportDraftOut
 from app.schemas.export_batch import ExportBatchOut
+from app.services.export_adapters.registry import list_export_adapters
 from app.services.ai_imports import (
     create_ai_import_batch,
+    ensure_ai_import_draft,
     export_ai_import_batch,
     get_ai_import_batch,
     get_ai_import_draft,
@@ -30,6 +32,8 @@ class ExportRunRequest(BaseModel):
     product_task_ids: list[int] = Field(default_factory=list)
     template_id: int | None = None
     default_rule_id: int | None = None
+    adapter_key: str | None = None
+    export_only_valid: bool = True
 
 
 class AiImportParseRequest(BaseModel):
@@ -53,7 +57,7 @@ class AiImportSupplementRequest(BaseModel):
 
 
 class TemplateMetaRequest(BaseModel):
-    template_file_path: str = Field(min_length=1)
+    template_file_path: str | None = None
 
 
 @router.post("/api/exports/preview")
@@ -69,6 +73,7 @@ def preview_exports_endpoint(
             product_task_ids=payload.product_task_ids,
             template_id=payload.template_id,
             default_rule_id=payload.default_rule_id,
+            adapter_key=payload.adapter_key,
         )
         return {"ok": True, **out}
     except Exception as exc:
@@ -88,6 +93,8 @@ def run_exports_endpoint(
             product_task_ids=payload.product_task_ids,
             template_id=payload.template_id,
             default_rule_id=payload.default_rule_id,
+            adapter_key=payload.adapter_key,
+            export_only_valid=payload.export_only_valid,
         )
         batch = out["batch"]
         return {
@@ -107,6 +114,11 @@ def list_export_history_endpoint(
 ) -> list[ExportBatchOut]:
     batches = session.scalars(select(ExportBatch).order_by(ExportBatch.created_at.desc()).limit(limit)).all()
     return [ExportBatchOut.model_validate(b) for b in batches]
+
+
+@router.get("/api/exports/adapters")
+def list_export_adapters_endpoint() -> dict[str, object]:
+    return {"ok": True, "items": list_export_adapters()}
 
 
 @router.get("/api/exports/{batch_id}/download")
@@ -139,7 +151,10 @@ async def upload_ai_import_template_endpoint(file: UploadFile = File(...)) -> di
 @router.post("/api/exports/ai-imports/template-meta")
 def parse_ai_import_template_meta_endpoint(payload: TemplateMetaRequest = Body(...)) -> dict[str, object]:
     try:
-        meta = parse_template_meta(template_file_path=payload.template_file_path)
+        from app.services.temu_upload_template import get_builtin_temu_upload_template_path
+
+        template_path = payload.template_file_path or get_builtin_temu_upload_template_path()
+        meta = parse_template_meta(template_file_path=template_path)
         return {"ok": True, "meta": meta}
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -180,7 +195,7 @@ def get_ai_import_endpoint(batch_id: int, session: Session = Depends(get_db_sess
     batch = get_ai_import_batch(session, batch_id=batch_id)
     if batch is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI import batch not found")
-    draft = get_ai_import_draft(session, batch_id=batch_id)
+    draft = ensure_ai_import_draft(session, batch=batch)
     return {
         "ok": True,
         "batch": AiImportBatchOut.model_validate(batch),
@@ -245,9 +260,7 @@ def supplement_ai_import_draft_endpoint(
     batch = get_ai_import_batch(session, batch_id=batch_id)
     if batch is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI import batch not found")
-    draft = get_ai_import_draft(session, batch_id=batch_id)
-    if draft is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found for this batch")
+    draft = ensure_ai_import_draft(session, batch=batch)
     try:
         supplemented = supplement_draft_with_defaults(
             session,

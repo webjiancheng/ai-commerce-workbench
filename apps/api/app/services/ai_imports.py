@@ -5,16 +5,33 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from openpyxl import load_workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.ai_import_batch import AiImportBatch
 from app.models.ai_import_draft import AiImportDraft
+from app.services.export_adapters.registry import get_export_adapter
+from app.services.listing_validation import validate_task_payload
+from app.services.temu_upload_template import (
+    get_builtin_temu_upload_template_path,
+    normalize_listing_field_key,
+    normalize_listing_fields,
+    parse_template_meta as parse_temu_template_meta,
+)
 
 
 IMAGE_FIELD_KEYWORDS = ("图", "图片", "视频", "预览图", "轮播图", "详情图文")
+
+
+def _resolve_template_file_path(template_file_path: str | None) -> str:
+    if template_file_path and str(template_file_path).strip():
+        return str(template_file_path).strip()
+    return get_builtin_temu_upload_template_path()
+
+
+def _new_ai_import_batch_no(batch_id: int) -> str:
+    return f"ai-import-{batch_id}-{uuid.uuid4().hex[:8]}"
 
 
 def list_ai_import_batches(session: Session, *, limit: int = 20) -> list[AiImportBatch]:
@@ -27,6 +44,46 @@ def get_ai_import_batch(session: Session, *, batch_id: int) -> AiImportBatch | N
 
 def get_ai_import_draft(session: Session, *, batch_id: int) -> AiImportDraft | None:
     return session.scalar(select(AiImportDraft).where(AiImportDraft.batch_id == batch_id).limit(1))
+
+
+def ensure_ai_import_draft(session: Session, *, batch: AiImportBatch) -> AiImportDraft:
+    draft = get_ai_import_draft(session, batch_id=batch.id)
+    if draft is not None:
+        return draft
+
+    headers = [str(x).strip() for x in (batch.parsed_headers_json or []) if str(x).strip()]
+    rows = batch.parsed_rows_json or []
+    common_fields = batch.parsed_common_fields_json or {}
+    normalized_common = _normalize_ai_common_fields(_stringify_common_fields(common_fields))
+    normalized_headers, normalized_rows = _normalize_ai_rows(headers, rows)
+    validation_result = batch.validation_result_json or _validate_headers_rows(normalized_headers, normalized_rows)
+    validation_result = _merge_validation(
+        validation_result,
+        _validate_against_template(
+            template_file_path=_resolve_template_file_path(batch.template_file_path),
+            common_fields=normalized_common,
+            headers=normalized_headers,
+            rows=normalized_rows,
+        ),
+    )
+
+    draft = AiImportDraft(
+        batch_id=batch.id,
+        common_fields_json=normalized_common,
+        headers_json=normalized_headers,
+        rows_json=normalized_rows,
+        field_settings_json=_build_field_settings(normalized_headers),
+        validation_result_json=validation_result,
+    )
+    session.add(draft)
+    batch.parsed_common_fields_json = normalized_common
+    batch.parsed_headers_json = normalized_headers
+    batch.parsed_rows_json = normalized_rows
+    batch.validation_result_json = validation_result
+    session.add(batch)
+    session.commit()
+    session.refresh(draft)
+    return draft
 
 
 # ─────────── 默认值补齐 ───────────
@@ -55,7 +112,7 @@ def get_default_rule_values(session: Session, *, rule_id: int | None = None) -> 
         return {}
 
     values: dict[str, str] = {}
-    raw = rule.values_json or {}
+    raw = normalize_listing_fields(rule.values_json or {}, keep_unknown=True, include_auxiliary=True)
     for k, v in raw.items():
         if v is not None and str(v).strip():
             values[str(k)] = str(v)
@@ -95,7 +152,7 @@ def get_product_task_values(session: Session, *, product_task_ids: list[int]) ->
         # 申报价格
         if task.price_usd:
             row["申报价格-美国站"] = str(task.price_usd)
-        result[str(task.id)] = row
+        result[str(task.id)] = normalize_listing_fields(row, keep_unknown=True, include_auxiliary=False)
 
     return result
 
@@ -164,7 +221,7 @@ def supplement_draft_with_defaults(
     draft.common_fields_json = common
 
     # ── 2b. 补充 rows ──
-    rows = [dict(r) for r in draft.rows_json]
+    rows = [normalize_listing_fields(dict(r), keep_unknown=True, include_auxiliary=False) for r in draft.rows_json]
     task_values_list = list(task_values_map.values())
 
     for row_idx, row in enumerate(rows):
@@ -206,11 +263,11 @@ def supplement_draft_with_defaults(
     # ── 2c. 重新校验 ──
     validation = _validate_supplemented_data(draft)
     batch = session.get(AiImportBatch, draft.batch_id)
-    if batch and batch.template_file_path:
+    if batch:
         validation = _merge_validation(
             validation,
             _validate_against_template(
-                template_file_path=batch.template_file_path,
+                template_file_path=_resolve_template_file_path(batch.template_file_path),
                 common_fields=draft.common_fields_json or {},
                 headers=draft.headers_json or [],
                 rows=draft.rows_json or [],
@@ -308,124 +365,26 @@ def save_uploaded_template(*, filename: str, content: bytes) -> tuple[str, str]:
 
 
 def parse_template_meta(*, template_file_path: str) -> dict[str, Any]:
-    """Extract prompt-critical template structure from Temu workbook."""
-    wb = load_workbook(template_file_path, data_only=True)
-    ws = wb["模版"] if "模版" in wb.sheetnames else wb[wb.sheetnames[0]]
-
-    common_row = 1
-    common_values_row = 2
-    header_row = 4
-    hint_row = 5
-
-    common_fields: list[str] = []
-    default_values: dict[str, str] = {}
-    detail_headers: list[str] = []
-    required_hints: list[str] = []
-
-    for col in range(1, ws.max_column + 1):
-        v = ws.cell(row=common_row, column=col).value
-        text = str(v).strip() if v is not None else ""
-        if text:
-            common_fields.append(text)
-            default_values[text] = str(ws.cell(row=common_values_row, column=col).value or "").strip()
-
-    for col in range(1, ws.max_column + 1):
-        h = ws.cell(row=header_row, column=col).value
-        header = str(h).strip() if h is not None else ""
-        if not header:
-            continue
-        detail_headers.append(header)
-        hint = str(ws.cell(row=hint_row, column=col).value or "").strip()
-        if hint:
-            required_hints.append(f"{header}: {hint}")
-
-    required_fields: list[str] = []
-    conditional_required_fields: list[str] = []
-    for col in range(1, ws.max_column + 1):
-        h = ws.cell(row=header_row, column=col).value
-        header = str(h).strip() if h is not None else ""
-        if not header:
-            continue
-        hint = str(ws.cell(row=hint_row, column=col).value or "").strip()
-        if not hint:
-            continue
-        if "条件必填" in hint:
-            conditional_required_fields.append(header)
-        elif "必填" in hint:
-            required_fields.append(header)
-
-    enum_options_map: dict[str, list[str]] = {}
-    if "KeyValueMap" in wb.sheetnames:
-        key_ws = wb["KeyValueMap"]
-        for col in range(1, ws.max_column + 1):
-            header = str(ws.cell(row=header_row, column=col).value or "").strip()
-            if not header:
-                continue
-            raw = key_ws.cell(row=1, column=col).value
-            raw_text = str(raw or "").strip()
-            if not raw_text or not raw_text.startswith("{"):
-                continue
-            try:
-                parsed = json.loads(raw_text)
-            except Exception:
-                continue
-            if isinstance(parsed, dict) and parsed:
-                enum_options_map[header] = [str(k) for k in parsed.keys()]
-
-    conditional_rules: list[dict[str, Any]] = []
-    if "PropertyRelateRequire" in wb.sheetnames and "HeaderKeyMap" in wb.sheetnames:
-        pr_ws = wb["PropertyRelateRequire"]
-        hk_ws = wb["HeaderKeyMap"]
-        header_key_by_col = {
-            col: str(hk_ws.cell(row=1, column=col).value or "").strip() for col in range(1, ws.max_column + 1)
-        }
-        header_label_by_col = {
-            col: str(ws.cell(row=header_row, column=col).value or "").strip() for col in range(1, ws.max_column + 1)
-        }
-        for r in range(1, pr_ws.max_row + 1):
-            raw = str(pr_ws.cell(row=r, column=1).value or "").strip()
-            if not raw or "_" not in raw:
-                continue
-            cond_value, prop_id = raw.rsplit("_", 1)
-            if not cond_value or not prop_id.isdigit():
-                continue
-            controller_cols = [
-                c for c, k in header_key_by_col.items()
-                if k and f"_{prop_id}" in k
-            ]
-            required_cols = [
-                c for c in range(1, ws.max_column + 1)
-                if str(pr_ws.cell(row=r, column=c).value or "").strip().lower() == "require"
-            ]
-            if not controller_cols or not required_cols:
-                continue
-            controller_headers = [header_label_by_col[c] for c in controller_cols if header_label_by_col.get(c)]
-            required_headers = [header_label_by_col[c] for c in required_cols if header_label_by_col.get(c)]
-            if not controller_headers or not required_headers:
-                continue
-            conditional_rules.append(
-                {
-                    "if_value": cond_value,
-                    "if_headers": sorted(set(controller_headers)),
-                    "required_headers": sorted(set(required_headers)),
-                }
-            )
-
+    meta = parse_temu_template_meta(template_file_path=template_file_path)
+    default_values = {
+        item["field_name"]: item.get("default_value", "")
+        for item in meta.get("common_fields", [])
+    }
     return {
-        "sheet_name": ws.title,
-        "common_row": common_row,
-        "common_values_row": common_values_row,
-        "header_row": header_row,
-        "hint_row": hint_row,
-        "data_start_row": header_row + 2,
-        "common_fields": common_fields,
-        "detail_headers": detail_headers,
-        "required_hints": required_hints,
+        "sheet_name": meta["sheet_name"],
+        "common_row": meta["common_row"],
+        "common_values_row": meta["common_values_row"],
+        "header_row": meta["header_row"],
+        "hint_row": meta["hint_row"],
+        "data_start_row": meta["data_start_row"],
+        "common_fields": meta["common_field_names"],
+        "detail_headers": meta["detail_headers"],
+        "required_hints": meta["required_hints"],
         "default_values": default_values,
-        "required_fields": required_fields,
-        "conditional_required_fields": conditional_required_fields,
-        "enum_options_map": enum_options_map,
-        "conditional_rules": conditional_rules,
+        "required_fields": meta["required_fields"],
+        "conditional_required_fields": meta["conditional_required_fields"],
+        "enum_options_map": meta["enum_options_map"],
+        "conditional_rules": meta["conditional_rules"],
     }
 
 
@@ -436,6 +395,35 @@ def _merge_validation(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, 
     }
 
 
+def _normalize_ai_common_fields(common_fields: dict[str, str]) -> dict[str, str]:
+    normalized = normalize_listing_fields(common_fields or {}, keep_unknown=True, include_auxiliary=False)
+    # 顶部公共字段里仍可能使用“发货仓”，统一补一份到模板公共字段“发货仓1”
+    if normalized.get("发货仓") and not normalized.get("发货仓1"):
+        normalized["发货仓1"] = normalized["发货仓"]
+    return {str(k): "" if v is None else str(v) for k, v in normalized.items()}
+
+
+def _normalize_ai_rows(headers: list[str], rows: list[dict[str, str]]) -> tuple[list[str], list[dict[str, str]]]:
+    normalized_header_order: list[str] = []
+    seen: set[str] = set()
+    for header in headers:
+        normalized = str(header or "").strip()
+        if not normalized:
+            continue
+        normalized_key = normalize_listing_field_key(normalized)
+        if normalized_key in seen:
+            continue
+        seen.add(normalized_key)
+        normalized_header_order.append(normalized_key)
+
+    normalized_rows: list[dict[str, str]] = []
+    for row in rows:
+        normalized_row = normalize_listing_fields(row or {}, keep_unknown=True, include_auxiliary=False)
+        filtered_row = {header: str(normalized_row.get(header) or "") for header in normalized_header_order}
+        normalized_rows.append(filtered_row)
+    return normalized_header_order, normalized_rows
+
+
 def _validate_against_template(
     *,
     template_file_path: str,
@@ -443,16 +431,18 @@ def _validate_against_template(
     headers: list[str],
     rows: list[dict[str, str]],
 ) -> dict[str, Any]:
-    meta = parse_template_meta(template_file_path=template_file_path)
+    meta = parse_temu_template_meta(template_file_path=template_file_path)
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
 
+    normalized_common = _normalize_ai_common_fields(common_fields)
+    normalized_headers, normalized_rows = _normalize_ai_rows(headers, rows)
     expected_headers = meta.get("detail_headers") or []
     expected_set = set(expected_headers)
-    incoming_set = set(headers)
+    incoming_set = set(normalized_headers)
 
     missing_headers = [h for h in expected_headers if h not in incoming_set]
-    extra_headers = [h for h in headers if h not in expected_set]
+    extra_headers = [h for h in normalized_headers if h not in expected_set]
     if missing_headers:
         errors.append({
             "field": "headers",
@@ -465,75 +455,18 @@ def _validate_against_template(
             "message": "存在模板外字段",
             "extra_headers": extra_headers,
         })
-    if not missing_headers and headers != expected_headers:
+    if not missing_headers and normalized_headers != expected_headers:
         warnings.append({
             "field": "headers",
             "message": "字段顺序与模板不一致",
         })
 
-    # common fields required check
-    for field in meta.get("common_fields") or []:
-        if not str(common_fields.get(field) or "").strip():
-            warnings.append({
-                "field": field,
-                "message": "公共字段为空，建议补齐",
-            })
-
-    required_fields = set(meta.get("required_fields") or [])
-    conditional_fields = set(meta.get("conditional_required_fields") or [])
-    conditional_rules = meta.get("conditional_rules") or []
-    enum_options_map = meta.get("enum_options_map") or {}
-
-    for idx, row in enumerate(rows):
-        for field in required_fields:
-            if field in incoming_set and not str(row.get(field) or "").strip():
-                errors.append({
-                    "row_index": idx,
-                    "field": field,
-                    "message": "模板必填字段为空",
-                })
-        for field in conditional_fields:
-            if field in incoming_set and not str(row.get(field) or "").strip():
-                warnings.append({
-                    "row_index": idx,
-                    "field": field,
-                    "message": "条件必填字段为空，需按业务条件确认",
-                })
-        for rule in conditional_rules:
-            if_headers = [h for h in rule.get("if_headers", []) if h in incoming_set]
-            if not if_headers:
-                continue
-            cond_value = str(rule.get("if_value") or "").strip()
-            if not cond_value:
-                continue
-            hit = any(str(row.get(h) or "").strip() == cond_value for h in if_headers)
-            if not hit:
-                continue
-            for req_header in rule.get("required_headers", []):
-                if req_header not in incoming_set:
-                    continue
-                if not str(row.get(req_header) or "").strip():
-                    errors.append({
-                        "row_index": idx,
-                        "field": req_header,
-                        "message": f"条件命中后必填（触发值: {cond_value}）",
-                    })
-        for field, options in enum_options_map.items():
-            if field not in incoming_set:
-                continue
-            val = str(row.get(field) or "").strip()
-            if not val:
-                continue
-            if val not in options:
-                warnings.append({
-                    "row_index": idx,
-                    "field": field,
-                    "message": "字段值不在模板枚举中",
-                    "value": val,
-                })
-
-    _append_spu_sku_validation(errors=errors, warnings=warnings, headers=headers, rows=rows)
-    return {"errors": errors, "warnings": warnings}
+    validation = validate_task_payload(
+        common_fields=normalized_common,
+        rows=normalized_rows,
+        template_meta=meta,
+    )
+    return _merge_validation({"errors": errors, "warnings": warnings}, validation)
 
 
 def _append_spu_sku_validation(
@@ -584,26 +517,28 @@ def create_ai_import_batch(
     original_filename: str | None,
 ) -> tuple[AiImportBatch, AiImportDraft]:
     parsed = _parse_external_ai_json(raw_json_text)
+    parsed_common = _normalize_ai_common_fields(parsed["common_fields"])
+    parsed_headers, parsed_rows = _normalize_ai_rows(parsed["headers"], parsed["rows"])
     validation_result = parsed["validation_result"]
-    if template_file_path:
-        validation_result = _merge_validation(
-            validation_result,
-            _validate_against_template(
-                template_file_path=template_file_path,
-                common_fields=parsed["common_fields"],
-                headers=parsed["headers"],
-                rows=parsed["rows"],
-            ),
-        )
+    effective_template_path = _resolve_template_file_path(template_file_path)
+    validation_result = _merge_validation(
+        validation_result,
+        _validate_against_template(
+            template_file_path=effective_template_path,
+            common_fields=parsed_common,
+            headers=parsed_headers,
+            rows=parsed_rows,
+        ),
+    )
     batch = AiImportBatch(
         name=name.strip() or "AI导入批次",
-        template_file_path=template_file_path,
+        template_file_path=effective_template_path,
         original_filename=original_filename,
         raw_json_text=raw_json_text,
         sheet_name=parsed.get("sheet_name") or None,
-        parsed_common_fields_json=parsed["common_fields"],
-        parsed_headers_json=parsed["headers"],
-        parsed_rows_json=parsed["rows"],
+        parsed_common_fields_json=parsed_common,
+        parsed_headers_json=parsed_headers,
+        parsed_rows_json=parsed_rows,
         parsed_warnings_json=parsed["warnings"],
         validation_result_json=validation_result,
         status="parsed",
@@ -614,10 +549,10 @@ def create_ai_import_batch(
 
     draft = AiImportDraft(
         batch_id=batch.id,
-        common_fields_json=parsed["common_fields"],
-        headers_json=parsed["headers"],
-        rows_json=parsed["rows"],
-        field_settings_json=_build_field_settings(parsed["headers"]),
+        common_fields_json=parsed_common,
+        headers_json=parsed_headers,
+        rows_json=parsed_rows,
+        field_settings_json=_build_field_settings(parsed_headers),
         validation_result_json=validation_result,
     )
     session.add(draft)
@@ -635,25 +570,24 @@ def update_ai_import_draft(
     rows: list[dict[str, Any]] | None,
     field_settings: dict[str, Any] | None,
 ) -> AiImportDraft:
-    draft = get_ai_import_draft(session, batch_id=batch.id)
-    if draft is None:
-        raise ValueError("AI import draft not found")
+    draft = ensure_ai_import_draft(session, batch=batch)
 
-    next_common = _stringify_common_fields(common_fields if common_fields is not None else draft.common_fields_json)
-    next_headers = _normalize_headers(headers if headers is not None else draft.headers_json)
-    next_rows = _normalize_rows(rows if rows is not None else draft.rows_json, next_headers)
-    next_settings = field_settings if field_settings is not None else draft.field_settings_json
+    next_common = _normalize_ai_common_fields(_stringify_common_fields(common_fields if common_fields is not None else draft.common_fields_json))
+    raw_headers = _normalize_headers(headers if headers is not None else draft.headers_json)
+    raw_rows = _normalize_rows(rows if rows is not None else draft.rows_json, raw_headers)
+    next_headers, next_rows = _normalize_ai_rows(raw_headers, raw_rows)
+    source_settings = field_settings if field_settings is not None else draft.field_settings_json
+    next_settings = _normalize_field_settings_for_headers(next_headers, source_settings)
     validation_result = _validate_headers_rows(next_headers, next_rows)
-    if batch.template_file_path:
-        validation_result = _merge_validation(
-            validation_result,
-            _validate_against_template(
-                template_file_path=batch.template_file_path,
-                common_fields=next_common,
-                headers=next_headers,
-                rows=next_rows,
-            ),
-        )
+    validation_result = _merge_validation(
+        validation_result,
+        _validate_against_template(
+            template_file_path=_resolve_template_file_path(batch.template_file_path),
+            common_fields=next_common,
+            headers=next_headers,
+            rows=next_rows,
+        ),
+    )
 
     draft.common_fields_json = next_common
     draft.headers_json = next_headers
@@ -674,23 +608,19 @@ def update_ai_import_draft(
 
 
 def export_ai_import_batch(session: Session, *, batch: AiImportBatch) -> tuple[AiImportBatch, str]:
-    draft = get_ai_import_draft(session, batch_id=batch.id)
-    if draft is None:
-        raise ValueError("AI import draft not found")
-    if not batch.template_file_path:
-        raise ValueError("请先上传 Temu 原始模板")
+    draft = ensure_ai_import_draft(session, batch=batch)
     validation = draft.validation_result_json or {}
     if validation.get("errors"):
         raise ValueError("字段校验未通过，请先修正后再导出")
 
-    output_path = _write_ai_import_excel(
-        template_file_path=batch.template_file_path,
+    template_path = _resolve_template_file_path(batch.template_file_path)
+    adapter = get_export_adapter("temu_half_managed_jewelry_upload")
+    output_path = adapter.write_excel(
+        common_fields=_normalize_ai_common_fields(draft.common_fields_json or {}),
+        rows=[normalize_listing_fields(row or {}, keep_unknown=True, include_auxiliary=False) for row in (draft.rows_json or [])],
+        batch_no=_new_ai_import_batch_no(batch.id),
+        template_file_path=template_path,
         preferred_sheet_name=batch.sheet_name,
-        common_fields=draft.common_fields_json or {},
-        headers=draft.headers_json or [],
-        rows=draft.rows_json or [],
-        field_settings=draft.field_settings_json or {},
-        batch_id=batch.id,
     )
     batch.export_file_path = output_path
     batch.status = "exported"
@@ -790,23 +720,12 @@ def _validate_headers_rows(headers: list[str], rows: list[dict[str, str]]) -> di
 
     header_set = set(headers)
     extra_fields: set[str] = set()
-    media_headers = [header for header in headers if any(token in header for token in IMAGE_FIELD_KEYWORDS)]
     for index, row in enumerate(rows):
         for header in headers:
             row.setdefault(header, "")
         for key in row.keys():
             if key not in header_set:
                 extra_fields.add(key)
-        for media_header in media_headers:
-            media_value = str(row.get(media_header) or "").strip()
-            if media_value:
-                warnings.append(
-                    {
-                        "row_index": index,
-                        "field": media_header,
-                        "message": "媒体字段建议留空，后续由系统资产填充",
-                    }
-                )
         if not any(str(v).strip() for v in row.values()):
             warnings.append({"row_index": index, "message": "该行全部为空"})
 
@@ -834,110 +753,19 @@ def _build_field_settings(headers: list[str]) -> dict[str, Any]:
     return settings
 
 
-def _write_ai_import_excel(
-    *,
-    template_file_path: str,
-    preferred_sheet_name: str | None,
-    common_fields: dict[str, str],
+def _normalize_field_settings_for_headers(
     headers: list[str],
-    rows: list[dict[str, str]],
-    field_settings: dict[str, Any],
-    batch_id: int,
-) -> str:
-    wb = load_workbook(template_file_path)
-    ws = wb[preferred_sheet_name] if preferred_sheet_name and preferred_sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
-
-    header_row = _locate_header_row(ws, headers)
-    col_map = _ensure_header_columns(ws, header_row=header_row, headers=headers, field_settings=field_settings)
-    _write_common_fields(ws, common_fields)
-    data_start_row = _resolve_data_start_row(ws, header_row=header_row)
-
-    for row_offset, row in enumerate(rows, start=1):
-        for header in headers:
-            settings = field_settings.get(header) or {}
-            if settings.get("export", True) is False:
-                continue
-            col = col_map.get(header)
-            if not col:
-                continue
-            ws.cell(row=data_start_row + row_offset - 1, column=col).value = str(row.get(header) or "")
-
-    settings = get_settings()
-    root = Path(settings.storage_root)
-    out_dir = root / settings.exports_dir_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"ai-import-export-{batch_id}-{uuid.uuid4().hex[:8]}.xlsx"
-    out_path = out_dir / filename
-    wb.save(out_path)
-    return f"{settings.exports_dir_name}/{filename}"
-
-
-def _locate_header_row(ws, headers: list[str]) -> int:
-    best_row = 1
-    best_score = -1
-    header_set = set(headers)
-    for row in range(1, min(ws.max_row, 30) + 1):
-        values = {str(ws.cell(row=row, column=col).value).strip() for col in range(1, min(ws.max_column, 120) + 1) if ws.cell(row=row, column=col).value}
-        score = len(values & header_set)
-        if score > best_score:
-            best_score = score
-            best_row = row
-    return best_row
-
-
-def _ensure_header_columns(ws, *, header_row: int, headers: list[str], field_settings: dict[str, Any]) -> dict[str, int]:
-    col_map: dict[str, int] = {}
-    next_col = ws.max_column + 1
-    for col in range(1, ws.max_column + 1):
-        value = ws.cell(row=header_row, column=col).value
-        name = str(value).strip() if value is not None else ""
-        if name:
-            col_map[name] = col
-    for header in headers:
-        settings = field_settings.get(header) or {}
-        if settings.get("export", True) is False:
+    field_settings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized = _build_field_settings(headers)
+    raw = field_settings if isinstance(field_settings, dict) else {}
+    for raw_key, raw_meta in raw.items():
+        key = normalize_listing_field_key(str(raw_key or "").strip())
+        if not key or key not in normalized:
             continue
-        if header in col_map:
+        if not isinstance(raw_meta, dict):
             continue
-        ws.cell(row=header_row, column=next_col).value = header
-        col_map[header] = next_col
-        next_col += 1
-    return col_map
-
-
-def _resolve_data_start_row(ws, *, header_row: int) -> int:
-    """
-    Temu templates usually place field hints right below headers.
-    Keep that row intact and write data from the next row.
-    """
-    hint_row = header_row + 1
-    has_hint = False
-    for col in range(1, ws.max_column + 1):
-        val = ws.cell(row=hint_row, column=col).value
-        text = str(val).strip() if val is not None else ""
-        if text:
-            has_hint = True
-            break
-    return header_row + 2 if has_hint else header_row + 1
-
-
-def _write_common_fields(ws, common_fields: dict[str, str]) -> None:
-    if not common_fields:
-        return
-    located: set[str] = set()
-    for row in range(1, min(ws.max_row, 20) + 1):
-        for col in range(1, min(ws.max_column, 20) + 1):
-            cell_value = ws.cell(row=row, column=col).value
-            key = str(cell_value).strip() if cell_value is not None else ""
-            if key and key in common_fields:
-                ws.cell(row=row, column=col + 1).value = common_fields[key]
-                located.add(key)
-    if len(located) == len(common_fields):
-        return
-    insert_row = 1
-    for key, value in common_fields.items():
-        if key in located:
-            continue
-        ws.cell(row=insert_row, column=max(ws.max_column + 1, 1)).value = key
-        ws.cell(row=insert_row, column=max(ws.max_column + 2, 2)).value = value
-        insert_row += 1
+        merged = {**normalized[key], **raw_meta}
+        merged["is_media_field"] = any(token in key for token in IMAGE_FIELD_KEYWORDS)
+        normalized[key] = merged
+    return normalized

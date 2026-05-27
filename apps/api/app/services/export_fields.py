@@ -14,6 +14,7 @@ from app.models.export_field_draft import ExportFieldDraft
 from app.models.product_ai_result import ProductAIResult
 from app.models.product_task import ProductTask
 from app.models.raw_product import RawProduct
+from app.services.temu_upload_template import normalize_listing_field_key, normalize_listing_fields, read_listing_field
 
 
 PRIORITY_ORDER: dict[str, int] = {
@@ -26,7 +27,19 @@ PRIORITY_ORDER: dict[str, int] = {
 
 
 def get_export_field_draft(session: Session, *, task_id: int) -> ExportFieldDraft | None:
-    return session.scalar(select(ExportFieldDraft).where(ExportFieldDraft.product_task_id == task_id).limit(1))
+    draft = session.scalar(select(ExportFieldDraft).where(ExportFieldDraft.product_task_id == task_id).limit(1))
+    if draft is None:
+        return None
+
+    normalized_fields = normalize_listing_fields(draft.fields_json or {}, keep_unknown=True, include_auxiliary=True)
+    normalized_sources = _normalize_source_keys(draft.field_sources_json or {})
+    if normalized_fields != (draft.fields_json or {}) or normalized_sources != (draft.field_sources_json or {}):
+        draft.fields_json = normalized_fields
+        draft.field_sources_json = normalized_sources
+        session.add(draft)
+        session.commit()
+        session.refresh(draft)
+    return draft
 
 
 def apply_default_rules(session: Session, *, task: ProductTask) -> ExportFieldDraft:
@@ -49,9 +62,10 @@ def apply_default_rules_with_options(
     if existing is not None and isinstance(existing.field_sources_json, dict):
         for k, meta in existing.field_sources_json.items():
             if isinstance(meta, dict) and meta.get("source") == "manual_override":
-                locked_fields.add(k)
-                fields[k] = (existing.fields_json or {}).get(k)
-                sources[k] = meta
+                normalized_key = normalize_listing_field_key(k)
+                locked_fields.add(normalized_key)
+                fields[normalized_key] = read_listing_field(existing.fields_json or {}, normalized_key)
+                sources[normalized_key] = meta
 
     # Base fields from raw + AI (product_override)
     base_fields, base_sources = _build_base_fields(session, task=task)
@@ -78,12 +92,12 @@ def apply_default_rules_with_options(
         out = rule.values_json or rule.output_json or {}
         if not isinstance(out, dict):
             continue
-        for k, v in out.items():
+        for k, v in normalize_listing_fields(out, keep_unknown=True, include_auxiliary=True).items():
             _set_field(
                 fields,
                 sources,
                 warnings,
-                key=str(k),
+                key=normalize_listing_field_key(str(k)),
                 value=v,
                 source_meta={
                     "source": rule.rule_type,
@@ -127,6 +141,57 @@ def apply_default_rules_with_options(
     return existing
 
 
+def apply_default_rules_with_merge_mode(
+    session: Session,
+    *,
+    task: ProductTask,
+    selected_rule_id: int | None,
+    overwrite_mode: str = "overwrite_system",
+) -> ExportFieldDraft:
+    mode = (overwrite_mode or "overwrite_system").strip().lower()
+    if mode not in {"fill_empty", "overwrite_system", "force_overwrite"}:
+        raise ValueError("overwrite_mode must be fill_empty | overwrite_system | force_overwrite")
+
+    previous = get_export_field_draft(session, task_id=task.id)
+    if previous is None or mode == "force_overwrite":
+        return apply_default_rules_with_options(session, task=task, selected_rule_id=selected_rule_id)
+
+    old_fields = normalize_listing_fields(previous.fields_json or {}, keep_unknown=True, include_auxiliary=True)
+    old_sources = _normalize_source_keys(previous.field_sources_json or {})
+    manual_keys = {
+        key
+        for key, meta in old_sources.items()
+        if isinstance(meta, dict) and str(meta.get("source") or "").strip().lower() == "manual_override"
+    }
+
+    generated = apply_default_rules_with_options(session, task=task, selected_rule_id=selected_rule_id)
+    new_fields = normalize_listing_fields(generated.fields_json or {}, keep_unknown=True, include_auxiliary=True)
+    new_sources = _normalize_source_keys(generated.field_sources_json or {})
+
+    merged_fields = dict(old_fields)
+    merged_sources = dict(old_sources)
+    merge_at = _now_iso()
+
+    for key, new_value in new_fields.items():
+        old_value = old_fields.get(key)
+        is_old_empty = _is_empty_value(old_value)
+        if mode == "fill_empty" and not is_old_empty:
+            continue
+        if mode == "overwrite_system" and key in manual_keys:
+            continue
+        merged_fields[key] = new_value
+        incoming_meta = dict(new_sources.get(key) or {})
+        incoming_meta.setdefault("applied_at", merge_at)
+        merged_sources[key] = incoming_meta
+
+    generated.fields_json = merged_fields
+    generated.field_sources_json = merged_sources
+    session.add(generated)
+    session.commit()
+    session.refresh(generated)
+    return generated
+
+
 def patch_export_fields_manual(
     session: Session,
     *,
@@ -140,12 +205,14 @@ def patch_export_fields_manual(
         session.commit()
         session.refresh(draft)
 
-    fields = dict(draft.fields_json or {})
-    sources = dict(draft.field_sources_json or {})
+    fields = normalize_listing_fields(draft.fields_json or {}, keep_unknown=True, include_auxiliary=True)
+    sources = _normalize_source_keys(draft.field_sources_json or {})
     warnings: list[dict[str, Any]] = list(draft.warnings_json or [])
 
     for k, v in (updates or {}).items():
-        key = str(k)
+        key = normalize_listing_field_key(str(k))
+        if not key:
+            continue
         fields[key] = v
         sources[key] = {"source": "manual_override", "applied_at": _now_iso(), "priority": "manual_override"}
 
@@ -186,28 +253,28 @@ def get_export_field_candidates(session: Session, *, task: ProductTask) -> dict[
     field_sources = dict((draft.field_sources_json or {}) if draft is not None else {})
 
     candidates: dict[str, dict[str, Any]] = {
-        "product_title_cn": {
+        "商品名称": {
             "raw": raw.title if raw else None,
             "ai": ai_title_cn,
-            "current": current_fields.get("product_title_cn") or task.title,
-            "manual": manual_fields.get("product_title_cn")
-            if str((field_sources.get("product_title_cn") or {}).get("source") or "") == "manual_override"
+            "current": read_listing_field(current_fields, "商品名称") or task.title,
+            "manual": read_listing_field(manual_fields, "商品名称")
+            if str((field_sources.get("商品名称") or {}).get("source") or "") == "manual_override"
             else None,
         },
-        "product_title_en": {
+        "英文名称": {
             "raw": raw.title if raw else None,
             "ai": ai_title_en,
-            "current": current_fields.get("product_title_en"),
-            "manual": manual_fields.get("product_title_en")
-            if str((field_sources.get("product_title_en") or {}).get("source") or "") == "manual_override"
+            "current": read_listing_field(current_fields, "英文名称"),
+            "manual": read_listing_field(manual_fields, "英文名称")
+            if str((field_sources.get("英文名称") or {}).get("source") or "") == "manual_override"
             else None,
         },
-        "category_path": {
+        "类目": {
             "raw": raw.category_path if raw else None,
             "ai": ai_category,
-            "current": current_fields.get("category_path") or task.selected_category_id,
-            "manual": manual_fields.get("category_path")
-            if str((field_sources.get("category_path") or {}).get("source") or "") == "manual_override"
+            "current": read_listing_field(current_fields, "类目") or task.selected_category_id,
+            "manual": read_listing_field(manual_fields, "类目")
+            if str((field_sources.get("类目") or {}).get("source") or "") == "manual_override"
             else None,
         },
         "selected_category_id": {
@@ -313,6 +380,7 @@ def _build_base_fields(session: Session, *, task: ProductTask) -> tuple[dict[str
     raw = session.get(RawProduct, task.raw_product_id)
     ai = session.scalar(select(ProductAIResult).where(ProductAIResult.task_id == task.id))
 
+    fallback_sku = task.platform_sku or (raw.platform_sku if raw else None) or task.source_id or (raw.source_id if raw else None)
     out: dict[str, Any] = {
         "task_id": task.id,
         "raw_product_id": task.raw_product_id,
@@ -322,6 +390,10 @@ def _build_base_fields(session: Session, *, task: ProductTask) -> tuple[dict[str
         "source_id": raw.source_id if raw else task.source_id,
         "raw_title": raw.title if raw else task.title,
         "selected_category_id": task.selected_category_id,
+        "SPU货号": task.task_no or fallback_sku,
+        "SKU货号": task.task_no or fallback_sku,
+        "类目": task.category_path or task.selected_category_id or (raw.category_path if raw else None),
+        "申报价格-美国站": task.price_usd,
     }
     sources: dict[str, Any] = {k: {"source": "raw_source"} for k in out.keys()}
 
@@ -339,10 +411,10 @@ def _build_base_fields(session: Session, *, task: ProductTask) -> tuple[dict[str
 
         effective_category_path = task.selected_category_id or cat_path or (raw.category_path if raw else None)
         ai_fields = {
-            "category_path": effective_category_path,
+            "类目": effective_category_path,
             "selected_category_id": task.selected_category_id or cat_path,
-            "product_title_cn": title_cn,
-            "product_title_en": title_en,
+            "商品名称": title_cn,
+            "英文名称": title_en,
         }
         for k, v in ai_fields.items():
             if v is not None:
@@ -359,8 +431,8 @@ def _build_context(session: Session, *, task: ProductTask, base_fields: dict[str
     raw = session.get(RawProduct, task.raw_product_id)
     ai = session.scalar(select(ProductAIResult).where(ProductAIResult.task_id == task.id))
 
-    category_path = base_fields.get("category_path") or base_fields.get("selected_category_id") or ""
-    title = str(base_fields.get("product_title_cn") or base_fields.get("raw_title") or "")
+    category_path = base_fields.get("类目") or base_fields.get("category_path") or base_fields.get("selected_category_id") or ""
+    title = str(base_fields.get("商品名称") or base_fields.get("product_title_cn") or base_fields.get("raw_title") or "")
     description = str(base_fields.get("product_description") or "")
 
     return {
@@ -520,7 +592,7 @@ def _set_field(
 
 
 def _apply_missing_warnings(fields: dict[str, Any], warnings: list[dict[str, Any]]) -> None:
-    required = ["product_title_cn", "category_path"]
+    required = ["商品名称", "类目"]
     for f in required:
         v = fields.get(f)
         if v is None or (isinstance(v, str) and not v.strip()):
@@ -612,3 +684,23 @@ def _infer_specs_from_sku_text(text: str) -> tuple[str | None, str | None]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_source_keys(source_map: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in (source_map or {}).items():
+        normalized_key = normalize_listing_field_key(str(key))
+        if not normalized_key:
+            continue
+        normalized[normalized_key] = value
+    return normalized
+
+
+def _is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False

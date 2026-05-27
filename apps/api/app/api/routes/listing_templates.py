@@ -15,7 +15,7 @@ from app.schemas.listing_template import (
     ListingTemplateUpdate,
 )
 
-router = APIRouter(prefix="/listing-templates", tags=["listing-templates"])
+router = APIRouter(prefix="/listing-templates", tags=["category-field-schemes"])
 
 
 @router.get("", response_model=list[ListingTemplateOut])
@@ -44,7 +44,7 @@ def get_template(
 ):
     tmpl = session.get(ListingTemplate, template_id)
     if not tmpl:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模板不存在")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="类目字段方案不存在")
     return tmpl
 
 
@@ -66,13 +66,13 @@ def download_template_excel(
     session: Annotated[Session, Depends(get_db_session)],
 ) -> dict[str, object]:
     """
-    将 listing_template 的字段配置导出为 Excel 模板文件。
+    将 listing_template 的字段配置导出为 Excel 类目字段方案文件。
     从 uniform_defaults_json 和 category_fields_json 读取字段，
     按后端 listing_default_fields.py 的字段分组写入 Excel。
     """
     tmpl = session.get(ListingTemplate, template_id)
     if not tmpl:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模板不存在")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="类目字段方案不存在")
 
     # 按设计方案字段分层组织内容
     uniform = tmpl.uniform_defaults_json or {}
@@ -84,7 +84,7 @@ def download_template_excel(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = tmpl.name[:31] if tmpl.name else "模板"
+    ws.title = tmpl.name[:31] if tmpl.name else "字段方案"
 
     # 样式定义
     header_font = Font(bold=True, size=12, color="FFFFFF")
@@ -195,6 +195,8 @@ def download_template_excel(
     return {
         "ok": True,
         "template_name": tmpl.name,
+        "scheme_name": tmpl.name,
+        "scheme_type": "category_field_scheme",
         "download_url": f"{settings.public_base_url}/storage/{settings.exports_dir_name}/{filename}",
         "filename": filename,
         "field_count": row_idx - 2,
@@ -209,7 +211,7 @@ def update_template(
 ):
     tmpl = session.get(ListingTemplate, template_id)
     if not tmpl:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模板不存在")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="类目字段方案不存在")
     update_data = data.model_dump(exclude_unset=True)
     for key, val in update_data.items():
         setattr(tmpl, key, val)
@@ -225,6 +227,6 @@ def delete_template(
 ):
     tmpl = session.get(ListingTemplate, template_id)
     if not tmpl:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模板不存在")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="类目字段方案不存在")
     session.delete(tmpl)
     session.commit()

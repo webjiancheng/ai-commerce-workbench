@@ -10,7 +10,7 @@ from app.db.base import Base
 
 
 class ListingTemplate(Base):
-    """上架模板定义，描述某个类目需要的所有字段及其默认值"""
+    """类目字段方案，描述某个类目需要的默认字段与类目属性字段"""
 
     __tablename__ = "listing_templates"
     __table_args__ = (

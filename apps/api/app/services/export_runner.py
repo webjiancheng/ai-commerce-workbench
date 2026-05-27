@@ -24,6 +24,9 @@ from app.models.product_asset import ProductAsset
 from app.models.product_ai_result import ProductAIResult
 from app.models.product_task import ProductTask
 from app.services.export_fields import apply_default_rules_with_options
+from app.services.export_adapters.registry import get_export_adapter
+from app.services.listing_validation import parse_sku_rows_from_draft, validate_task_payload
+from app.services.temu_upload_template import normalize_listing_fields
 from app.services.export_templates import get_default_export_template
 
 
@@ -53,17 +56,10 @@ def preview_exports(
     product_task_ids: list[int],
     template_id: int | None = None,
     default_rule_id: int | None = None,
+    adapter_key: str | None = None,
 ) -> dict[str, Any]:
-    template = session.get(ExportTemplate, template_id) if template_id else get_default_export_template(session, platform="temu")
-    if template is None:
-        raise RuntimeError("No default export template configured")
-
-    mappings = session.scalars(
-        select(ExportFieldMapping)
-        .where(ExportFieldMapping.template_id == template.id)
-        .order_by(ExportFieldMapping.column_index.asc(), ExportFieldMapping.id.asc())
-    ).all()
-    _validate_export_configuration(template=template, mappings=mappings)
+    adapter = get_export_adapter(adapter_key)
+    template_meta = adapter.get_template_meta()
 
     rows: list[PreviewRow] = []
     for task_id in product_task_ids:
@@ -73,17 +69,18 @@ def preview_exports(
         draft = session.scalar(select(ExportFieldDraft).where(ExportFieldDraft.product_task_id == task_id).limit(1))
         if draft is None or default_rule_id is not None:
             draft = apply_default_rules_with_options(session, task=task, selected_rule_id=default_rule_id)
-        export_fields, field_sources, validation = _build_row(session, task=task, template=template, mappings=mappings, draft=draft)
+        export_fields, field_sources, validation = _build_row_v2(session, task=task, draft=draft, template_meta=template_meta)
         rows.append(PreviewRow(task_id=task_id, export_fields=export_fields, field_sources=field_sources, validation=validation))
 
     return {
         "template": {
-            "id": template.id,
-            "name": template.name,
-            "version": template.version,
-            "platform": template.platform,
-            "header_row_index": template.header_row_index,
-            "file_path": template.file_path,
+            "id": None,
+            "name": adapter.display_name,
+            "version": adapter.adapter_key,
+            "platform": "temu",
+            "header_row_index": template_meta.get("header_row"),
+            "file_path": template_meta.get("template_file_path"),
+            "adapter_key": adapter.adapter_key,
         },
         "rows": [
             {
@@ -98,7 +95,14 @@ def preview_exports(
 
 
 def run_exports(session: Session, *, product_task_ids: list[int]) -> dict[str, Any]:
-    return run_exports_with_options(session, product_task_ids=product_task_ids, template_id=None, default_rule_id=None)
+    return run_exports_with_options(
+        session,
+        product_task_ids=product_task_ids,
+        template_id=None,
+        default_rule_id=None,
+        adapter_key="miaoshou_temu_non_apparel",
+        export_only_valid=True,
+    )
 
 
 def run_exports_with_options(
@@ -107,24 +111,18 @@ def run_exports_with_options(
     product_task_ids: list[int],
     template_id: int | None,
     default_rule_id: int | None,
+    adapter_key: str | None,
+    export_only_valid: bool,
 ) -> dict[str, Any]:
-    template = session.get(ExportTemplate, template_id) if template_id else get_default_export_template(session, platform="temu")
-    if template is None:
-        raise RuntimeError("No default export template configured")
+    adapter = get_export_adapter(adapter_key)
     rule = session.get(DefaultRule, default_rule_id) if default_rule_id else None
-
-    mappings = session.scalars(
-        select(ExportFieldMapping)
-        .where(ExportFieldMapping.template_id == template.id)
-        .order_by(ExportFieldMapping.column_index.asc(), ExportFieldMapping.id.asc())
-    ).all()
-    _validate_export_configuration(template=template, mappings=mappings)
+    template_meta = adapter.get_template_meta()
 
     batch_no = _new_batch_no()
     batch = ExportBatch(
         batch_no=batch_no,
-        template_id=template.id,
-        template_version=template.version,
+        template_id=template_id,
+        template_version=adapter.adapter_key,
         export_mode="default_rule",
         default_rule_id=rule.id if rule else None,
         default_rule_name=rule.name if rule else None,
@@ -139,8 +137,9 @@ def run_exports_with_options(
     session.refresh(batch)
 
     # Build all rows first and persist export_records
-    built_rows: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    built_rows: list[dict[str, Any]] = []
     blocking_errors: list[str] = []
+    common_fields: dict[str, Any] = {}
     for task_id in product_task_ids:
         task = session.get(ProductTask, task_id)
         if task is None:
@@ -148,14 +147,16 @@ def run_exports_with_options(
         draft = session.scalar(select(ExportFieldDraft).where(ExportFieldDraft.product_task_id == task_id).limit(1))
         if draft is None or default_rule_id is not None:
             draft = apply_default_rules_with_options(session, task=task, selected_rule_id=default_rule_id)
-        export_fields, field_sources, validation = _build_row(session, task=task, template=template, mappings=mappings, draft=draft)
+        export_fields, field_sources, validation = _build_row_v2(session, task=task, draft=draft, template_meta=template_meta)
+        if not common_fields:
+            common_fields = {field: export_fields.get(field, "") for field in template_meta.get("common_field_names", [])}
         status = "success" if not (validation.get("errors") or []) else "failed"
         if status == "failed":
             blocking_errors.append(f"task_id={task_id} 缺少必填字段或字段校验失败")
         rec = ExportRecord(
             product_task_id=task_id,
-            template_id=template.id,
-            template_version=template.version,
+            template_id=template_id,
+            template_version=adapter.adapter_key,
             export_fields_json=export_fields,
             field_sources_json=field_sources,
             validation_result_json=validation,
@@ -165,7 +166,8 @@ def run_exports_with_options(
         session.add(rec)
         session.commit()
         session.refresh(rec)
-        built_rows.append((task_id, export_fields, field_sources, validation))
+        if status == "success":
+            built_rows.append(export_fields)
         if status == "success":
             batch.success_count += 1
         else:
@@ -173,16 +175,22 @@ def run_exports_with_options(
         session.add(batch)
         session.commit()
 
-    if blocking_errors:
+    if blocking_errors and not export_only_valid:
         batch.status = "failed"
         session.add(batch)
         session.commit()
         raise RuntimeError("导出前校验未通过：" + "；".join(blocking_errors[:5]))
 
+    if not built_rows:
+        batch.status = "failed"
+        session.add(batch)
+        session.commit()
+        raise RuntimeError("没有可导出的通过任务")
+
     # Generate excel
-    exported_rel_path = _write_excel(template=template, mappings=mappings, rows=built_rows, batch_no=batch_no)
+    exported_rel_path = adapter.write_excel(common_fields=common_fields, rows=built_rows, batch_no=batch_no)
     batch.exported_file_path = exported_rel_path
-    batch.status = "success"
+    batch.status = "success" if batch.failed_count == 0 else "partial_success"
     session.add(batch)
     session.commit()
     session.refresh(batch)
@@ -203,6 +211,81 @@ def _validate_export_configuration(*, template: ExportTemplate, mappings: list[E
     required_mappings = [item for item in enabled_mappings if item.required]
     if not required_mappings:
         raise RuntimeError(f"导出模板 {template.name} 未配置必填字段")
+
+
+def _build_row_v2(
+    session: Session,
+    *,
+    task: ProductTask,
+    draft: ExportFieldDraft | None,
+    template_meta: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    fields = normalize_listing_fields((draft.fields_json or {}) if draft is not None else {}, keep_unknown=True, include_auxiliary=True)
+    sources = dict((draft.field_sources_json or {}) if draft is not None else {})
+    selected_assets = _load_selected_assets(session, task_id=task.id)
+    image_settings = _normalize_export_image_settings(getattr(task, "export_image_settings_json", None))
+
+    export_fields: dict[str, Any] = {}
+    for field_name in template_meta.get("common_field_names", []):
+        export_fields[field_name] = fields.get(field_name, "")
+    for field_name in template_meta.get("detail_headers", []):
+        value = fields.get(field_name, "")
+        if not value and _is_media_field(field_name):
+            value = _fill_media_field_by_name(field_name, selected_assets, image_settings=image_settings)
+            if value:
+                sources[field_name] = {"source": "asset_fallback"}
+        export_fields[field_name] = value
+
+    if str(template_meta.get("adapter_key") or "").strip() == "miaoshou_temu_non_apparel":
+        _fill_miaoshou_fallback_fields(task=task, export_fields=export_fields)
+
+    if not str(export_fields.get("商品层级") or "").strip():
+        export_fields["商品层级"] = "单SKU商品"
+    if not str(export_fields.get("SPU货号") or "").strip():
+        export_fields["SPU货号"] = task.task_no or task.platform_sku or task.source_id or ""
+    if not str(export_fields.get("SKU货号") or "").strip():
+        export_fields["SKU货号"] = task.platform_sku or task.source_id or task.task_no or ""
+    if not str(export_fields.get("商品名称") or "").strip():
+        export_fields["商品名称"] = task.title or ""
+    if not str(export_fields.get("英文名称") or "").strip() and isinstance(task.title_package, dict):
+        export_fields["英文名称"] = str(task.title_package.get("title_en") or "")
+
+    common_fields = {field: export_fields.get(field, "") for field in template_meta.get("common_field_names", [])}
+    detail_row = {field: export_fields.get(field, "") for field in template_meta.get("detail_headers", [])}
+    validation = validate_task_payload(
+        common_fields=common_fields,
+        rows=[detail_row],
+        template_meta=template_meta,
+        asset_dimensions_by_url={
+            asset.public_url: (asset.width, asset.height)
+            for asset in selected_assets.values()
+            if asset.public_url
+        },
+    )
+    if len(parse_sku_rows_from_draft(fields)) > 1:
+        validation["warnings"].append(
+            {
+                "field": "SKU信息明细",
+                "field_name": "SKU信息明细",
+                "field_key": "SKU信息明细",
+                "type": "multi_sku_not_expanded",
+                "message": "当前导出仍按单条主行写入，请复核多 SKU 商品",
+                "blocking": False,
+            }
+        )
+    return export_fields, sources, validation
+
+
+def _fill_miaoshou_fallback_fields(*, task: ProductTask, export_fields: dict[str, Any]) -> None:
+    # Keep minimal safe defaults so users can export with existing drafts while migrating.
+    if not str(export_fields.get("* 主编号") or "").strip():
+        export_fields["* 主编号"] = task.task_no or task.platform_sku or task.source_id or ""
+    if not str(export_fields.get("*产品标题") or "").strip():
+        export_fields["*产品标题"] = task.title or ""
+    if not str(export_fields.get("*英文标题") or "").strip() and isinstance(task.title_package, dict):
+        export_fields["*英文标题"] = str(task.title_package.get("title_en") or "")
+    if not str(export_fields.get("* 申报价\n（CNY）") or "").strip() and task.price_usd is not None:
+        export_fields["* 申报价\n（CNY）"] = str(task.price_usd)
 
 
 def _build_row(
@@ -350,10 +433,10 @@ def _validate_task_ai_readiness(
                 }
             )
 
-    if not str(export_fields.get("product_title_cn") or "").strip() and not str(export_fields.get("product_title_en") or "").strip():
+    if not str(export_fields.get("商品名称") or "").strip() and not str(export_fields.get("英文名称") or "").strip():
         warnings.append(
             {
-                "field_key": "product_title_cn",
+                "field_key": "商品名称",
                 "type": "listing_title_missing",
                 "message": "中文标题和英文标题都为空，请先生成标题或手动填写",
             }
@@ -439,7 +522,15 @@ def _fill_media_field_by_name(
     if not name:
         return ""
     if "轮播图" in name:
-        urls = [info.public_url for info in _arranged_carousel_assets(selected_assets, image_settings=image_settings)]
+        arranged = _arranged_carousel_assets(selected_assets, image_settings=image_settings)
+        # 支持“商品轮播图1..10”按列回填；无序号时回填逗号拼接
+        match = re.search(r"轮播图(\d+)", name)
+        if match:
+            index = int(match.group(1))
+            if 1 <= index <= len(arranged):
+                return arranged[index - 1].public_url
+            return ""
+        urls = [info.public_url for info in arranged]
         return ",".join(urls)
     if "预览图" in name:
         for slot in ("preview_1", "sku_1", "carousel_1"):
